@@ -25,6 +25,31 @@ Milestone M0 implements the core architectural domain contracts and validation e
 - 100% synthetic unit test suite without network dependencies or credentials.
 - CI workflow targeting Python 3.11 and 3.12 across Windows and Linux.
 
+## Milestone M0 Verification & Status
+
+### Implemented Functionality
+- `src/` package structure with `pyproject.toml` (restricted to Python `>=3.11, <3.13`).
+- Immutable domain models: `Candle`, `MarketIdentity`, and `SupportedTimeframe`.
+- Half-open interval time convention: `[open_time, close_time)`.
+- Canonical OHLCV contract validation (positive prices, non-negative volume, high/low bounds, UTC enforcement).
+- Strict chronological ordering check (rejects out-of-order data without auto-sorting).
+- Duplicate timestamp rejection.
+- Gap detection (reports missing intervals without forward-filling or fabricating rows).
+- Unified CLI supporting both `open-quant validate <path>` and `open-quant-validate <path>`.
+- Fully synthetic unit test suite (75 tests, zero network or API credentials required).
+- CI workflow targeting Windows and Ubuntu on Python 3.11 and 3.12.
+
+### Verified Functionality
+- **Clean Editable Install**: Verified on Python 3.11.15 and Python 3.12.13.
+- **Unit Test Suite**: 75/75 passing tests on both Windows and Linux runtimes.
+- **Linter & Formatting**: 100% clean under `ruff check .` and `ruff format .`.
+- **Bytecode Compilation**: `python -m compileall -q src tests` verified on both 3.11 and 3.12.
+- **CLI Ingestion Tests**: Verified on valid CSVs, CSVs with missing intervals (audit and strict mode), invalid prices, naive timestamps, duplicates, and out-of-order inputs.
+- **Local Multi-OS Matrix**: Verified on local Windows 11 host and local Ubuntu (WSL) for both Python 3.11 and 3.12.
+
+### Outstanding Verification
+- **Cloud-Hosted GitHub Actions Execution**: The workflow `.github/workflows/ci.yml` is configured and passes locally across the full 4-job matrix. Actual cloud-hosted runner execution is pending remote repository creation and push to GitHub.
+
 ## Time Semantics Contract
 
 Candle intervals strictly use the **half-open interval convention** `[open_time, close_time)`:
@@ -57,7 +82,9 @@ python -m compileall -q src tests
 
 # 4. Run the CSV validator CLI
 open-quant validate path/to/candles.csv
-# or
+# or directly
+open-quant-validate path/to/candles.csv
+# or via Python module
 python -m open_quant_intelligence.cli validate path/to/candles.csv
 ```
 

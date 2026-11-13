@@ -78,3 +78,67 @@ def test_cli_quiet_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> N
 
     assert exit_code == 0
     assert captured.out == ""
+
+
+def test_cli_direct_file_argument_invocation(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Verify that 'open-quant path/to/file.csv' directly triggers validation."""
+    valid_csv = tmp_path / "valid_direct.csv"
+    candles = generate_synthetic_series(count=6, timeframe="1h")
+    valid_csv.write_text(candles_to_csv_string(candles), encoding="utf-8")
+
+    exit_code = main([str(valid_csv)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "Validation Status: PASSED" in captured.out
+
+
+def test_cli_missing_columns_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    bad_csv = tmp_path / "missing_cols.csv"
+    bad_csv.write_text("exchange_id,market_type\nbinance,spot\n", encoding="utf-8")
+
+    exit_code = main(["validate", str(bad_csv)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "MISSING_COLUMNS" in captured.out
+
+
+def test_cli_empty_csv_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    empty_csv = tmp_path / "empty.csv"
+    empty_csv.write_text("", encoding="utf-8")
+
+    exit_code = main(["validate", str(empty_csv)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "EMPTY_FILE" in captured.out
+
+
+def test_cli_duplicate_timestamp_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    dup_csv = tmp_path / "duplicate.csv"
+    t1 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    c1 = create_synthetic_candle(open_time=t1)
+    c2 = create_synthetic_candle(open_time=t1)
+    dup_csv.write_text(candles_to_csv_string([c1, c2]), encoding="utf-8")
+
+    exit_code = main(["validate", str(dup_csv)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "DUPLICATE_TIMESTAMP" in captured.out
+
+
+def test_cli_out_of_order_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    order_csv = tmp_path / "out_of_order.csv"
+    t1 = datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+    c1 = create_synthetic_candle(open_time=t1)
+    c2 = create_synthetic_candle(open_time=t2)
+    order_csv.write_text(candles_to_csv_string([c2, c1]), encoding="utf-8")
+
+    exit_code = main(["validate", str(order_csv)])
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "OUT_OF_ORDER_TIMESTAMP" in captured.out

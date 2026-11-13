@@ -41,6 +41,8 @@ env/
 *.db
 *.sqlite
 *.sqlite3
+*.duckdb
+*.duckdb.wal
 data/
 *.parquet
 *.arrow
@@ -50,10 +52,13 @@ duckdb/
 logs/
 *.log
 
-# Pytest / Coverage / Tool cache
+# Pytest / Coverage / Test Runners / Tool cache
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.tox/
+.nox/
+.hypothesis/
 .coverage
 htmlcov/
 

@@ -7,7 +7,7 @@ name = "open-quant-intelligence"
 version = "0.1.0"
 description = "Research-first quantitative cryptocurrency research platform (V2 M0 Foundation)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.13"
 authors = [
     { name = "Open Quant Intelligence Contributors" },
 ]
@@ -27,6 +27,7 @@ dev = [
 ]
 
 [project.scripts]
+open-quant = "open_quant_intelligence.cli:main"
 open-quant-validate = "open_quant_intelligence.cli:main"
 
 [tool.setuptools.packages.find]
