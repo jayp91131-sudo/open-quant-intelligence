@@ -28,9 +28,11 @@ MANIFEST
 
 # Virtual environments
 .venv/
+.venv*/
 venv/
 ENV/
 env/
+uv.lock
 
 # Environment variables & secrets
 .env
