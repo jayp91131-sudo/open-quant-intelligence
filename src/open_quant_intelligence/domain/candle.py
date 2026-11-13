@@ -83,7 +83,20 @@ class Candle:
 
         utc_open_time = self.open_time.astimezone(timezone.utc)
 
+        # Validate boolean flags and integer fields (explicit type checking to prevent bool masquerading)
+        if not isinstance(self.is_closed, bool):
+            raise InvalidCandleError(
+                f"is_closed must be a boolean, got {type(self.is_closed).__name__}: {self.is_closed!r}."
+            )
+
+        if self.trade_count is not None:
+            if isinstance(self.trade_count, bool) or not isinstance(self.trade_count, int) or self.trade_count < 0:
+                raise InvalidCandleError(
+                    f"trade_count must be a non-negative integer or None, got: {self.trade_count!r}."
+                )
+
         # Handle close_time
+        expected_close_time = compute_close_time(utc_open_time, parsed_tf)
         if self.close_time is not None:
             if not isinstance(self.close_time, datetime):
                 raise InvalidCandleError(
@@ -94,13 +107,14 @@ class Candle:
                     f"close_time must be timezone-aware (UTC). Naive timestamp rejected: {self.close_time!r}."
                 )
             utc_close_time = self.close_time.astimezone(timezone.utc)
-            if utc_close_time <= utc_open_time:
+            if utc_close_time != expected_close_time:
                 raise InvalidCandleError(
-                    f"close_time ({utc_close_time.isoformat()}) must be strictly after "
-                    f"open_time ({utc_open_time.isoformat()})."
+                    f"Contradictory close_time ({utc_close_time.isoformat()}). "
+                    f"For timeframe '{normalized_timeframe}' starting at {utc_open_time.isoformat()}, "
+                    f"close_time must equal open_time + timeframe duration ({expected_close_time.isoformat()})."
                 )
         else:
-            utc_close_time = compute_close_time(utc_open_time, parsed_tf)
+            utc_close_time = expected_close_time
 
         # Price and volume validations
         for price_name, price_val in (
@@ -109,7 +123,7 @@ class Candle:
             ("low", self.low),
             ("close", self.close),
         ):
-            if not isinstance(price_val, (int, float)):
+            if isinstance(price_val, bool) or not isinstance(price_val, (int, float)):
                 raise InvalidCandleError(f"{price_name} price must be a numeric value, got {type(price_val).__name__}.")
             f_val = float(price_val)
             if not math.isfinite(f_val):
@@ -117,7 +131,7 @@ class Candle:
             if f_val <= 0.0:
                 raise InvalidCandleError(f"{price_name} price must be strictly positive (> 0), got: {f_val}.")
 
-        if not isinstance(self.base_volume, (int, float)):
+        if isinstance(self.base_volume, bool) or not isinstance(self.base_volume, (int, float)):
             raise InvalidCandleError(f"base_volume must be numeric, got {type(self.base_volume).__name__}.")
         f_volume = float(self.base_volume)
         if not math.isfinite(f_volume):
@@ -150,7 +164,8 @@ class Candle:
         # Optional quote_volume check
         if self.quote_volume is not None:
             if (
-                not isinstance(self.quote_volume, (int, float))
+                isinstance(self.quote_volume, bool)
+                or not isinstance(self.quote_volume, (int, float))
                 or not math.isfinite(float(self.quote_volume))
                 or float(self.quote_volume) < 0.0
             ):

@@ -30,21 +30,25 @@ Milestone M0 implements the core architectural domain contracts and validation e
 ### Implemented Functionality
 - `src/` package structure with `pyproject.toml` (restricted to Python `>=3.11, <3.13`).
 - Immutable domain models: `Candle`, `MarketIdentity`, and `SupportedTimeframe`.
-- Half-open interval time convention: `[open_time, close_time)`.
+- Half-open interval time convention: `[open_time, close_time)` where `close_time = open_time + duration`. Reject contradictory explicit close times.
 - Canonical OHLCV contract validation (positive prices, non-negative volume, high/low bounds, UTC enforcement).
+- Strict boolean and non-negative integer type enforcement (`is_closed` bool, `trade_count` non-negative integer or None, bool values rejected as prices/volumes).
+- Market identity integrity: symbol pair separator validation (`/`, `-`, `_`), non-empty base and quote assets, currency agreement check.
 - Strict chronological ordering check (rejects out-of-order data without auto-sorting).
 - Duplicate timestamp rejection.
-- Gap detection (reports missing intervals without forward-filling or fabricating rows).
+- Timeframe grid alignment verification and accurate gap detection (rejects misaligned intervals, reports missing count only for exact grid intervals without forward-filling or fabricating rows).
+- Hardened CSV stream validation against short/malformed rows and unheaded extra columns.
+- Empty series policy: in-memory empty sequences and header-only CSVs are marked invalid with structured `EMPTY_DATASET` issue.
 - Unified CLI supporting both `open-quant validate <path>` and `open-quant-validate <path>`.
-- Fully synthetic unit test suite (75 tests, zero network or API credentials required).
+- Fully synthetic unit test suite (96 tests, zero network or API credentials required).
 - CI workflow targeting Windows and Ubuntu on Python 3.11 and 3.12.
 
 ### Verified Functionality
 - **Clean Editable Install**: Verified on Python 3.11.15 and Python 3.12.13.
-- **Unit Test Suite**: 75/75 passing tests on both Windows and Linux runtimes.
+- **Unit Test Suite**: 96/96 passing tests on both Windows and Linux runtimes.
 - **Linter & Formatting**: 100% clean under `ruff check .` and `ruff format .`.
-- **Bytecode Compilation**: `python -m compileall -q src tests` verified on both 3.11 and 3.12.
-- **CLI Ingestion Tests**: Verified on valid CSVs, CSVs with missing intervals (audit and strict mode), invalid prices, naive timestamps, duplicates, and out-of-order inputs.
+- **Bytecode Compilation**: `python -m compileall -q src tests` verified on both 3.11 and 3.12 (exit code 0).
+- **CLI Ingestion Tests**: Verified across all 11 integration test scenarios (valid CSV, audit gaps, strict gaps, invalid prices, naive timestamps, duplicate timestamps, out-of-order timestamps, missing required columns, empty CSV, nonexistent file, and unheaded extra columns).
 - **Local Multi-OS Matrix**: Verified on local Windows 11 host and local Ubuntu (WSL) for both Python 3.11 and 3.12.
 
 ### Outstanding Verification

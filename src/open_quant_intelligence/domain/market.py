@@ -39,24 +39,42 @@ class MarketIdentity:
                 "Only 'spot' is supported in Milestone M0. Futures and derivatives are out of scope."
             )
 
-        # Derive base and quote currencies if not explicitly populated
-        derived_base = self.base_currency.strip().upper() if self.base_currency else ""
-        derived_quote = self.quote_currency.strip().upper() if self.quote_currency else ""
+        # Validate symbol format: must contain a separator ('/', '-', or '_')
+        # with non-empty base and quote components (e.g. 'BTC/USDT', 'ETH-USD')
+        clean_symbol = self.symbol.strip().upper()
+        sep = None
+        for candidate_sep in ("/", "-", "_"):
+            if candidate_sep in clean_symbol:
+                sep = candidate_sep
+                break
 
-        if not derived_base or not derived_quote:
-            clean_symbol = self.symbol.strip().upper()
-            if "/" in clean_symbol:
-                parts = clean_symbol.split("/", 1)
-                derived_base = derived_base or parts[0]
-                derived_quote = derived_quote or parts[1]
-            elif "-" in clean_symbol:
-                parts = clean_symbol.split("-", 1)
-                derived_base = derived_base or parts[0]
-                derived_quote = derived_quote or parts[1]
-            elif "_" in clean_symbol:
-                parts = clean_symbol.split("_", 1)
-                derived_base = derived_base or parts[0]
-                derived_quote = derived_quote or parts[1]
+        if not sep:
+            raise InvalidMarketError(
+                f"Malformed symbol {self.symbol!r}. Symbol must contain a valid pair separator ('/', '-', '_')."
+            )
+
+        parts = clean_symbol.split(sep)
+        if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
+            raise InvalidMarketError(
+                f"Malformed symbol {self.symbol!r}. Base and quote components must be non-empty."
+            )
+
+        sym_base, sym_quote = parts[0].strip(), parts[1].strip()
+
+        # Derive or validate base and quote currencies
+        derived_base = self.base_currency.strip().upper() if self.base_currency else sym_base
+        derived_quote = self.quote_currency.strip().upper() if self.quote_currency else sym_quote
+
+        if derived_base != sym_base:
+            raise InvalidMarketError(
+                f"base_currency {derived_base!r} does not agree with symbol {self.symbol!r} base asset {sym_base!r}."
+            )
+
+        if derived_quote != sym_quote:
+            raise InvalidMarketError(
+                f"quote_currency {derived_quote!r} does not agree with symbol {self.symbol!r} "
+                f"quote asset {sym_quote!r}."
+            )
 
         object.__setattr__(self, "exchange_id", self.exchange_id.strip().lower())
         object.__setattr__(self, "market_type", normalized_market_type)
