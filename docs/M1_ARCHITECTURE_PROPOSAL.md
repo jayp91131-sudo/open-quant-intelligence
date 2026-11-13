@@ -1,5 +1,5 @@
 # Open Quant Intelligence V2 — Milestone M1 Architecture Proposal
-## Public Market Data Ingestion and Canonical Storage Engine (Final Correction)
+## Public Market Data Ingestion and Canonical Storage Engine (Final Approved Specification)
 
 **Document Reference:** `docs/M1_ARCHITECTURE_PROPOSAL.md`  
 **Milestone:** M1 — Public Market Data Ingestion & Storage  
@@ -8,7 +8,7 @@
 **Author:** AntiGravity (Implementation Engineer)  
 **Technical Authority:** ChatGPT  
 **Final Decision Maker:** Project Owner  
-**Status:** REVISED ARCHITECTURAL SPECIFICATION ONLY (Implementation is strictly NOT authorized)  
+**Status:** FINAL ARCHITECTURAL SPECIFICATION ONLY (Implementation is strictly NOT authorized)  
 
 ---
 
@@ -17,13 +17,13 @@
 Milestone M1 establishes the foundation for reproducible quantitative research in Open Quant Intelligence (OQI) by delivering an automated, deterministic historical market data ingestion and storage pipeline.
 
 The pipeline will:
-1. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials.
-2. Filter unfinalized candles using strict exchange-anchored observation time, and validate all candle rows through the existing M0 domain contracts (`Candle`, `MarketIdentity`, `SupportedTimeframe`).
-3. Store validated datasets in Apache Parquet files using Snappy compression and integer microsecond UTC timestamp representations.
-4. Maintain an append-only, crash-resilient local dataset catalog in DuckDB that tracks ingestion provenance, data quality statistics, gap analysis, and dual cryptographic fingerprints (canonical content fingerprint vs. physical Parquet SHA-256).
+1. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials, mediated through a strict, allowlisted public adapter interface that encapsulates CCXT.
+2. Filter unfinalized candles using a conservative server-time uncertainty lower bound, and validate all candle rows through the existing M0 domain contracts (`Candle`, `MarketIdentity`, `SupportedTimeframe`).
+3. Store validated datasets in Apache Parquet files using Snappy compression and integer microsecond UTC timestamp representations via cross-platform atomic no-clobber publications.
+4. Maintain an append-only, crash-resilient local dataset catalog in DuckDB that tracks ingestion provenance, data quality statistics, gap analysis, EMPTY snapshot deduplication, and dual cryptographic fingerprints (canonical binary content fingerprint vs. physical Parquet SHA-256).
 5. Provide user-facing CLI commands for downloading, cataloging, inspecting, and re-validating historical datasets.
 
-This revision directly resolves all items from the second technical review: exact integer timestamp arithmetic, grid-aligned request-window semantics, strict raw-page multi-attribute validation, monotonic exchange clock skew tracking, durable crash recovery manifests and active leases, Binance vision endpoint routing, binary-level canonical content fingerprinting, and DuckDB empty/quality status separation.
+This final specification resolves all review items: sub-millisecond rejection, M0 enum member alignment (`SupportedTimeframe.M1..D1`), conservative clock uncertainty bounds, allowlisted adapter encapsulation, atomic non-clobbering storage, EMPTY snapshot idempotency, six-field raw OHLCV validation, and negative-zero floating-point normalization.
 
 ---
 
@@ -34,12 +34,13 @@ This revision directly resolves all items from the second technical review: exac
 - **Repository Structure:** Standard `src/` layout under `src/open_quant_intelligence/`.
 - **Domain Invariants:** Immutable `Candle`, `MarketIdentity`, and `SupportedTimeframe` classes remain the single source of truth.
 - **Time Semantics:** Half-open interval convention `[open_time, close_time)` where `close_time = open_time + duration`.
-- **Supported Timeframes:** Strictly `1m`, `5m`, `15m`, `30m`, `1h`, `4h`, `1d`.
+- **Supported Timeframes:** Strictly `SupportedTimeframe.M1` ("1m"), `M5` ("5m"), `M15` ("15m"), `M30` ("30m"), `H1` ("1h"), `H4` ("4h"), and `D1` ("1d").
 - **Data Integrity:** No silent auto-sorting, no forward-filling of gaps, and no row fabrication.
 - **Test Integrity:** The existing 104-test M0/M0.1 unit and CLI test suite must continue passing without modification.
 
 ### B. Strict Milestone Exclusions
 - **No Private API Keys or Credentials:** Ingestion uses public market data endpoints exclusively.
+- **No Raw CCXT Exposure:** Raw CCXT exchange objects are never leaked outside the internal adapter boundary.
 - **No Order Execution or Trading:** Zero routing, balancing, order placement, or wallet manipulation.
 - **No Derivatives:** Strictly spot markets (`market_type == "spot"`). Futures, options, and perpetuals are out of scope.
 - **No Strategy Logic or Backtesting:** Strategy evaluation, alpha generation, and portfolio simulation belong to M2/M3.
@@ -54,7 +55,7 @@ This revision directly resolves all items from the second technical review: exac
 
 | Component | Library Choice | Justification |
 |---|---|---|
-| **Market Data Adapter** | `ccxt>=4.4.0, <5.0.0` | Industry-standard exchange abstraction. Provides rate-limiting (`enableRateLimit=True`), dynamic throttle coordination, and standardized Kline parsing for Binance public endpoints. Reuses a single exchange instance per ingestion session. |
+| **Market Data Adapter** | `ccxt>=4.4.0, <5.0.0` | Industry-standard exchange abstraction. Encapsulated behind `PublicExchangeAdapter`. Provides rate-limiting (`enableRateLimit=True`), dynamic throttle coordination, and standardized Kline parsing for Binance public vision endpoints. |
 | **Analytical Catalog & Query** | `duckdb>=1.1.0, <2.0.0` | Embedded in-process analytical SQL engine. Handles metadata registration, analytical queries across local Parquet files, and relational catalog queries without requiring a client-server database daemon. |
 | **Parquet Storage Engine** | Native DuckDB Parquet Engine (Primary) | DuckDB compiles native, highly performant Parquet reading and writing (`COPY ... TO ... (FORMAT PARQUET, COMPRESSION SNAPPY)`). Using DuckDB for Parquet eliminates heavy runtime coupling to PyArrow for ingestion. |
 | **Optional Arrow Interop** | `pyarrow>=15.0.0, <19.0.0` (Optional `[dev]`) | Maintained as an optional development dependency for zero-copy memory testing and schema inspection, but **NOT** required for the production runtime pipeline. |
@@ -93,20 +94,23 @@ dev = [
 ```text
 src/open_quant_intelligence/
 ├── domain/                      # [M0] Immutable contracts (Candle, MarketIdentity, SupportedTimeframe)
+│   ├── candle.py
+│   ├── market.py
+│   └── timeframe.py
 ├── data/                        # [M0] Validation engine
-│   ├── validation.py            # [M0] Canonical candle & stream validator
+│   ├── validation.py            # [M0] Canonical candle & stream validator (final domain authority)
 │   └── quality.py               # [M1 NEW] Gap analysis & data quality reporting
 ├── ingestion/                   # [M1 NEW] Public ingestion pipeline
 │   ├── __init__.py
-│   ├── adapter.py               # CCXT Binance public vision client wrapper
+│   ├── adapter.py               # Strict allowlisted Binance public vision adapter (encapsulates CCXT)
 │   ├── pagination.py            # Strict raw-page interval paginator with regression guards
-│   ├── clock.py                 # Monotonic exchange clock offset estimator & skew guard
-│   ├── finalization.py          # Observation-time candle finalization filter
-│   └── pipeline.py              # Orchestrator: Fetch -> Finalize -> Validate -> Fingerprint -> Store
+│   ├── clock.py                 # Monotonic exchange clock offset estimator & conservative skew guard
+│   ├── finalization.py          # Observation-time candle finalization filter (lower-bound based)
+│   └── pipeline.py              # Orchestrator: Fetch -> Validate Raw -> Finalize -> Validate M0 -> Store
 ├── storage/                     # [M1 NEW] Persistence & Catalog
 │   ├── __init__.py
 │   ├── manifest.py              # Ingestion manifest, active lease & crash recovery record
-│   ├── parquet_store.py         # Atomic Parquet writer, staging validator & quarantine
+│   ├── parquet_store.py         # Cross-platform atomic no-clobber Parquet writer & quarantine
 │   ├── fingerprint.py           # Canonical binary content hashing & artifact SHA-256
 │   └── catalog.py               # DuckDB catalog registration, gap recording & queries
 └── cli.py                       # CLI entrypoints (validate, ingest, datasets, inspect, verify)
@@ -118,25 +122,27 @@ flowchart TD
     subgraph Binance_Public["Binance Public Vision Cluster"]
         API["REST API: https://data-api.binance.vision/api/v3/klines"]
         TimeAPI["Time API: https://data-api.binance.vision/api/v3/time"]
+        ExchangeInfo["Exchange Info: https://data-api.binance.vision/api/v3/exchangeInfo"]
     end
 
     subgraph Ingestion_Engine["Ingestion Engine (src/open_quant_intelligence/ingestion/)"]
-        Client["CCXT Vision Public Adapter (enableRateLimit=True)"]
-        ClockSync["Monotonic Clock Estimator (Round-Trip Latency & Skew Filter)"]
+        Adapter["PublicExchangeAdapter (Strict Interface, CCXT Encapsulated, No Raw Access)"]
+        ClockSync["Monotonic Clock Estimator (Uncertainty Lower-Bound, Skew Filter)"]
         Paginator["Strict Paginator (Ascending Order, Duplicate & Overlap Check)"]
-        Finalizer["Finalization Guard (Exclude Incomplete Candles)"]
+        RawValidator["Raw OHLCV Structure & Numeric Validator (Exact 6 Fields, Finite)"]
+        Finalizer["Finalization Guard (Lower Bound of Server Time, Never Early)"]
     end
 
     subgraph Validation_Layer["Validation Layer (src/open_quant_intelligence/data/)"]
-        Validator["validate_candles() M0 Domain Contract Enforcement"]
-        QualityAnalyzer["Quality & Gap Analyzer (Gap-Free vs Gap-Containing)"]
-        BinaryFingerprint["Canonical Binary Content Fingerprint (SHA-256)"]
+        Validator["validate_candles() M0 Domain Contract (Final Domain Authority)"]
+        QualityAnalyzer["Quality & Gap Analyzer (Gap-Free vs Gap-Containing vs Empty)"]
+        BinaryFingerprint["Canonical Binary Content Fingerprint (Negative-Zero Normalized, SHA-256)"]
     end
 
     subgraph Storage_Layer["Storage & Metadata Layer (src/open_quant_intelligence/storage/)"]
         ManifestManager["Durable Ingestion Manifest & Lease Manager (.ingest_manifest.json)"]
         StageStore["Atomic Staging (.tmp Parquet Write)"]
-        AtomicRename["Atomic Filesystem Rename (.tmp -> .parquet)"]
+        AtomicRename["Cross-Platform Atomic No-Clobber Rename (Link/Exclusive Rename)"]
         DuckDBCatalog["DuckDB Catalog (data/catalog.duckdb)"]
         DataFiles["Parquet Datasets: data/datasets/.../*.parquet"]
         Quarantine["Quarantine Directory: data/quarantine/"]
@@ -146,11 +152,14 @@ flowchart TD
         CLI["open-quant CLI (ingest, datasets, verify)"]
     end
 
-    TimeAPI -->|Server Time Samples| ClockSync
+    ExchangeInfo -->|Rate Limit Weights| Adapter
+    TimeAPI -->|Server Time Samples| Adapter
+    Adapter --> ClockSync
     ClockSync --> Finalizer
-    API -->|Raw Kline Batches| Client
-    Client -->|Raw Pages| Paginator
-    Paginator -->|Validated Raw Pages| Finalizer
+    API -->|Raw Kline Batches| Adapter
+    Adapter -->|Raw Pages| Paginator
+    Paginator --> RawValidator
+    RawValidator --> Finalizer
     Finalizer -->|Finalized Raw Candles| Validator
     Validator -->|Contract Violation| Fail["Halt Ingestion & Write Manifest Failure"]
     Validator -->|Validated Immutable Candles| QualityAnalyzer
@@ -158,6 +167,7 @@ flowchart TD
     BinaryFingerprint --> ManifestManager
     ManifestManager --> StageStore
     StageStore --> AtomicRename
+    AtomicRename -->|Target Exists -> EEXIST Error| Collision["Halt with PathCollisionError"]
     AtomicRename --> DataFiles
     AtomicRename -->|Commit Transaction| DuckDBCatalog
     DuckDBCatalog -.->|Startup Reconciliation & Re-hash| DataFiles
@@ -176,13 +186,16 @@ To prevent truncation, precision drift, and platform-specific IEEE-754 floating-
 All conversions between Python `datetime` and integer epoch units must use exact integer arithmetic anchored to `datetime(1970, 1, 1, tzinfo=timezone.utc)`:
 
 ```python
+from datetime import datetime, timedelta, timezone
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 
 def datetime_to_epoch_ms(dt: datetime) -> int:
     """Convert an aware UTC datetime to integer epoch milliseconds.
 
-    Rejects naive datetimes and pre-epoch timestamps.
+    Rejects naive datetimes, pre-epoch timestamps, and fractional milliseconds.
     """
     if dt.tzinfo is None or dt.utcoffset() != timedelta(0):
         raise ValueError(f"Datetime {dt} must be explicit timezone-aware UTC.")
@@ -190,8 +203,12 @@ def datetime_to_epoch_ms(dt: datetime) -> int:
         raise ValueError(f"Pre-epoch datetime {dt} is not supported.")
 
     diff = dt - EPOCH_UTC
-    # Exact integer arithmetic using microseconds
     total_micros = diff.days * 86_400_000_000 + diff.seconds * 1_000_000 + diff.microseconds
+
+    # Explicitly reject sub-millisecond fractions
+    if total_micros % 1_000 != 0:
+        raise ValueError(f"Timestamp {dt} has fractional milliseconds (microseconds: {diff.microseconds}).")
+
     return total_micros // 1_000
 
 
@@ -206,22 +223,24 @@ def epoch_ms_to_datetime(ms: int) -> datetime:
 
 
 def timeframe_to_duration_ms(timeframe: SupportedTimeframe) -> int:
-    """Return exact integer duration milliseconds for supported timeframes."""
-    minutes_map = {
-        SupportedTimeframe.ONE_MINUTE: 1,
-        SupportedTimeframe.FIVE_MINUTES: 5,
-        SupportedTimeframe.FIFTEEN_MINUTES: 15,
-        SupportedTimeframe.THIRTY_MINUTES: 30,
-        SupportedTimeframe.ONE_HOUR: 60,
-        SupportedTimeframe.FOUR_HOURS: 240,
-        SupportedTimeframe.ONE_DAY: 1440,
+    """Return exact integer duration milliseconds for M0 SupportedTimeframe members."""
+    minutes_map: dict[SupportedTimeframe, int] = {
+        SupportedTimeframe.M1: 1,
+        SupportedTimeframe.M5: 5,
+        SupportedTimeframe.M15: 15,
+        SupportedTimeframe.M30: 30,
+        SupportedTimeframe.H1: 60,
+        SupportedTimeframe.H4: 240,
+        SupportedTimeframe.D1: 1440,
     }
+    if timeframe not in minutes_map:
+        raise ValueError(f"Unsupported timeframe: {timeframe}")
     return minutes_map[timeframe] * 60_000
 ```
 
 ### B. Sub-Millisecond & Pre-Epoch Timestamp Policy
-- **Sub-Millisecond Policy:** Microsecond fractions on input datetimes must be exact multiples of 1,000 ($\mu s \pmod{1000} == 0$). If sub-millisecond fractions exist, input validation raises `UnalignedTimestampError` rather than silently rounding or truncating.
-- **Pre-Epoch Policy:** Timestamps prior to `1970-01-01T00:00:00Z` ($ms < 0$) are rejected with `PreEpochTimestampError`. Cryptocurrency spot markets did not exist prior to 2009; pre-epoch dates indicate invalid configurations.
+- **Sub-Millisecond Policy:** Microsecond fractions on input datetimes must be exact multiples of 1,000 (`total_micros % 1000 == 0`). If sub-millisecond fractions exist, input validation raises `ValueError` rather than silently rounding or truncating.
+- **Pre-Epoch Policy:** Timestamps prior to `1970-01-01T00:00:00Z` ($ms < 0$) are rejected with `ValueError`. Cryptocurrency spot markets did not exist prior to 2009; pre-epoch dates indicate invalid configurations.
 
 ### C. Request-Window Semantics & Grid Alignment
 The requested range is defined as the half-open interval `[since, until)`:
@@ -245,186 +264,147 @@ $$N_{\text{expected}} = \frac{\text{until\_ms} - \text{since\_ms}}{\Delta_{\text
 
 ---
 
-## 6. Strict Raw-Page Validation & Pagination Controller
+## 6. Strict Raw-Page & OHLCV Structure Validation
 
-### A. Raw-Page Validation Invariants
-Before accepting any page of raw OHLCV rows from CCXT, the paginator must execute the following checks in order:
-1. **Timestamp Type & Representation:** Every `kline[0]` must be a strictly non-negative Python integer (`isinstance(t, int) and not isinstance(t, bool)`).
-2. **Strict Ascending Order:** Timestamps within the page must be strictly increasing:
+### A. Strict Raw OHLCV Row Structure & Numeric Validation
+Before accessing `row[0]` or any individual elements, the paginator validates the structural and numerical integrity of each Kline row:
+1. **Row Container & Length Type:** The row must be an ordered sequence (`list` or `tuple`) containing **exactly 6 fields** (`len(row) == 6`). Longer or shorter tuples are rejected immediately with `MalformedKlineError`.
+2. **Field Types & Content:**
+   - Field `[0]` (`open_time_ms`): Must be a strictly non-negative integer (`isinstance(t, int) and not isinstance(t, bool) and t >= 0`).
+   - Fields `[1]` (`open`), `[2]` (`high`), `[3]` (`low`), `[4]` (`close`), `[5]` (`volume`): Must be valid numeric values (instances of `int` or `float`, not `bool`).
+3. **Finite-Value Check:** Every numeric price and volume field must be strictly finite (`math.isfinite(val) is True`). `NaN`, `+Infinity`, and `-Infinity` are rejected with `MalformedKlineError`.
+4. **Basic Price Positivity & Volume Non-Negativity:**
+   - Prices (`open`, `high`, `low`, `close`) must be strictly positive ($> 0$).
+   - Volume must be non-negative ($\ge 0$).
+5. **Preservation of M0 Domain Authority:** This ingestion-level check serves as an early filter to reject corrupted exchange wire payloads before finalization. The comprehensive domain invariants (e.g. `high >= max(open, close)`, `low <= min(open, close)`, timezone-aware UTC datetime conversions, and symbol formatting) are strictly validated by M0's `validate_candles()` as the final domain authority.
+
+### B. Strict Raw-Page Ordering & Invariants
+1. **Strict Ascending Order:** Timestamps within the page must be strictly increasing:
    $$t_{i+1} > t_i \quad \forall \, 0 \le i < \text{len}(\text{page}) - 1$$
    Decreasing or identical timestamps inside a page raise `MalformedPageError`.
-3. **Cursor Compliance:** Every returned timestamp must be $\ge \text{current\_since\_ms}$. If $t_0 < \text{current\_since\_ms}$, the page contains stale or non-advancing data, triggering `PaginationRegressionError`.
-4. **No Overlap with Previously Accepted Data:** If a previous page was accepted with timestamps $S_{\text{prev}}$, the intersection $\text{set}(t \in \text{page}) \cap S_{\text{prev}}$ must be empty. Overlaps indicate an exchange cursor regression and raise `PageOverlapError`.
-5. **Full Sequence Verification:** The entire sequence of timestamps is validated against regression and duplicate sets, not merely the first and last timestamps.
-6. **Maximum Timestamp Authenticity:** The paginator asserts that $\max(\text{page timestamps}) == \text{page}[-1][0]$.
+2. **Cursor Compliance:** Every returned timestamp must be $\ge \text{current\_since\_ms}$. If $t_0 < \text{current\_since\_ms}$, the page contains stale or non-advancing data, triggering `PaginationRegressionError`.
+3. **No Overlap with Previously Accepted Data:** If previous pages accepted timestamps $S_{\text{prev}}$, the intersection $\text{set}(t \in \text{page}) \cap S_{\text{prev}}$ must be empty. Overlaps indicate an exchange cursor regression and raise `PageOverlapError`.
+4. **Full Sequence Verification:** The entire sequence of timestamps is validated against regression and duplicate sets, not merely the first and last timestamps.
+5. **Maximum Timestamp Authenticity:** The paginator asserts that $\max(\text{page timestamps}) == \text{page}[-1][0]$.
 
-### B. Cursor Advancement Invariant
+### C. Cursor Advancement Invariant
 The cursor must advance if and only if the page has passed all raw-page validation checks:
 $$\text{current\_since\_ms} = \text{max\_raw\_open\_ms} + 1$$
 - **Incomplete Candle Independence:** If the final candle on the page is in progress and excluded by the finalization guard, `current_since_ms` **still advances** based on $\text{max\_raw\_open\_ms} + 1$. Because cursor advancement is driven by the validated raw page rather than the finalized subset, tail-candle filtering can never stall the loop.
 
-### C. Consistent Request Budget & Safety Ceiling
+### D. Consistent Request Budget & Safety Ceiling
 To prevent runaway loops when responses contain sparse or partial pages, M1 defines a consistent maximum request budget:
 $$\text{budget} = \max\left(50, \, \left\lceil \frac{N_{\text{expected}}}{\text{PAGE\_LIMIT}} \right\rceil \times 3\right)$$
 Where $\text{PAGE\_LIMIT} = 1000$ (Binance maximum per request). If the pagination iteration count exceeds $\text{budget}$, pagination aborts with `PaginationBudgetExceededError`.
 
-### D. Paginator Implementation Specification
-```python
-def paginate_ohlcv(
-    adapter: PublicExchangeAdapter,
-    symbol: str,
-    timeframe: SupportedTimeframe,
-    since_ms: int,
-    until_ms: int,
-    clock: MonotonicClockEstimator,
-) -> list[RawKline]:
-    """Deterministically paginate historical OHLCV from Binance vision public endpoints."""
-    step_ms = timeframe_to_duration_ms(timeframe)
-    expected_count = (until_ms - since_ms) // step_ms
-    max_pages = max(50, ((expected_count + 999) // 1000) * 3)
+---
 
-    current_since_ms = since_ms
-    collected_candles: list[RawKline] = []
-    seen_timestamps: set[int] = set()
-    page_count = 0
+## 7. Clock Authority, Uncertainty Interval & Conservative Finalization
 
-    while current_since_ms < until_ms:
-        page_count += 1
-        if page_count > max_pages:
-            raise PaginationBudgetExceededError(f"Pagination exceeded safety budget of {max_pages} requests.")
+### A. Server-Time Uncertainty Interval (Never Finalize Early)
+Assuming symmetric network latency introduces risk: if response transmission is delayed, the exchange server clock may actually be further behind the client's estimate. To guarantee that **no candle is ever finalized prematurely**, M1 models server time as an **uncertainty interval** $[T_{\text{server\_min}}, T_{\text{server\_max}}]$ and uses the **conservative lower bound** for all finalization decisions.
 
-        page = adapter.fetch_ohlcv(symbol, timeframe.value, since=current_since_ms, limit=1000)
+1. **Sampling Protocol:**
+   - Measure monotonic timestamps around the server-time call:
+     ```python
+     t_mono_before = time.monotonic_ns()
+     t_server_ms = adapter.fetch_time()
+     t_mono_after = time.monotonic_ns()
+     ```
+   - Round-trip latency is $\Delta_{\text{RTT}} = (t_{\text{mono\_after}} - t_{\text{mono\_before}}) // 1_000_000\,\text{ms}$.
+2. **Uncertainty Lower Bound Formulation:**
+   - The exchange timestamp `t_server_ms` was generated at some moment between $t_{\text{mono\_before}}$ and $t_{\text{mono\_after}}$.
+   - In the worst-case scenario (all network delay occurred on the outbound request, so response returned instantaneously), the server clock at $t_{\text{mono\_after}}$ is at least `t_server_ms`.
+   - Therefore, at any elapsed monotonic time $\Delta_{\text{mono}} = (t_{\text{mono\_now}} - t_{\text{mono\_after}}) // 1_000_000\,\text{ms}$, the **conservative lower bound of estimated server time** is:
+     $$T_{\text{server\_min\_ms}} = t_{\text{server\_ms}} + \Delta_{\text{mono}}$$
+     *(Zero assumed outbound delay; conservative lower bound prevents premature candle closure).*
+3. **Conservative Finalization Rule:**
+   A candle is finalized if and only if:
+   $$T_{\text{open\_ms}} + \Delta_{\text{timeframe\_ms}} \le T_{\text{server\_min\_ms}}$$
+   Because $T_{\text{server\_min\_ms}} \le T_{\text{actual\_server}}$, this strictly guarantees that the candle's close boundary has passed on the exchange.
 
-        # 1. Empty page: Exchange has no further data in range
-        if not page:
-            break
-
-        # 2. Strict type, structure, and ordering validation
-        page_timestamps: list[int] = []
-        for i, row in enumerate(page):
-            if not isinstance(row[0], int) or isinstance(row[0], bool):
-                raise MalformedPageError(f"Row {i} timestamp {row[0]!r} is not an integer.")
-            t = row[0]
-            if page_timestamps and t <= page_timestamps[-1]:
-                raise MalformedPageError(f"Page timestamps not strictly increasing: {page_timestamps[-1]} -> {t}")
-            if t < current_since_ms:
-                raise PaginationRegressionError(f"Row timestamp {t} violates cursor {current_since_ms}")
-            if t in seen_timestamps:
-                raise PageOverlapError(f"Timestamp {t} was already accepted in a previous page.")
-            page_timestamps.append(t)
-
-        max_raw_open_ms = page_timestamps[-1]
-        seen_timestamps.update(page_timestamps)
-
-        # 3. Finalization filtering & range enclosure
-        obs_time_ms = clock.get_estimated_server_time_ms()
-
-        for raw_kline in page:
-            open_ms = raw_kline[0]
-
-            # Exclusive until check: [since, until)
-            if open_ms >= until_ms:
-                return collected_candles
-
-            # Candle finalization guard: close boundary <= observed server time
-            close_ms = open_ms + step_ms
-            if close_ms > obs_time_ms:
-                # In-progress candle; exclude from historical dataset
-                continue
-
-            collected_candles.append(raw_kline)
-
-        # 4. Advance cursor strictly based on validated raw page
-        current_since_ms = max_raw_open_ms + 1
-
-    return collected_candles
-```
+### B. Clock Resampling, Age Ceiling & Exhaustion Policy
+- **Maximum Clock Age:** The clock offset estimate has a maximum lifetime of 10 minutes (`MAX_CLOCK_AGE_SEC = 600`).
+- **Resampling Protocol:** If clock age exceeds 10 minutes, or if round-trip latency during a sample exceeds 2,000 ms, the adapter attempts resampling up to `MAX_CLOCK_RESAMPLE_ATTEMPTS = 3` times.
+- **Uncertainty Exhaustion Policy:** If all 3 resampling attempts exceed 2,000 ms RTT, or if $|\tau_{\text{exchange}} - \tau_{\text{local}}| > 3000\,\text{ms}$ in either direction, ingestion **halts immediately** with `UnreliableClockError`. The pipeline refuses to finalize candles when server time cannot be established with high confidence.
 
 ---
 
-## 7. Clock Authority, Monotonic Synchronization & Skew Mitigation
+## 8. Public-Only Exchange Adapter & Endpoint Routing
 
-### A. The Clock-Skew Vulnerability & Correct Directionality
-A naive finalization rule using unverified local system time creates two severe failure modes:
-1. **Local Clock Ahead ($\tau_{\text{local}} > \tau_{\text{exchange}}$):** The client believes an interval has closed before the exchange has finished trading it. This prematurely persists incomplete candle data as historical truth.
-2. **Local Clock Behind ($\tau_{\text{local}} < \tau_{\text{exchange}}$):** The client refuses to accept fully closed candles at the tail of the requested window.
-
-### B. Monotonic Exchange-Time Offset Estimation
-To eliminate dependence on the local wall clock, M1 anchors observation time to Binance exchange server time tracked via Python's monotonic clock (`time.monotonic_ns()`):
-
-1. **Round-Trip Latency Sampling:** At session startup, the adapter samples Binance public time (`GET /api/v3/time`):
-   ```python
-   t_mono_before = time.monotonic_ns()
-   t_server_ms = adapter.fetch_time()
-   t_mono_after = time.monotonic_ns()
-
-   round_trip_ms = (t_mono_after - t_mono_before) // 1_000_000
-   one_way_delay_ms = round_trip_ms // 2
-   # Estimated exchange server time at monotonic reference point t_mono_after
-   t_server_estimated_ms = t_server_ms + one_way_delay_ms
-   ```
-2. **Current Observation Time Formula:**
-   $$\tau_{\text{obs\_ms}} = t_{\text{server\_estimated\_ms}} + \frac{t_{\text{mono\_now}} - t_{\text{mono\_after}}}{1\,000\,000}$$
-3. **Offset Resampling & Clock Age Ceiling:**
-   - The clock offset estimate has a maximum lifetime of 10 minutes (`MAX_CLOCK_AGE_SEC = 600`).
-   - If an ingestion session exceeds 10 minutes, the adapter automatically resamples server time.
-4. **Latency Uncertainty & Skew Guard:**
-   - If round-trip latency during clock sampling exceeds 2,000 ms, the sample is rejected and retried.
-   - If the absolute discrepancy between local wall time and exchange time $|\tau_{\text{exchange}} - \tau_{\text{local}}| > 3000\,\text{ms}$, ingestion aborts immediately with `ClockSkewError("System clock skew exceeds safe threshold")`.
-   - Separate offline tests must explicitly exercise:
-     - `test_clock_local_ahead_aborts`: Local clock ahead by $>3$ seconds halts.
-     - `test_clock_local_behind_aborts`: Local clock behind by $>3$ seconds halts.
-     - `test_clock_high_latency_resamples`: Round trip latency $>2$ seconds triggers resampling.
-
----
-
-## 8. Binance Vision Endpoint Configuration & Rate-Limiting
-
-### A. Dedicated Public Market Data Host
-Binance provides an isolated public market data cluster decoupled from account trading and order routing engines:
-```text
-https://data-api.binance.vision
-```
-Using this host ensures that historical ingestion traffic does not compete with matching engine queues, reduces rate-limit contention, and guarantees zero authenticated API endpoints are reachable.
-
-### B. CCXT Public Adapter Configuration
-CCXT's default Binance endpoint dictionary points to `https://api.binance.com`. In M1, the exchange adapter overrides CCXT's endpoint configuration on instantiation:
+### A. Strict Allowlisted Adapter Interface (`PublicExchangeAdapter`)
+To prevent architectural leaks, raw CCXT objects and authenticated methods are strictly encapsulated. The ingestion engine interacts solely through a narrow, allowlisted interface:
 
 ```python
-import ccxt
+from typing import Protocol
 
 
-def create_binance_public_adapter() -> ccxt.binance:
-    exchange = ccxt.binance(
-        {
-            "enableRateLimit": True,
-            "options": {
-                "defaultType": "spot",
-                "adjustForTimeDifference": False,  # Managed by OQI MonotonicClockEstimator
-            },
-            "urls": {
-                "api": {
-                    "public": "https://data-api.binance.vision/api/v3",
-                    # Explicitly disable private/trading endpoints
-                    "private": None,
-                    "v1": "https://data-api.binance.vision/api/v3",
-                }
-            },
-        }
-    )
-    return exchange
+class RawKlineRow(list):
+    """Raw Kline tuple [open_time, open, high, low, close, volume]."""
+
+
+class PublicExchangeAdapter(Protocol):
+    """Strict allowlisted public market data interface encapsulating CCXT."""
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, since_ms: int, limit: int = 1000) -> list[RawKlineRow]:
+        """Fetch raw public OHLCV candles from Binance vision cluster."""
+        ...
+
+    def fetch_time(self) -> int:
+        """Fetch public Binance server timestamp in milliseconds."""
+        ...
+
+    def get_rate_limit_weight_limit(self) -> int:
+        """Return maximum IP request weight per minute from exchangeInfo."""
+        ...
+
+    def get_last_used_weight_1m(self) -> int:
+        """Return the latest recorded X-MBX-USED-WEIGHT-1M header value."""
+        ...
 ```
 
-### C. Request-Weight Management & Response Headers
-Binance Spot enforces rate limits based on IP request weight per minute (typically 1,200 or 6,000 weight/min):
-1. **Dynamic Limit Retrieval:** At session initialization, the adapter calls `exchange.fetch_exchange_status()` or inspects `GET /api/v3/exchangeInfo` rate-limit blocks to record the current IP weight capacity.
-2. **Used-Weight Header Inspection:** Every response inspects the header `X-MBX-USED-WEIGHT-1M`.
-   - If used weight is $\le 70\%$ of capacity: proceed at normal paced rate.
-   - If used weight is $> 70\%$ of capacity: inject an adaptive proportional delay:
-     $$\text{sleep\_ms} = \left(\frac{\text{used\_weight}}{\text{max\_weight}}\right)^2 \times 500\,\text{ms}$$
-   - If used weight is $> 90\%$: pause execution until the current 60-second window expires.
-3. **HTTP 429 Handling:** Inspects the `Retry-After` header. If present, sleeps for the specified number of seconds $+ 500\,\text{ms}$ jitter. If absent, applies exponential backoff capped at 60 seconds. Maximum 3 retries.
-4. **HTTP 418 IP Ban:** If Binance returns HTTP 418 (`DDoSProtection` / IP ban), **HALT IMMEDIATELY WITH ZERO RETRIES**. Log a `CRITICAL` error and record the ban in the ingestion manifest to protect the user's infrastructure.
+### B. Dedicated Public Market Data Host & Encapsulation
+- **Public Market Data Host:** Configured exclusively to Binance's dedicated public cluster:
+  ```text
+  https://data-api.binance.vision
+  ```
+- **Disabling Private/Trading Methods:**
+  ```python
+  import ccxt
+
+
+  class BinanceVisionPublicAdapter:
+      def __init__(self) -> None:
+          self._exchange = ccxt.binance(
+              {
+                  "enableRateLimit": True,
+                  "options": {
+                      "defaultType": "spot",
+                      "adjustForTimeDifference": False,
+                  },
+                  "urls": {
+                      "api": {
+                          "public": "https://data-api.binance.vision/api/v3",
+                          "v1": "https://data-api.binance.vision/api/v3",
+                          "private": None,  # Disabled
+                      }
+                  },
+              }
+          )
+          # Explicitly seal unnecessary methods
+          self._exchange.create_order = None
+          self._exchange.cancel_order = None
+          self._exchange.fetch_balance = None
+  ```
+
+### C. Rate Limits from `exchangeInfo` & Header Inspection
+- **Weight Limits from `exchangeInfo`:** During session initialization, the adapter calls `GET /api/v3/exchangeInfo` and parses the `rateLimits` array for `rateLimitType == "REQUEST_WEIGHT"` and `interval == "MINUTE"`. The returned `limit` (e.g. 1,200 or 6,000) is cached. `fetch_exchange_status()` is **not** used.
+- **Used-Weight Header Inspection:** Every response inspects the header `X-MBX-USED-WEIGHT-1M`.
+  - Used weight $\le 70\%$: Paced execution.
+  - Used weight $> 70\%$: Adaptive proportional sleep $\text{sleep\_ms} = (\text{used} / \text{limit})^2 \times 500\,\text{ms}$.
+  - Used weight $> 90\%$: Pauses execution until the current 60-second window expires.
+- **HTTP 429:** Respects `Retry-After` header $+ 500\,\text{ms}$ jitter. Up to 3 retries.
+- **HTTP 418 IP Ban:** **HALT IMMEDIATELY WITH ZERO RETRIES.** Log `CRITICAL` error.
 
 ---
 
@@ -433,10 +413,21 @@ Binance Spot enforces rate limits based on IP request weight per minute (typical
 To guarantee deterministic data integrity across platforms, compilers, and DuckDB versions, M1 establishes **exactly one canonical serialization contract**.
 
 ### A. Content Fingerprint vs. Artifact SHA-256
-- **Canonical Content Fingerprint (`content_fingerprint_sha256`):** Computed over a strictly normalized, length-prefixed binary stream of validated candle attributes. Completely invariant to OS, Parquet metadata, row-group chunking, or Snappy compression differences.
-- **Parquet Artifact SHA-256 (`file_sha256`):** Standard SHA-256 cryptographic digest of the physical `.parquet` file on disk. Used for block corruption and storage verification.
+- **Canonical Content Fingerprint (`content_fingerprint_sha256`):** Computed over a strictly normalized, length-prefixed binary stream of validated candle attributes. Invariant to OS, Parquet metadata, row-group chunking, or compression differences.
+- **Parquet Artifact SHA-256 (`file_sha256`):** Standard SHA-256 cryptographic digest of the physical `.parquet` file on disk.
 
-### B. Canonical Binary Serialization Specification
+### B. Negative-Zero Normalization Contract
+In IEEE-754 floating point arithmetic, $-0.0$ and $+0.0$ have distinct bit representations (`0x8000000000000000` vs. `0x0000000000000000`).
+- **Normalization Rule:** Before binary encoding, all price and volume values are normalized:
+  ```python
+  def normalize_float(val: float) -> float:
+      if val == 0.0:  # Matches both +0.0 and -0.0 in Python
+          return 0.0
+      return val
+  ```
+  This ensures negative zero is strictly normalized to positive zero, eliminating non-deterministic hashing variances.
+
+### C. Canonical Binary Serialization Specification
 The binary stream fed into `hashlib.sha256()` is constructed through strict little-endian binary encoding:
 
 ```text
@@ -452,35 +443,40 @@ The binary stream fed into `hashlib.sha256()` is constructed through strict litt
 [Candle Record Block] (Repeated for each candle, ordered strictly by open_time ascending)
   - Open Time Epoch ms:   INT64_LE (8 bytes)
   - Close Time Epoch ms:  INT64_LE (8 bytes)
-  - Open Price:           IEEE-754 binary64 DOUBLE_LE (8 bytes)
-  - High Price:           IEEE-754 binary64 DOUBLE_LE (8 bytes)
-  - Low Price:            IEEE-754 binary64 DOUBLE_LE (8 bytes)
-  - Close Price:          IEEE-754 binary64 DOUBLE_LE (8 bytes)
-  - Base Volume:          IEEE-754 binary64 DOUBLE_LE (8 bytes)
+  - Open Price:           Normalized IEEE-754 binary64 DOUBLE_LE (8 bytes)
+  - High Price:           Normalized IEEE-754 binary64 DOUBLE_LE (8 bytes)
+  - Low Price:            Normalized IEEE-754 binary64 DOUBLE_LE (8 bytes)
+  - Close Price:          Normalized IEEE-754 binary64 DOUBLE_LE (8 bytes)
+  - Base Volume:          Normalized IEEE-754 binary64 DOUBLE_LE (8 bytes)
   - Quote Volume Present: UINT8 (1 byte: 0 = NULL, 1 = Present)
-    [If Present]:         IEEE-754 binary64 DOUBLE_LE (8 bytes)
+    [If Present]:         Normalized IEEE-754 binary64 DOUBLE_LE (8 bytes)
   - Trade Count Present:  UINT8 (1 byte: 0 = NULL, 1 = Present)
     [If Present]:         INT64_LE (8 bytes)
 ```
 
 #### Canonical Serialization Rules
 1. **Validation Prerequisite:** Fingerprinting is performed **only after** candles pass full `validate_candles()` contract checks.
-2. **No Silent Sorting:** The input sequence must already be sorted in strict ascending order. If $t_{i+1} \le t_i$, fingerprinter raises `UnsortedStreamError`.
-3. **Normalized Float Representation:** Prices and volumes are verified finite (`math.isfinite(val) is True`). IEEE-754 binary64 little-endian (`<d` in Python `struct`) provides unambiguous byte sequences.
+2. **No Silent Sorting:** Input sequence must already be sorted in strict ascending order. If $t_{i+1} \le t_i$, fingerprinter raises `UnsortedStreamError`.
+3. **Normalized Float Representation:** Prices and volumes verified finite (`math.isfinite(val) is True`). IEEE-754 binary64 little-endian (`<d` in Python `struct`) provides unambiguous byte sequences.
 4. **Final Digest:** `hashlib.sha256()` digest formatted as a lowercase 64-character hexadecimal string prefixed with `sha256:`.
 5. **Illustrative Sample Format:** All sample hashes shown in proposals or documentation are explicitly illustrative format examples, not hardcoded verification anchors.
 
 ---
 
-## 10. Crash Recovery, Durable Manifest & Storage Reconciliation
+## 10. Crash Recovery, Durable Manifest & Atomic No-Clobber Publication
 
-### A. Ingestion Manifest & Active Leases
-To prevent race conditions, orphan file confusion, and unrecoverable partial writes, every ingestion job generates a durable JSON manifest file alongside staging data:
+### A. Cross-Platform Atomic No-Clobber Publication
+To uphold the invariant that **existing historical datasets are immutable and never overwritten**, M1 replaces `os.replace()` (which clobbers destination files on POSIX) with an atomic no-clobber publication operation:
+- **POSIX Systems:** Uses `os.link(staging_path, target_path)` followed by `os.unlink(staging_path)`. If `target_path` already exists, `os.link()` raises `FileExistsError` (EEXIST) atomically without touching the target.
+- **Windows Systems:** Uses the Win32 `MoveFileExW` API with flag `MOVEFILE_WRITE_THROUGH` and without `MOVEFILE_REPLACE_EXISTING`. If the destination exists, it raises `FileExistsError` atomically.
+- **Collision Handling:** If `target_path` already exists, ingestion halts immediately with `DatasetPathCollisionError`. The staging file remains in place and is logged for administrative review. Target files are never overwritten.
+
+### B. Ingestion Manifest Schema & Active Leases
+Every ingestion job writes a durable JSON manifest file alongside staging data:
 ```text
 data/datasets/.ingest_manifest_<ingestion_uuid>.json
 ```
 
-#### Ingestion Manifest Schema
 ```json
 {
   "ingestion_uuid": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
@@ -505,75 +501,36 @@ data/datasets/.ingest_manifest_<ingestion_uuid>.json
 }
 ```
 
-### B. Multi-Stage Ingestion State Machine
-```text
-[ INITIALIZING ]  --> Writes active manifest (.ingest_manifest_<uuid>.json) with PID lease
-         │
-         ▼
-[ WRITING_TMP ]   --> Writes data to staging path: <target_name>.tmp_<uuid>
-         │
-         ▼
-[ VERIFY_TMP ]    --> Verifies readable Parquet, row count, and matches file_sha256
-         │
-         ▼
-[ ATOMIC_RENAME ] --> Atomic same-filesystem rename: os.replace(staging, target)
-         │
-         ▼
-[ CATALOG_COMMIT] --> DuckDB ACID transaction: insert dataset + gaps record
-         │
-         ▼
-[ CLEANUP ]       --> Unlinks manifest file; state is now fully durable in DuckDB
-```
+### C. Manifest Reconciliation Protocol (Commit Success vs. Unlink Failure)
+If a process crashes after DuckDB commit succeeds but before `.ingest_manifest_<uuid>.json` is deleted:
+1. Startup reconciliation detects the orphaned manifest.
+2. Checks DuckDB catalog for `ingestion_uuid`.
+3. If a record with `ingestion_status = 'COMMITTED'` already exists for that `ingestion_uuid`, the manifest is simply unlinked (transaction already durable in catalog).
+4. If no record exists, reconciliation verifies the Parquet artifact and completes the commit transaction.
 
-### C. Active Lease Protocol & Safe Staging Cleanup
-- A staging `.tmp` file is **never deleted based on age alone**.
-- Before cleaning any `.tmp` file, the startup reconciliation engine inspects its matching manifest:
-  1. Checks if `lease_owner_pid` is currently running on the operating system.
-  2. Checks if `lease_expires_at_utc` is in the past.
-  3. Only if the PID is dead and the lease has expired is the staging file considered orphaned and deleted.
-
-### D. Startup Reconciliation & Quarantine Engine
-On CLI startup, OQI scans `data/datasets/`:
-1. **Unregistered Valid Artifacts:** If a `.parquet` file exists without a catalog record, the engine checks for a corresponding manifest. If the file's computed `file_sha256` matches the manifest, it reads the data, recomputes `content_fingerprint_sha256`, and completes the catalog commit transaction as a recovered dataset.
-2. **Unverifiable / Tampered Artifacts:** If an unregistered `.parquet` file has no manifest, is unreadable, or fails hash verification, it is **quarantined**:
-   - Moved to `data/quarantine/<timestamp>_<filename>`.
-   - Logged as a quarantine event in `data/quarantine_log.jsonl`.
-   - Never silently deleted.
+### D. Safe Staging Cleanup & Quarantine
+- **Active Lease Protection:** Staging `.tmp` files are never deleted on age alone. Before cleaning, the reconciler checks if `lease_owner_pid` is active on the OS and `lease_expires_at_utc` is in the future.
+- **Quarantine:** Unregistered, corrupted, or untracked `.parquet` files are moved to `data/quarantine/<timestamp>_<filename>` and logged in `data/quarantine_log.jsonl`.
 
 ---
 
-## 11. Parquet Storage Model & DuckDB Catalog Specification
+## 11. Parquet Storage Model, EMPTY Deduplication & DuckDB Catalog
 
-### A. Immutable Dataset Snapshots & Collision-Safe Naming
-- Every dataset file is immutable and named using a unique snapshot ID derived from the ingestion UUID:
-  ```text
-  data/datasets/exchange=binance/market=spot/symbol=BTC_USDT/timeframe=1h/
-      dataset_20261101T000000Z_20261105T000000Z_<content_hash_8>_<ingestion_uuid_8>.parquet
-  ```
-- Including `<ingestion_uuid_8>` guarantees collision-safe paths on re-ingestion (`--force`).
+### A. EMPTY Snapshot Idempotency & Deduplication
+When the exchange legitimately returns zero candles for a requested window (e.g. market did not exist prior to listing):
+1. **Catalog Representation:**
+   - `record_count = 0`, `gap_count = 0`, `missing_intervals = N_expected`.
+   - `quality_status = 'EMPTY'`, `ingestion_status = 'COMMITTED'`.
+   - `file_path = NULL`, `file_sha256 = NULL`, `file_size_bytes = NULL` (no physical file created).
+   - `content_fingerprint_sha256 = "sha256:EMPTY"`.
+2. **Deduplication Policy:**
+   - If `open-quant ingest` is invoked for a range with an existing verified `EMPTY` snapshot in the catalog:
+     - The CLI detects the `EMPTY` record.
+     - Logs: `Verified EMPTY dataset already recorded for this range. Skipping ingestion. Use --force to re-query exchange.`
+     - Exits with returncode 0 without performing network requests.
+   - If `--force` is supplied, ingestion re-queries Binance vision endpoints. If still empty, it records a new timestamped `EMPTY` snapshot under the same `dataset_identity`.
 
-### B. Parquet Schema Specification
-| Column Name | Logical Parquet Type | Physical Type | Nullable | OQI Candle Model Field |
-|---|---|---|:---:|---|
-| `exchange_id` | `VARCHAR` | `BYTE_ARRAY` | No | `Candle.exchange_id` |
-| `market_type` | `VARCHAR` | `BYTE_ARRAY` | No | `Candle.market_type` |
-| `symbol` | `VARCHAR` | `BYTE_ARRAY` | No | `Candle.symbol` |
-| `timeframe` | `VARCHAR` | `BYTE_ARRAY` | No | `Candle.timeframe` |
-| `open_time` | `TIMESTAMP_MICROS (UTC)` | `INT64` | No | `Candle.open_time` |
-| `close_time` | `TIMESTAMP_MICROS (UTC)` | `INT64` | No | `Candle.close_time` |
-| `open` | `DOUBLE` | `DOUBLE` | No | `Candle.open` |
-| `high` | `DOUBLE` | `DOUBLE` | No | `Candle.high` |
-| `low` | `DOUBLE` | `DOUBLE` | No | `Candle.low` |
-| `close` | `DOUBLE` | `DOUBLE` | No | `Candle.close` |
-| `base_volume` | `DOUBLE` | `DOUBLE` | No | `Candle.base_volume` |
-| `quote_volume` | `DOUBLE` | `DOUBLE` | **Yes** | `Candle.quote_volume` (`NULL` in M1) |
-| `trade_count` | `INT64` | `INT64` | **Yes** | `Candle.trade_count` (`NULL` in M1) |
-
-### C. DuckDB Catalog Schema (DDL)
-To cleanly separate ingestion lifecycle status from data quality status and support empty datasets:
-- `file_path` and `file_sha256` are **nullable** (an `EMPTY` dataset creates no Parquet file).
-- `ingestion_status` (`COMMITTED`, `FAILED`, `ABORTED`) is separated from `quality_status` (`EMPTY`, `GAP_FREE`, `GAP_CONTAINING`, `CORRUPTED`).
-
+### B. DuckDB Catalog Schema (DDL)
 ```sql
 CREATE TABLE IF NOT EXISTS datasets (
     snapshot_id VARCHAR PRIMARY KEY,             -- Unique snapshot ID (e.g. 'snap_f47ac10b8e21')
@@ -590,7 +547,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     record_count BIGINT NOT NULL,                -- Actual records captured (0 if EMPTY)
     gap_count INTEGER NOT NULL,                  -- Number of gap events
     missing_intervals BIGINT NOT NULL,           -- Total missing intervals across all gaps
-    content_fingerprint_sha256 VARCHAR NOT NULL, -- Canonical content hash (empty hash for EMPTY)
+    content_fingerprint_sha256 VARCHAR NOT NULL, -- Canonical content hash ('sha256:EMPTY' if EMPTY)
     file_sha256 VARCHAR,                         -- NULL for EMPTY datasets
     file_path VARCHAR,                           -- NULL for EMPTY datasets
     file_size_bytes BIGINT,                      -- NULL for EMPTY datasets
@@ -612,17 +569,6 @@ CREATE TABLE IF NOT EXISTS dataset_gaps (
 CREATE INDEX IF NOT EXISTS idx_datasets_identity 
 ON datasets(dataset_identity, ingested_at DESC);
 ```
-
-### D. Idempotency, Deduplication & Re-Ingestion (`--force`)
-1. **Deduplication:** When `open-quant ingest` is invoked:
-   - Computes `dataset_identity`.
-   - Queries DuckDB for the latest `COMMITTED` snapshot matching this identity.
-   - If found, and `file_path` exists with matching `file_sha256`:
-     - Ingestion exits immediately with code 0: `Dataset already committed and verified. Use --force to re-download.`
-2. **Re-Ingestion (`--force`):**
-   - Ingestion proceeds, generating a fresh `ingestion_uuid` and distinct `snapshot_id`.
-   - Stored in a distinct Parquet file incorporating the new UUID prefix.
-   - Registered in DuckDB as a new snapshot under the same `dataset_identity`. Historical snapshots remain queryable and immutable.
 
 ---
 
@@ -680,19 +626,16 @@ All automated CI test suites run **100% offline** without network access or live
 
 ### Required Deterministic Test Suite
 1. **`test_exact_integer_epoch_conversions`**: Asserts exact integer round-tripping for aware UTC datetimes; rejects naive datetimes, pre-epoch datetimes, and fractional microsecond inputs.
-2. **`test_unaligned_request_window_rejected`**: Verifies `UnalignedBoundaryError` is raised when `since` or `until` is not aligned to the timeframe grid.
-3. **`test_paginator_rejects_unsorted_page`**: Injects page with descending or identical timestamps; verifies `MalformedPageError`.
-4. **`test_paginator_rejects_page_overlap`**: Injects page containing timestamps already seen; verifies `PageOverlapError`.
-5. **`test_paginator_advances_cursor_past_unfinalized_tail`**: Simulates page where tail candle is in progress; verifies raw cursor advances past it.
-6. **`test_paginator_safety_budget_exceeded`**: Simulates infinite sparse page responses; verifies `PaginationBudgetExceededError`.
-7. **`test_clock_skew_local_ahead_aborts`**: Injects mock exchange time where local clock is $>3$ seconds ahead; verifies immediate abort with `ClockSkewError`.
-8. **`test_clock_skew_local_behind_aborts`**: Injects mock exchange time where local clock is $>3$ seconds behind; verifies immediate abort with `ClockSkewError`.
-9. **`test_binance_vision_public_routing`**: Verifies adapter URLs route to `https://data-api.binance.vision` and private endpoints are disabled.
-10. **`test_canonical_content_fingerprint_deterministic`**: Computes binary content fingerprint across platforms; verifies byte-level equality.
-11. **`test_empty_dataset_catalog_representation`**: Verifies empty exchange responses create catalog entries with `quality_status = 'EMPTY'`, `file_path = NULL`, and `file_sha256 = NULL`.
-12. **`test_crash_recovery_with_active_lease`**: Verifies startup reconciler does NOT delete staging files belonging to active PIDs with unexpired leases.
-13. **`test_crash_recovery_quarantine_corrupt_files`**: Simulates orphaned untracked `.parquet` files; asserts mover places them in `data/quarantine/`.
-14. **`test_http_418_immediate_halt`**: Verifies HTTP 418 IP ban aborts immediately with zero retries.
+2. **`test_timeframe_to_duration_ms_enum_members`**: Verifies exact duration mapping for all `SupportedTimeframe` members (`M1` through `D1`).
+3. **`test_raw_ohlcv_validation_six_fields`**: Verifies rows with $<6$ or $>6$ items, non-integer timestamps, non-finite floats, or negative prices are rejected with `MalformedKlineError`.
+4. **`test_conservative_clock_uncertainty_lower_bound`**: Injects varying network latency; verifies finalization strictly uses $T_{\text{server\_min\_ms}}$ and never finalizes early.
+5. **`test_clock_resampling_exhaustion_halts`**: Simulates 3 consecutive high-latency clock samples; verifies ingestion halts with `UnreliableClockError`.
+6. **`test_public_adapter_encapsulation`**: Verifies adapter exposes only allowlisted methods; raw CCXT object and trading methods are inaccessible.
+7. **`test_atomic_no_clobber_file_exists`**: Verifies publication raises `DatasetPathCollisionError` without overwriting when target file exists.
+8. **`test_empty_snapshot_deduplication`**: Verifies existing `EMPTY` snapshot causes subsequent unforced calls to exit 0 without network requests.
+9. **`test_canonical_content_fingerprint_negative_zero_normalized`**: Verifies $-0.0$ and $+0.0$ in float fields yield identical content fingerprint SHA-256.
+10. **`test_manifest_reconciliation_post_commit_crash`**: Simulates process crash after DuckDB commit but before manifest unlinking; asserts startup cleaner unlinks manifest without error.
+11. **`test_http_418_immediate_halt`**: Verifies HTTP 418 IP ban aborts immediately with zero retries.
 
 ---
 
@@ -700,19 +643,16 @@ All automated CI test suites run **100% offline** without network access or live
 
 | # | Criterion | Verification Method |
 |---|---|---|
-| 1 | Connect to Binance vision public cluster with zero credentials | Adapter routing unit test |
-| 2 | Reject unaligned `since` and `until` boundaries with structured error | Parameterized unit tests |
-| 3 | Use exact integer epoch milliseconds throughout all calculations | Unit tests rejecting float conversion |
-| 4 | Validate raw pages for strict ascending order, uniqueness, and cursor adherence | Ingestion paginator unit tests |
-| 5 | Measure round-trip server latency and track clock skew monotonically | Monotonic clock estimator unit tests |
-| 6 | Filter in-progress candles against exchange observation time | Finalization guard tests |
-| 7 | Validate all stored candles through M0 domain contracts | Pipeline integration test |
-| 8 | Persist datasets atomically with Snappy compression | Parquet round-trip test |
-| 9 | Dual fingerprinting: canonical binary content hash + artifact SHA-256 | Deterministic byte-level test |
-| 10 | Crash recovery via durable manifest, active lease, and quarantine | Staging reconciliation tests |
-| 11 | DuckDB catalog tracks snapshots, gaps, and separates empty/quality status | Catalog DDL and SQL query tests |
-| 12 | Support CLI commands (`ingest`, `datasets list`, `inspect`, `verify`) | CLI invocation and output tests |
-| 13 | 100% offline deterministic test suite passing on Python 3.11 and 3.12 | CI workflow matrix run |
+| 1 | Encapsulate CCXT in strict allowlisted `PublicExchangeAdapter` pointing to Binance vision | Adapter encapsulation unit test |
+| 2 | Reject sub-millisecond timestamps, naive datetimes, and unaligned window boundaries | Parameterized unit tests |
+| 3 | Use SupportedTimeframe enum members (`M1..D1`) with exact millisecond durations | Timeframe unit test |
+| 4 | Validate raw OHLCV rows for exact 6 fields, finite numbers, and valid bounds | Ingestion raw row validator tests |
+| 5 | Conservative clock uncertainty lower-bound finalization (never finalize early) | Clock estimator unit tests |
+| 6 | Cross-platform atomic no-clobber Parquet publication | Filesystem publication collision tests |
+| 7 | EMPTY snapshot idempotency and deduplication in DuckDB catalog | Catalog deduplication unit tests |
+| 8 | Canonical binary content fingerprinting with negative-zero normalization | Deterministic byte-level test |
+| 9 | Ingestion manifest lifecycle with active lease and orphan quarantine | Staging reconciliation tests |
+| 10 | 100% offline deterministic test suite passing on Python 3.11 and 3.12 | CI workflow matrix run |
 
 ---
 
@@ -723,4 +663,4 @@ All automated CI test suites run **100% offline** without network access or live
 3. **Dedicated Vision Host Availability:** `data-api.binance.vision` is specifically maintained by Binance for high-throughput public data ingestion. If unreachable, the adapter fails gracefully with clear network error classification.
 
 ---
-**Milestone M1 Proposal Revision Complete. Awaiting Technical Lead Review & Approval.**
+**Milestone M1 Proposal Final Correction Complete. Awaiting Technical Lead Review & Approval.**
