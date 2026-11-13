@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Sequence, TextIO
 
 from open_quant_intelligence.domain.candle import Candle, InvalidCandleError
+from open_quant_intelligence.domain.market import InvalidMarketError, MarketIdentity
 from open_quant_intelligence.domain.timeframe import (
     InvalidTimeframeError,
     SupportedTimeframe,
@@ -471,38 +472,47 @@ def validate_candle_stream(
             )
             continue
 
-        exch = exch_raw.strip().lower()
-        mtype = mtype_raw.strip().lower()
-        sym = sym_raw.strip().upper()
-        tf = tf_raw.strip().lower()
+        # Validate MarketIdentity contract (exchange_id, market_type, symbol)
+        try:
+            market_ident = MarketIdentity(
+                exchange_id=exch_raw,
+                market_type=mtype_raw,
+                symbol=sym_raw,
+            )
+        except InvalidMarketError as exc:
+            errors.append(
+                ValidationIssue(
+                    row_index=row_num,
+                    issue_type="INVALID_MARKET_IDENTITY",
+                    message=f"Row {row_num} violates market identity contract: {exc}",
+                )
+            )
+            continue
+
+        exch = market_ident.exchange_id
+        mtype = market_ident.market_type
+        sym = market_ident.symbol
+
+        # Parse timeframe without pre-lowercasing, so '1M' (months) is preserved and rejected
+        try:
+            parsed_row_tf = parse_timeframe(tf_raw)
+            tf = parsed_row_tf.value
+        except InvalidTimeframeError as exc:
+            errors.append(
+                ValidationIssue(
+                    row_index=row_num,
+                    issue_type="UNSUPPORTED_TIMEFRAME",
+                    message=str(exc),
+                )
+            )
+            continue
 
         if first_row:
             expected_exchange = exch
             expected_market_type = mtype
             expected_symbol = sym
             expected_timeframe = tf
-
-            if expected_market_type != "spot":
-                errors.append(
-                    ValidationIssue(
-                        row_index=row_num,
-                        issue_type="UNSUPPORTED_MARKET_TYPE",
-                        message=f"market_type '{mtype_raw}' is unsupported. Only 'spot' is supported in Milestone M0.",
-                    )
-                )
-
-            try:
-                parsed_tf = parse_timeframe(expected_timeframe)
-                interval_delta = timeframe_to_timedelta(parsed_tf)
-            except InvalidTimeframeError as exc:
-                errors.append(
-                    ValidationIssue(
-                        row_index=row_num,
-                        issue_type="UNSUPPORTED_TIMEFRAME",
-                        message=str(exc),
-                    )
-                )
-
+            interval_delta = timeframe_to_timedelta(parsed_row_tf)
             first_row = False
 
         # Homogeneity enforcement

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from open_quant_intelligence.domain.market import InvalidMarketError, MarketIdentity
 from open_quant_intelligence.domain.timeframe import (
     compute_close_time,
     parse_timeframe,
@@ -62,11 +63,18 @@ class Candle:
         if not self.symbol or not isinstance(self.symbol, str) or not self.symbol.strip():
             raise InvalidCandleError("symbol must be a non-empty string.")
 
-        normalized_market_type = str(self.market_type).strip().lower()
-        if normalized_market_type != "spot":
-            raise InvalidCandleError(
-                f"Unsupported market_type: {self.market_type!r}. In Milestone M0, only 'spot' is supported."
+        # Validate market identity contract (market_type, symbol format, base/quote agreement)
+        try:
+            market_ident = MarketIdentity(
+                exchange_id=self.exchange_id,
+                market_type=self.market_type,
+                symbol=self.symbol,
             )
+        except InvalidMarketError as exc:
+            raise InvalidCandleError(f"Invalid market identity: {exc}") from exc
+
+        normalized_market_type = market_ident.market_type
+        normalized_symbol = market_ident.symbol
 
         # Validate timeframe
         parsed_tf = parse_timeframe(self.timeframe)
@@ -181,9 +189,9 @@ class Candle:
             normalized_fetched_at = self.fetched_at.astimezone(timezone.utc)
 
         # Apply normalized fields
-        object.__setattr__(self, "exchange_id", self.exchange_id.strip().lower())
+        object.__setattr__(self, "exchange_id", market_ident.exchange_id)
         object.__setattr__(self, "market_type", normalized_market_type)
-        object.__setattr__(self, "symbol", self.symbol.strip().upper())
+        object.__setattr__(self, "symbol", normalized_symbol)
         object.__setattr__(self, "timeframe", normalized_timeframe)
         object.__setattr__(self, "open_time", utc_open_time)
         object.__setattr__(self, "close_time", utc_close_time)
