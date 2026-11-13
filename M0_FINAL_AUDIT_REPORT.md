@@ -1,11 +1,20 @@
 # M0 Final Audit & Verification Report
 
 **Project:** Open Quant Intelligence V2  
-**Milestone:** M0 — Project Bootstrap & Domain Contracts  
+**Milestone:** M0 — Project Bootstrap & Domain Contracts (Initial Audit Snapshot)  
 **Auditor:** Senior Python Engineer, QA Engineer, and Security Reviewer  
 **Date of Audit:** 2026-11-13  
 **Target Repository:** `open-quant-intelligence`  
-**Current Milestone State:** M0 Code Complete and Fully Audited  
+**Current Milestone State:** M0 Code Complete (Historical Baseline Audit: 80 Tests)  
+
+> [!NOTE]
+> **Historical Context & Test Suite Evolution:**  
+> This audit document records the baseline verification snapshot at the conclusion of Milestone M0 bootstrap (80 tests).  
+> Subsequent technical review and contract hardening expanded the test suite as follows:  
+> - **M0 Initial Audit Snapshot (This Document):** 80 tests passing (baseline bootstrap & domain contracts).  
+> - **M0 Remediation Phase (`M0_REMEDIATION_REPORT.md`):** 96 tests passing (remediated defects M0-01 through M0-06, including explicit close boundary invariants, non-Candle object guards, CSV short-row safety, and interval alignment).  
+> - **M0.1 Corrective Patch Phase (`M0_1_CORRECTION_REPORT.md` / PR #1):** **104 tests** passing (timeframe case sensitivity preserving monthly `1M` rejection, `MarketIdentity` contract enforcement across CSV and domain models).  
+> For the live, current verification status (104 tests), refer to `README.md` and the verified GitHub Actions PR workflow run [43405143643](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43405143643).
 
 ---
 
@@ -105,7 +114,9 @@ Tests were executed using `pytest` across four environment configurations:
 
 ---
 
-## 6. Exact Test Counts & Results
+## 6. Exact Test Counts & Results (Historical M0 Audit Snapshot)
+
+*Note: This table reflects the historical 80-test baseline. See note above for subsequent expansion to 96 (M0 remediation) and 104 (M0.1 patch).*
 
 | Test Module | Tests Executed | Passed | Failed |
 | :--- | :--- | :--- | :--- |
@@ -114,7 +125,7 @@ Tests were executed using `pytest` across four environment configurations:
 | `tests/unit/test_timeframe.py` | 18 | 18 | 0 |
 | `tests/unit/test_validation.py` | 20 | 20 | 0 |
 | `tests/unit/test_cli.py` | 10 | 10 | 0 |
-| **Total Test Suite** | **80** | **80** | **0** |
+| **Total Test Suite (Snapshot)** | **80** | **80** | **0** |
 
 * Execution time on Windows: **0.12s**
 * Execution time on Ubuntu (WSL): **0.77s**
@@ -171,12 +182,13 @@ All 11 required CLI integration scenarios were evaluated with exact exit codes v
 ## 10. GitHub Actions Status
 
 * **Workflow File:** `.github/workflows/ci.yml` defines the matrix for `ubuntu-latest` and `windows-latest` across Python `3.11` and `3.12`.
-* **Verified GitHub Actions Workflow Run:**  
-  Cloud CI is verified passing on GitHub Actions run [43402604865](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43402604865):
-  - Ubuntu / Python 3.11: **PASS**
-  - Ubuntu / Python 3.12: **PASS**
-  - Windows / Python 3.11: **PASS**
-  - Windows / Python 3.12: **PASS**
+* **Verified GitHub Actions Workflow Runs:**  
+  - Initial main branch run: [43402604865](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43402604865) (PASS across all 4 jobs).  
+  - Current PR #1 run (104 tests): [43405143643](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43405143643) (PASS across all 4 jobs):
+    - Ubuntu / Python 3.11: **PASS**
+    - Ubuntu / Python 3.12: **PASS**
+    - Windows / Python 3.11: **PASS**
+    - Windows / Python 3.12: **PASS**
 
 ---
 

@@ -50,7 +50,7 @@ Milestone M0 implements the core architectural domain contracts and validation e
 - **Bytecode Compilation**: `python -m compileall -q src tests` verified on both 3.11 and 3.12 (exit code 0).
 - **CLI Ingestion Tests**: Verified across all 11 integration test scenarios (valid CSV, audit gaps, strict gaps, invalid prices, naive timestamps, duplicate timestamps, out-of-order timestamps, missing required columns, empty CSV, nonexistent file, and unheaded extra columns).
 - **Local Multi-OS Matrix**: Verified on local Windows 11 host and local Ubuntu (WSL) for both Python 3.11 and 3.12.
-- **Cloud-Hosted GitHub Actions CI**: Verified passing on GitHub Actions workflow run [43402604865](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43402604865) across all matrix jobs (Ubuntu Python 3.11 & 3.12, Windows Python 3.11 & 3.12).
+- **Cloud-Hosted GitHub Actions CI**: Verified passing on GitHub Actions workflow run [43405143643](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43405143643) across all matrix jobs (Ubuntu Python 3.11 & 3.12, Windows Python 3.11 & 3.12).
 
 ## Time Semantics Contract
 
