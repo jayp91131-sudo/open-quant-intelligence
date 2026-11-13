@@ -18,13 +18,14 @@ Milestone M1 establishes the foundation for reproducible quantitative research i
 
 The pipeline will:
 1. Validate Spot market tradability and active status against Binance exchange metadata (`GET /api/v3/exchangeInfo`) before initiating ingestion, immediately rejecting unsupported, delisted, or non-tradable pairs.
-2. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials, mediated through a strict, allowlisted public adapter that explicitly strips all private, SAPI, futures, options, portfolio-margin, and WebSocket endpoint groups.
-3. Enforce the requested half-open interval $[since, until)$ strictly at the ingestion boundary, guaranteeing candles with $open\_time \ge until$ never enter validation, fingerprinting, or storage.
-4. Filter unfinalized candles using a conservative server-time uncertainty lower bound adjusted for worst-case hardware clock-rate drift ($\rho_{\max} = 100\,\text{ppm}$), guaranteeing no candle is ever finalized prematurely.
-5. Validate all admitted candles through the existing M0 domain contracts (`Candle`, `MarketIdentity`, `SupportedTimeframe`).
-6. Store validated datasets in Apache Parquet files using Snappy compression and integer microsecond UTC timestamp representations via cross-platform atomic no-clobber publications with synchronous directory `fsync` barriers.
-7. Maintain an append-only, crash-resilient local dataset catalog in DuckDB that tracks ingestion provenance, data quality statistics, gap analysis, EMPTY snapshot deduplication, and dual cryptographic fingerprints (including full canonical header SHA-256 digests for zero-candle datasets vs. physical Parquet SHA-256).
-8. Provide user-facing CLI commands for downloading, cataloging, inspecting, and re-validating historical datasets.
+2. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials, mediated through a strict, allowlisted public adapter that encapsulates CCXT and explicitly purges all private, SAPI, futures, options, portfolio-margin, and WebSocket endpoint groups.
+3. Enforce the requested half-open interval $[since, until)$ strictly at the ingestion boundary, guaranteeing candles with $open\_time \ge until$ never enter finalization, validation, fingerprinting, or storage.
+4. Filter unfinalized candles using unextrapolated, fresh server-time observations without local monotonic drift extrapolation, guaranteeing no candle is finalized early relative to exchange time.
+5. Provide an explicit zero-candle branch for legitimate EMPTY ranges that validates market identity and window boundaries, computes a canonical header-only content SHA-256 digest, and records an immutable committed EMPTY catalog entry with nullable artifact fields, without routing empty sequences into M0's sequence validator (which expects at least one candle).
+6. Validate all admitted non-empty candles through the immutable M0 `Candle` domain contract and sequence rules, verifying that physical Parquet row counts match `record_count`, and that `record_count + missing_intervals == expected_records` across both `GAP_FREE` and `GAP_CONTAINING` datasets.
+7. Store validated datasets in Apache Parquet files using Snappy compression via a complete crash-recovery protocol incorporating durable manifest state transitions, atomic temp-file creation, cross-platform no-clobber publication, and platform-specific sync barriers (`os.fsync` and directory barriers on POSIX; `FlushFileBuffers` and write-through on Windows).
+8. Maintain an immutable dataset snapshot catalog in DuckDB accompanied by a dedicated verification history table, cleanly separating immutable snapshot identities from mutable or temporal verification audit events.
+9. Provide user-facing CLI commands for downloading, cataloging, inspecting, and re-validating historical datasets.
 
 ---
 
@@ -41,8 +42,8 @@ The pipeline will:
 
 ### B. Strict Milestone Exclusions
 - **No Private API Keys or Credentials:** Ingestion uses public market data endpoints exclusively.
-- **No Raw CCXT Exposure:** Raw CCXT exchange objects are never leaked outside the internal adapter boundary.
-- **No Extraneous Endpoints:** SAPI, futures (fapi), delivery (dapi), options (eapi), portfolio-margin (papi), and WebSockets are stripped.
+- **No Raw CCXT Exposure:** Raw CCXT exchange objects are never leaked outside the internal adapter boundary; no generic method forwarding is permitted.
+- **No Extraneous Endpoints:** SAPI, futures (fapi), delivery (dapi), options (eapi), portfolio-margin (papi), and WebSockets are completely purged.
 - **No Order Execution or Trading:** Zero routing, balancing, order placement, or wallet manipulation.
 - **No Derivatives:** Strictly spot markets (`market_type == "spot"`). Futures, options, and perpetuals are out of scope.
 - **No Strategy Logic or Backtesting:** Strategy evaluation, alpha generation, and portfolio simulation belong to M2/M3.
@@ -57,7 +58,7 @@ The pipeline will:
 
 | Component | Library Choice | Justification |
 |---|---|---|
-| **Market Data Adapter** | `ccxt>=4.4.52, <5.0.0` | Industry-standard exchange abstraction. Encapsulated behind `PublicExchangeAdapter`. Deep-merged endpoint URLs are explicitly sanitized to retain only Vision Spot public operations. |
+| **Market Data Adapter** | `ccxt>=4.4.52, <5.0.0` | Industry-standard exchange abstraction. Encapsulated behind `PublicExchangeAdapter`. Deep-merged endpoint URLs are explicitly sanitized to retain only the required Vision Spot public operations. |
 | **Analytical Catalog & Query** | `duckdb>=1.1.0, <2.0.0` | Embedded in-process analytical SQL engine. Handles metadata registration, analytical queries across local Parquet files, and relational catalog queries without requiring a client-server database daemon. |
 | **Parquet Storage Engine** | Native DuckDB Parquet Engine (Primary) | DuckDB compiles native, highly performant Parquet reading and writing (`COPY ... TO ... (FORMAT PARQUET, COMPRESSION SNAPPY)`). Using DuckDB for Parquet eliminates heavy runtime coupling to PyArrow for ingestion. |
 | **Optional Arrow Interop** | `pyarrow>=15.0.0, <19.0.0` (Optional `[dev]`) | Maintained as an optional development dependency for zero-copy memory testing and schema inspection, but **NOT** required for the production runtime pipeline. |
@@ -100,60 +101,66 @@ src/open_quant_intelligence/
 │   ├── market.py
 │   └── timeframe.py
 ├── data/                        # [M0] Validation engine
-│   ├── validation.py            # [M0] Canonical candle & stream validator (final domain authority)
+│   ├── validation.py            # [M0] Canonical candle & stream validator (final domain authority for Candle models)
 │   └── quality.py               # [M1 NEW] Gap analysis & data quality reporting
 ├── ingestion/                   # [M1 NEW] Public ingestion pipeline
 │   ├── __init__.py
 │   ├── adapter.py               # Strict allowlisted Binance public vision adapter (encapsulates sanitized CCXT)
 │   ├── market_check.py          # Pre-flight Spot market metadata & tradability verification
 │   ├── pagination.py            # Strict raw-page interval paginator with [since, until) boundary clamp
-│   ├── clock.py                 # Monotonic clock offset estimator with drift allowance (rho_max = 100ppm)
-│   ├── finalization.py          # Observation-time candle finalization filter (drift-compensated lower bound)
-│   └── pipeline.py              # Orchestrator: Pre-Flight -> Fetch -> Boundary Clamp -> Finalize -> Validate -> Store
+│   ├── clock.py                 # Fresh exchange server time observation & maximum-age resampler
+│   ├── finalization.py          # Observation-time candle finalization filter (unextrapolated lower bound)
+│   └── pipeline.py              # Orchestrator: Pre-Flight -> Fetch -> Clamp -> Zero/Non-Zero Branch -> Store
 ├── storage/                     # [M1 NEW] Persistence & Catalog
 │   ├── __init__.py
-│   ├── manifest.py              # Ingestion manifest, active lease & crash recovery record
-│   ├── parquet_store.py         # Staging flush, fsync barriers, cross-platform atomic no-clobber publication
+│   ├── manifest.py              # Durable manifest manager, atomic update transitions, active leases
+│   ├── parquet_store.py         # Staging flush, platform sync barriers, atomic no-clobber publication
 │   ├── fingerprint.py           # Canonical binary content hashing (data & empty sets) & artifact SHA-256
-│   └── catalog.py               # DuckDB catalog registration, gap recording & queries
+│   └── catalog.py               # DuckDB immutable snapshot catalog, gap recording & verification history
 └── cli.py                       # CLI entrypoints (validate, ingest, datasets, inspect, verify)
 ```
 
 ### B. Mermaid Architecture Diagram
 ```mermaid
 flowchart TD
-    subgraph Binance_Public["Binance Public Vision Cluster"]
+    subgraph Binance_Vision["Binance Public Vision Cluster"]
         ExchangeInfo["GET /api/v3/exchangeInfo (Market Metadata & Rate Limits)"]
         TimeAPI["GET /api/v3/time (Server Time Samples)"]
         API["GET /api/v3/klines (Public Spot Kline Batches)"]
     end
 
-    subgraph Ingestion_Engine["Ingestion Engine (src/open_quant_intelligence/ingestion/)"]
-        Adapter["PublicExchangeAdapter (Sanitized CCXT 4.4.52, Vision Endpoints Only)"]
+    subgraph Ingestion_Adapter["Adapter Boundary (src/open_quant_intelligence/ingestion/)"]
+        Adapter["PublicExchangeAdapter (Strict Interface, Sanitized CCXT 4.4.52)"]
         PreFlight["Market Metadata Validator (Spot Tradability & Status Check)"]
-        ClockSync["Monotonic Clock Estimator (RTT Latency + 100ppm Drift Lower Bound)"]
+        ClockSync["Server Time Observer (Fresh Samples, Max-Age Resampling)"]
         Paginator["Strict Paginator (Ascending Order, Duplicate & Overlap Check)"]
         BoundaryFilter["Window Boundary Enforcer (Strictly Discards open_time >= until)"]
-        Finalizer["Finalization Guard (Conservative Lower Bound, Never Early)"]
+        Finalizer["Finalization Guard (Unextrapolated Server Time Lower Bound)"]
     end
 
-    subgraph Validation_Layer["Validation Layer (src/open_quant_intelligence/data/)"]
-        Validator["validate_candles() M0 Domain Contract (Final Domain Authority)"]
-        QualityAnalyzer["Quality & Gap Analyzer (Gap-Free vs Gap-Containing vs Empty)"]
-        BinaryFingerprint["Canonical Binary Content Fingerprint (Normalized Data / Empty Digest)"]
+    subgraph Pipeline_Branching["Ingestion Pipeline (Zero vs Non-Zero Branch)"]
+        Decision{"Any Admitted Candles?"}
+        
+        subgraph Zero_Branch["Zero-Candle Branch (Legitimate EMPTY)"]
+            EmptyDigest["Compute Canonical Header-Only Content SHA-256"]
+            EmptyCatalog["Record Committed EMPTY Snapshot (file_path=NULL)"]
+        end
+        
+        subgraph Non_Zero_Branch["Non-Zero Candle Branch"]
+            M0Validator["M0 Candle Domain Validation & M1 Sequence Checks"]
+            QualityCheck["Verify: record_count + missing_intervals == expected_records"]
+            DataDigest["Compute Canonical Binary Content SHA-256"]
+            Staging["Parquet Staging Write + Row Count Check (rows == record_count)"]
+            Publication["Atomic No-Clobber Publication + Platform Sync Barriers"]
+            DataCatalog["Record Committed Snapshot + Gaps in DuckDB"]
+        end
     end
 
-    subgraph Storage_Layer["Storage & Metadata Layer (src/open_quant_intelligence/storage/)"]
-        ManifestManager["Durable Manifest & Lease Manager (.ingest_manifest.json)"]
-        StageStore["Atomic Staging (.tmp Write + Flush + File/Parent fsync)"]
-        AtomicRename["Cross-Platform Atomic No-Clobber Rename (os.link / MoveFileExW)"]
-        DuckDBCatalog["DuckDB Catalog (data/catalog.duckdb)"]
+    subgraph Storage_Catalog["Storage & Catalog Layer (src/open_quant_intelligence/storage/)"]
+        ManifestManager["Durable Manifest State Transitions (.ingest_manifest.json)"]
         DataFiles["Parquet Datasets: data/datasets/.../*.parquet"]
+        DuckDBCatalog["DuckDB Catalog (data/catalog.duckdb: datasets & verification_history)"]
         Quarantine["Quarantine Directory: data/quarantine/"]
-    end
-
-    subgraph User_CLI["Command Line Interface (cli.py)"]
-        CLI["open-quant CLI (ingest, datasets, verify)"]
     end
 
     ExchangeInfo -->|Rate Limits & Symbols| Adapter
@@ -167,104 +174,72 @@ flowchart TD
     Adapter -->|Raw Pages| Paginator
     Paginator --> BoundaryFilter
     BoundaryFilter -->|Filtered: open_time < until| Finalizer
-    Finalizer -->|Finalized Raw Candles| Validator
-    Validator -->|Contract Violation| Fail["Halt Ingestion & Write Manifest Failure"]
-    Validator -->|Validated Immutable Candles| QualityAnalyzer
-    QualityAnalyzer --> BinaryFingerprint
-    BinaryFingerprint --> ManifestManager
-    ManifestManager --> StageStore
-    StageStore --> AtomicRename
-    AtomicRename -->|Target Exists -> EEXIST Error| Collision["Halt with PathCollisionError"]
-    AtomicRename --> DataFiles
-    AtomicRename -->|Commit Transaction + Directory fsync| DuckDBCatalog
+    Finalizer --> Decision
+    
+    Decision -->|Zero Candles| EmptyDigest
+    EmptyDigest --> EmptyCatalog
+    EmptyCatalog --> DuckDBCatalog
+    
+    Decision -->|>= 1 Candles| M0Validator
+    M0Validator --> QualityCheck
+    QualityCheck --> DataDigest
+    DataDigest --> ManifestManager
+    ManifestManager --> Staging
+    Staging --> Publication
+    Publication --> DataFiles
+    Publication --> DataCatalog
+    DataCatalog --> DuckDBCatalog
     DuckDBCatalog -.->|Startup Reconciliation & Re-hash| DataFiles
     DuckDBCatalog -.->|Unverifiable / Tampered| Quarantine
-    CLI --> Ingestion_Engine
-    CLI --> DuckDBCatalog
 ```
 
 ---
 
-## 5. Pre-Flight Allowlisted Spot Market Metadata Check
+## 5. Pre-Flight Market Metadata Check & Binance Vision Configuration
 
-To prevent failed pagination loops and corrupted ingestion attempts on non-existent, delisted, or non-tradable pairs, M1 mandates an **allowlisted Spot market metadata pre-flight check** prior to issuing historical Kline requests:
+### A. Pre-Flight Spot Tradability Check
+Before making Kline queries, the adapter calls `GET /api/v3/exchangeInfo`:
+1. The symbol must exist in `exchangeInfo["symbols"]`.
+2. `status` must strictly be `"TRADING"`. If `"HALT"`, `"BREAK"`, or delisted, abort with `MarketStatusError`.
+3. `isSpotTradingAllowed` must be `True`.
+4. `permissions` or `permissionSets` must contain `"SPOT"`.
+5. Non-tradable or non-spot pairs abort immediately with structured exit code 1.
 
-### A. Pre-Flight Validation Rules
-1. **Metadata Ingestion:** At session startup, the adapter inspects the response from `GET /api/v3/exchangeInfo`.
-2. **Symbol Existence & Tradability Check:**
-   - The symbol must exist in `exchangeInfo["symbols"]`.
-   - `status` must be `"TRADING"`. If `"HALT"`, `"BREAK"`, or delisted, ingestion aborts immediately with `MarketStatusError(f"Symbol {symbol} is currently not trading (status: {status})")`.
-   - `isSpotTradingAllowed` must be `True`.
-   - `permissions` or `permissionSets` must explicitly contain `"SPOT"`.
-   - Quotes and base assets must match M0 `MarketIdentity` expectations (e.g. `base="BTC"`, `quote="USDT"`).
-3. **Structured Failure:** If the symbol is unsupported, delisted, or restricted to non-spot permissions, the CLI aborts with exit code 1 and outputs a structured diagnostic report without fetching candles.
+### B. CCXT 4.4.52 URL Sanitization & Allowlisted Interface
+CCXT's default constructor deep-merges extensive default URL dictionaries across private and derivative APIs. To prevent accidental leakage or invocation of unapproved endpoints:
 
----
+1. **Remove Extraneous Keys:** The adapter deletes or purges `sapi`, `fapi`, `dapi`, `eapi`, `papi`, `ws`, and the obsolete `v1` path (in CCXT 4.4.52, Binance `v1` points to `/api/v1`, which is unnecessary for M1).
+2. **Retain Strictly Required Keys:**
+   ```python
+   sanitized_api = {
+       "public": "https://data-api.binance.vision/api/v3",
+   }
+   ```
+3. **Strict Interface Encapsulation:** The raw CCXT object is encapsulated privately within `PublicExchangeAdapter`. No `__getattr__` or method forwarding is permitted. Only four public methods are exposed:
+   - `fetch_ohlcv(symbol, timeframe, since_ms, limit)`
+   - `fetch_time()`
+   - `get_rate_limit_weight_limit()`
+   - `get_last_used_weight_1m()`
 
-## 6. CCXT 4.4.52 URL Sanitization & Effective Configuration
-
-### B. CCXT Deep-Merge Vulnerability
-CCXT's constructor deep-merges user-supplied URL dictionaries over extensive internal default dictionaries. If only `urls["api"]["public"]` is overridden, CCXT 4.4.52 retains internal routing entries for:
-- SAPI (`api["sapi"]`)
-- Futures USD-M (`api["fapi"]`, `fapiPublic`, `fapiPrivate`)
-- Delivery COIN-M (`api["dapi"]`, `dapiPublic`, `dapiPrivate`)
-- Options (`api["eapi"]`)
-- Portfolio Margin (`api["papi"]`)
-- WebSockets (`urls["ws"]`)
-
-### C. Explicit Endpoint Group Stripping
-To guarantee zero accidental routing to non-Vision, private, or derivative APIs, the adapter explicitly sanitizes CCXT's effective URL table after construction:
-
-```python
-import ccxt
-
-
-class BinanceVisionPublicAdapter:
-    """Strict allowlisted public adapter encapsulating sanitized CCXT 4.4.52."""
-
-    def __init__(self) -> None:
-        self._exchange = ccxt.binance(
-            {
-                "enableRateLimit": True,
-                "options": {
-                    "defaultType": "spot",
-                    "adjustForTimeDifference": False,
-                },
-                "urls": {
-                    "api": {
-                        "public": "https://data-api.binance.vision/api/v3",
-                        "v1": "https://data-api.binance.vision/api/v3",
-                    }
-                },
-            }
-        )
-
-        # Explicitly purge all unnecessary SAPI, futures, options, and private API groups
-        sanitized_api = {
-            "public": "https://data-api.binance.vision/api/v3",
-            "v1": "https://data-api.binance.vision/api/v3",
-        }
-        self._exchange.urls["api"] = sanitized_api
-
-        # Purge WebSocket entries
-        if "ws" in self._exchange.urls:
-            self._exchange.urls["ws"] = {}
-
-        # Seal all authenticated and trading methods
-        self._exchange.create_order = None
-        self._exchange.cancel_order = None
-        self._exchange.fetch_balance = None
-        self._exchange.fetch_orders = None
-```
-
-An offline test `test_ccxt_effective_url_configuration` verifies that inspecting `adapter._exchange.urls["api"]` contains **only** the allowlisted public Vision URLs.
+### C. Rate-Limit Recovery & Backoff Policy
+1. **Dynamic Limit Retrieval:** At initialization, the adapter parses `exchangeInfo.rateLimits` for `rateLimitType == "REQUEST_WEIGHT"` and `interval == "MINUTE"`. The `limit` (e.g. 1,200 or 6,000) is cached. `fetch_exchange_status()` is **not** used.
+2. **Proactive Throttling via `X-MBX-USED-WEIGHT-1M`:**
+   - Every response inspects `X-MBX-USED-WEIGHT-1M`.
+   - Used weight $> 70\%$: Injects adaptive sleep $\text{sleep\_ms} = (\text{used} / \text{limit})^2 \times 500\,\text{ms}$.
+   - Used weight $> 90\%$: Pauses until the 60-second window elapses.
+3. **HTTP 429 Rate Limit Handling:**
+   - Reads `Retry-After` header. If present, sleeps for the specified seconds $+ 500\,\text{ms}$ jitter.
+   - If `Retry-After` is absent, falls back to bounded exponential backoff: $T = \min(60, 2^{\text{attempt}} \times 1.5) + \text{jitter}$.
+   - Maximum 3 retries. If exhausted, aborts immediately with `RateLimitExhaustedError`. Ingestion terminates safely; pagination does not continue.
+4. **HTTP 418 IP Ban:**
+   - If HTTP 418 is received, **HALT IMMEDIATELY WITH ZERO RETRIES**. Log a `CRITICAL` alert and write an abort record in the manifest.
 
 ---
 
-## 7. Exact Timestamp Arithmetic & Strict Window Boundary Enforcement
+## 6. Exact Timestamp Arithmetic & Complete Pagination Algorithm
 
-### A. Exact Integer Epoch Timedelta Arithmetic (No Floating-Point Math)
-All conversions between Python `datetime` and integer epoch units must use exact integer arithmetic anchored to `EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)`:
+### A. Exact Integer Epoch Timedelta Arithmetic
+Conversions between Python `datetime` and integer epoch units use exact integer arithmetic anchored to `EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)`:
 
 ```python
 from datetime import datetime, timedelta, timezone
@@ -286,7 +261,7 @@ def datetime_to_epoch_ms(dt: datetime) -> int:
     diff = dt - EPOCH_UTC
     total_micros = diff.days * 86_400_000_000 + diff.seconds * 1_000_000 + diff.microseconds
 
-    # Explicitly reject sub-millisecond fractions
+    # Explicitly reject fractional milliseconds
     if total_micros % 1_000 != 0:
         raise ValueError(f"Timestamp {dt} has fractional milliseconds (microseconds: {diff.microseconds}).")
 
@@ -319,49 +294,163 @@ def timeframe_to_duration_ms(timeframe: SupportedTimeframe) -> int:
     return minutes_map[timeframe] * 60_000
 ```
 
-### B. Ingestion Boundary Window Enforcement: $[since, until)$
-Binance kline queries accept `startTime` (`since`) and `endTime`. However, exchanges frequently return the full 1,000-candle page or boundary candles exceeding the requested window.
-- **Strict Boundary Clamp:** At the raw ingestion collection boundary, before candles are passed to finalization, domain validation, fingerprinting, or storage:
-  $$\text{Admitted Candles} = \{k \in \text{page} \mid \text{since\_ms} \le k[0] < \text{until\_ms}\}$$
-- Any candle with $open\_time \ge until\_ms$ is **strictly discarded at the ingestion boundary**. It must never enter validation, fingerprinting, or Parquet storage.
-- An offline test `test_paginator_enforces_upper_bound_clamp` injects exchange pages containing rows where $open\_time \ge until$ and asserts they are excluded from the dataset.
+### B. Complete Pagination Algorithm Specification
+```python
+def paginate_ohlcv(
+    adapter: PublicExchangeAdapter,
+    symbol: str,
+    timeframe: SupportedTimeframe,
+    since_ms: int,
+    until_ms: int,
+    clock: ServerTimeObserver,
+) -> list[RawKlineRow]:
+    """Deterministically paginate historical OHLCV from Binance vision public endpoints."""
+    step_ms = timeframe_to_duration_ms(timeframe)
+    expected_count = (until_ms - since_ms) // step_ms
+    max_pages = max(50, ((expected_count + 999) // 1000) * 3)
+
+    current_since_ms = since_ms
+    admitted_candles: list[RawKlineRow] = []
+    seen_timestamps: set[int] = set()
+    page_count = 0
+
+    while current_since_ms < until_ms:
+        page_count += 1
+        if page_count > max_pages:
+            raise PaginationBudgetExceededError(f"Pagination exceeded safety budget of {max_pages} requests.")
+
+        # Request batch from exchange (max 1000 klines)
+        page = adapter.fetch_ohlcv(symbol, timeframe.value, since_ms=current_since_ms, limit=1000)
+
+        # 1. Empty page: Exchange has no further data in range
+        if not page:
+            break
+
+        # 2. Strict row type, exact 6-field structure, and numeric sanity
+        page_timestamps: list[int] = []
+        for i, row in enumerate(page):
+            if not isinstance(row, (list, tuple)) or len(row) != 6:
+                raise MalformedKlineError(f"Row {i} is not a sequence of exactly 6 elements: {row!r}")
+            t, o, h, l, c, v = row
+            if not isinstance(t, int) or isinstance(t, bool) or t < 0:
+                raise MalformedKlineError(f"Row {i} timestamp {t!r} is not a non-negative integer.")
+            for val_name, val in [("open", o), ("high", h), ("low", l), ("close", c), ("volume", v)]:
+                if not isinstance(val, (int, float)) or isinstance(val, bool):
+                    raise MalformedKlineError(f"Row {i} field {val_name} {val!r} is not numeric.")
+                if not math.isfinite(val):
+                    raise MalformedKlineError(f"Row {i} field {val_name} {val!r} is not finite.")
+            if min(o, h, l, c) <= 0:
+                raise MalformedKlineError(
+                    f"Row {i} contains non-positive price: open={o}, high={h}, low={l}, close={c}"
+                )
+            if v < 0:
+                raise MalformedKlineError(f"Row {i} contains negative volume: {v}")
+
+            # Strict ascending timestamp verification within the page
+            if page_timestamps and t <= page_timestamps[-1]:
+                raise MalformedPageError(f"Page timestamps not strictly increasing: {page_timestamps[-1]} -> {t}")
+            if t < current_since_ms:
+                raise PaginationRegressionError(f"Row timestamp {t} violates cursor {current_since_ms}")
+            if t in seen_timestamps:
+                raise PageOverlapError(f"Timestamp {t} was already accepted in a previous page.")
+            page_timestamps.append(t)
+
+        max_raw_open_ms = page_timestamps[-1]
+        seen_timestamps.update(page_timestamps)
+
+        # 3. Fresh unextrapolated server time observation
+        obs_server_time_ms = clock.get_fresh_server_time_ms()
+
+        # 4. Ingestion boundary clamp [since, until) and candle finalization
+        for raw_kline in page:
+            open_ms = raw_kline[0]
+
+            # Strict upper-bound clamp: discard any candle where open_time >= until
+            if open_ms >= until_ms:
+                continue
+            if open_ms < since_ms:
+                continue
+
+            # Finalization guard: close boundary must not exceed observed exchange time
+            close_ms = open_ms + step_ms
+            if close_ms > obs_server_time_ms:
+                # In-progress candle at the tail; skip admission
+                continue
+
+            admitted_candles.append(raw_kline)
+
+        # 5. Advance cursor monotonically based on validated raw page maximum
+        current_since_ms = max_raw_open_ms + 1
+
+    return admitted_candles
+```
 
 ---
 
-## 8. Conservative Clock Uncertainty & Worst-Case Drift Mitigation
+## 7. Clock Authority & Unextrapolated Observation Lower Bound
 
-### A. Clock-Rate Drift Vulnerability ($\rho$)
-Hardware monotonic clocks drift relative to true astronomical time due to temperature and crystal tolerances (typical maximum oscillator drift is $\rho_{\max} = 100\,\text{ppm}$, or $\approx 100\,\mu\text{s}/\text{sec}$). Extrapolating server time over a 10-minute session ($600\,\text{sec}$) introduces up to:
-$$\delta_{\text{drift}} = 600 \times 100 \times 10^{-6}\,\text{sec} = 60\,\text{ms}$$
-If local monotonic time ticks faster than server time, a naive estimate would overestimate server time and finalize a candle up to 60 ms early.
+### A. Delayed Finalization as Safe Engineering Trade-off
+Extrapolating server time using local monotonic time assumes that local oscillator drift is universally bounded across all hardware environments. To remove this assumption, M1 adopts a **strictly unextrapolated observation model**:
+- The pipeline queries Binance server time (`GET /api/v3/time`).
+- The returned `t_server_ms` is treated as a conservative lower bound of current exchange time at the moment the response arrives.
+- **No extrapolation:** Local monotonic time is **never** added to extrapolate future server time.
+- **Trade-off:** If an observation is several seconds old, a newly completed candle might not be finalized until the next refresh. This trade-off is intentionally accepted: **delayed finalization is strictly preferred over premature finalization.**
 
-### B. Drift-Compensated Conservative Lower Bound
-To guarantee that **no candle is ever finalized prematurely under any network asymmetry or clock drift**, M1 defines the conservative lower bound of server time:
-$$T_{\text{server\_min\_ms}} = t_{\text{server\_ms}} + \Delta_{\text{mono\_ms}} \times (1 - \rho_{\max})$$
-Where:
-- $t_{\text{server\_ms}}$ is the raw timestamp returned by `GET /api/v3/time`.
-- $\Delta_{\text{mono\_ms}} = (t_{\text{mono\_now}} - t_{\text{mono\_after}}) // 1_000_000$ is the elapsed monotonic time since response reception.
-- $\rho_{\max} = 0.0001$ ($100\,\text{ppm}$ worst-case drift allowance).
-- Assumed outbound network latency is conservatively taken as zero.
-
-### C. Candle Finalization Invariant
-A candle is finalized if and only if:
-$$T_{\text{open\_ms}} + \Delta_{\text{timeframe\_ms}} \le T_{\text{server\_min\_ms}}$$
-Because $T_{\text{server\_min\_ms}} \le T_{\text{actual\_server}}$ under worst-case drift and zero network delay, premature candle closure is mathematically impossible.
-
-### D. Resampling & Uncertainty Exhaustion Policy
-- `MAX_CLOCK_AGE_SEC = 600` (10 minutes).
-- If sample round-trip latency $>2,000\,\text{ms}$, the adapter resamples up to 3 times.
-- If all 3 resampling attempts fail or $|\tau_{\text{exchange}} - \tau_{\text{local}}| > 3,000\,\text{ms}$, ingestion aborts with `UnreliableClockError`.
+### B. Freshness & Resampling Protocol
+1. **Observation Lifetime:** Server time samples expire after `MAX_CLOCK_AGE_SEC = 60` seconds.
+2. **Fresh Resampling:** Before evaluating tail candle finalization, if the cached server time is older than 60 seconds, the adapter fetches a fresh timestamp.
+3. **Latency & Skew Safeguards:**
+   - If round-trip latency during clock fetching exceeds 2,000 ms, the sample is retried up to 3 times.
+   - If all 3 attempts fail, or if $|\tau_{\text{exchange}} - \tau_{\text{local}}| > 3,000\,\text{ms}$, ingestion aborts with `UnreliableClockError`.
+   - **Exchange Accuracy Assumption:** The pipeline assumes the Binance exchange server clock is internally synchronized via NTP and does not step backward during the session.
 
 ---
 
-## 9. Canonical Binary Content Fingerprinting (Data & EMPTY Sets)
+## 8. Dual Pipeline Branching: Legitimate EMPTY vs. Non-Empty Datasets
+
+### A. Clean Resolution of M0 Compatibility for EMPTY Datasets
+M0's `validate_candles()` and `validate_candle_stream()` explicitly require at least one candle and return `is_valid=False` with `issue_type="EMPTY_DATASET"` if given an empty sequence. M1 resolves this without changing M0 by introducing an explicit **pipeline branch**:
+
+```text
+Admitted Candles Count:
+  ├── 0 Candles  ──> Zero-Candle Branch (Legitimate EMPTY Snapshot)
+  └── >= 1 Candle ──> Non-Empty Branch (M0 Candle & Sequence Validation)
+```
+
+### B. Zero-Candle Branch (Legitimate EMPTY)
+When zero candles are admitted for a valid query window:
+1. **Validation:** Confirms market identity is valid and window satisfies $\text{since\_ms} < \text{until\_ms}$ with grid alignment.
+2. **No Row Fabrication:** Zero rows are passed to M0; no dummy candles are created.
+3. **No Artifact Creation:** No Parquet file is written; `file_path = NULL`, `file_sha256 = NULL`, `file_size_bytes = NULL`.
+4. **Canonical Header-Only Content Fingerprint:** Computes SHA-256 over the canonical `[Header Block]` with `Candle Count = 0`:
+   $$\text{content\_fingerprint\_sha256} = \text{sha256}(\text{Header Block})$$
+5. **Catalog Registration:** Commits a snapshot with `quality_status = 'EMPTY'`, `ingestion_status = 'COMMITTED'`, `record_count = 0`, `gap_count = 0`, `missing_intervals = N_expected`. This is an authorized successful outcome, not an error.
+
+### C. Non-Empty Branch & Physical Row-Count Verification
+When $\ge 1$ candles are admitted:
+1. **M0 Domain Contract Enforcement:** Every raw row is converted to an immutable M0 `Candle` instance, enforcing all domain invariants (price positivity, high/low bounding, UTC timestamps).
+2. **M1 Sequence Validation:** Validates chronological ordering ($t_{i+1} > t_i$), absence of duplicates, alignment to the timeframe grid, and detects gap events.
+3. **Physical Row-Count & Gap Consistency Invariant:**
+   Before staging Parquet data, the pipeline asserts:
+   $$\text{record\_count} + \text{missing\_intervals} == \text{expected\_records}$$
+   - **GAP_FREE Datasets:** $\text{missing\_intervals} == 0 \implies \text{record\_count} == \text{expected\_records}$.
+   - **GAP_CONTAINING Datasets:** $\text{record\_count} < \text{expected\_records}$, but the physical Parquet file must contain **exactly `record_count` rows**.
+   - If `record_count + missing_intervals != expected_records`, ingestion halts with `InconsistentGapStatisticsError`.
+4. **Staging File Verification:**
+   After writing the staging Parquet file, DuckDB executes:
+   ```sql
+   SELECT count(*) FROM read_parquet('staging_path.parquet.tmp')
+   ```
+   The returned count must **strictly equal `record_count`**. If unequal, ingestion halts with `StagingRowMismatchError`.
+
+---
+
+## 9. Canonical Binary Content Fingerprinting & Negative-Zero Normalization
 
 To guarantee deterministic data integrity across platforms, compilers, and DuckDB versions, M1 establishes **exactly one canonical serialization contract**.
 
 ### A. Negative-Zero Normalization
-In IEEE-754 floating point arithmetic, $-0.0$ and $+0.0$ have distinct bit representations (`0x8000000000000000` vs. `0x0000000000000000`). All price and volume floats are normalized before serialization:
+In IEEE-754 arithmetic, $-0.0$ and $+0.0$ have different bit representations (`0x8000000000000000` vs `0x0000000000000000`). All float values are normalized before serialization:
 ```python
 def normalize_float(val: float) -> float:
     return 0.0 if val == 0.0 else val
@@ -394,36 +483,25 @@ def normalize_float(val: float) -> float:
     [If Present]:         INT64_LE (8 bytes)
 ```
 
-### C. EMPTY Dataset Canonical Fingerprint
-For an EMPTY dataset (zero candles returned):
-- The `[Header Block]` is serialized with `Candle Count = 0`, incorporating `schema_version`, `exchange_id`, `market_type`, `symbol`, `timeframe`, `requested_since_ms`, and `requested_until_ms`.
-- The `[Candle Record Block]` is omitted.
-- The SHA-256 digest of this canonical header stream is computed:
-  $$\text{content\_fingerprint\_sha256} = \text{sha256}(\text{Header Block})$$
-- **Properties:**
-  - Replaces arbitrary sentinel strings (such as `"sha256:EMPTY"`) with true cryptographic digests.
-  - Distinct market identities or query windows produce distinct empty digests.
-  - Identical empty ranges produce stable, reproducible digests across platforms.
-
 ---
 
-## 10. Complete Storage Durability, Fsync Barriers & Atomic Publication
+## 10. Complete Storage Durability, Sync Barriers & Crash Recovery
 
-### A. Staging Verification & File Flush
-Before initiating publication or manifest state transitions:
-1. The writer flushes DuckDB Parquet buffers to disk.
-2. An explicit file-descriptor `os.fsync(fd)` is executed to commit file blocks to physical non-volatile storage.
-3. The staging file is reopened and verified: DuckDB executes `SELECT count(*) FROM read_parquet(staging_path)` and verifies row count matches `expected_records`.
-4. Cryptographic checksum `file_sha256` is calculated over the flushed staging file.
+### A. Durable Staging, Publication & Sync Barriers
+To ensure filesystem durability across operating systems:
+1. **POSIX Systems:**
+   - Staging file is flushed and committed via `os.fsync(fd)`.
+   - Manifest updates write to `.ingest_manifest_<uuid>.tmp`, execute `os.fsync()`, and perform `os.replace()` to ensure atomic manifest durability.
+   - Atomic no-clobber publication executes `os.link(staging, target)` followed by `os.unlink(staging)`.
+   - A directory barrier `os.fsync(dir_fd)` is executed on the parent directory to commit the directory entry.
+2. **Windows Systems:**
+   - Staging file is flushed via Win32 `FlushFileBuffers(handle)` with write-through semantics.
+   - Manifest updates write to a temporary file and atomically replace the previous manifest.
+   - Publication uses Win32 `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`, raising `FileExistsError` if the destination exists.
+   - Note: Windows directory entry updates are committed via filesystem write-through; native POSIX directory file descriptors are not available.
+3. **Collision Invariant:** If `target_path` already exists, ingestion halts with `DatasetPathCollisionError`. Existing target files are never overwritten.
 
-### B. Cross-Platform Atomic No-Clobber Publication
-To uphold the invariant that **existing historical datasets are immutable and never overwritten**:
-- **POSIX Systems:** Uses `os.link(staging_path, target_path)` followed by `os.unlink(staging_path)`. If `target_path` exists, `os.link()` raises `FileExistsError` (EEXIST) atomically without touching the target.
-- **Windows Systems:** Uses Win32 `MoveFileExW` with `MOVEFILE_WRITE_THROUGH` and without `MOVEFILE_REPLACE_EXISTING`. If destination exists, it raises `FileExistsError` atomically.
-- **Directory Fsync:** On POSIX, `os.fsync()` is executed on the parent directory file descriptor after rename to ensure directory entry durability.
-- **Collision Handling:** If `target_path` exists, ingestion halts immediately with `DatasetPathCollisionError`. Target files are never overwritten.
-
-### C. Ingestion Manifest Schema & Lifecycle Transitions
+### B. Durable Ingestion Manifest Schema
 ```json
 {
   "ingestion_uuid": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
@@ -439,7 +517,9 @@ To uphold the invariant that **existing historical datasets are immutable and ne
   "requested_until_utc": "2026-11-05T00:00:00Z",
   "staging_file_path": "data/datasets/.../dataset_..._f47ac10b.parquet.tmp",
   "target_file_path": "data/datasets/.../dataset_..._f47ac10b.parquet",
+  "expected_records": 96,
   "record_count": 96,
+  "missing_intervals": 0,
   "content_fingerprint_sha256": "sha256:7f9a2b84c310d54e8b21c430aef7830182419ef8973b02196a84920485a3bb12",
   "file_sha256": "sha256:4d831b7908c84857b28ec95ef5476a8947cf839a823908dbca19273645bbef21",
   "stage": "COMMITTING_CATALOG",
@@ -448,21 +528,25 @@ To uphold the invariant that **existing historical datasets are immutable and ne
 }
 ```
 
-#### Durability Sequence
-1. Write staging `.parquet.tmp` and flush via `os.fsync()`.
-2. Write manifest `.ingest_manifest_<uuid>.json` (`stage = "STAGED"`).
-3. Execute atomic no-clobber rename to target `.parquet`.
-4. Update manifest (`stage = "COMMITTING_CATALOG"`).
-5. Execute DuckDB transaction (`INSERT INTO datasets ...`).
-6. Unlink manifest file.
+### C. Comprehensive Crash-Recovery State Transition Table
 
-If a crash occurs between step 5 and 6, startup reconciliation finds the orphaned manifest, observes the transaction already committed in DuckDB, and safely unlinks the manifest.
+| Crash Point | Filesystem State | Catalog State | Manifest State | Startup Reconciliation Recovery Action |
+|---|---|---|---|---|
+| **1. Before initial manifest is durable** | Partial `.tmp` or no files | No record | No manifest | Unreferenced `.tmp` without manifest: if unleased or expired, deleted as stale garbage. |
+| **2. After manifest durable, before staging completion** | `.tmp` file incomplete | No record | `INITIALIZING` or `STAGING` | Reconciler checks lease: if PID dead and lease expired, deletes staging `.tmp` and unlinks manifest. |
+| **3. After staging durable, before publication** | `.tmp` complete & verified | No record | `STAGED` | Reconciler verifies staging `.tmp` hash. If valid, completes publication $\to$ updates manifest $\to$ commits catalog. If invalid, deletes `.tmp` and manifest. |
+| **4. After publication, before manifest update** | Target `.parquet` exists; `.tmp` unlinked | No record | `STAGED` | Reconciler checks target `.parquet`: if `file_sha256` matches manifest, advances manifest to `PUBLISHED` and commits catalog. |
+| **5. After PUBLISHED, before DuckDB commit** | Target `.parquet` exists | No record | `COMMITTING_CATALOG` | Reconciler executes DuckDB commit transaction $\to$ unlinks manifest. |
+| **6. After DuckDB commit, before manifest unlinking** | Target `.parquet` exists | Committed record exists | `COMMITTING_CATALOG` | Reconciler checks DuckDB: `ingestion_uuid` is already `COMMITTED`; safely unlinks orphaned manifest. |
+| **7. During cleanup (staging/manifest unlink)** | Target `.parquet` exists | Committed record exists | Stale manifest or `.tmp` | Reconciler verifies catalog commit, cleans up residual files. Recovery is completely idempotent. |
 
 ---
 
-## 11. DuckDB Catalog Specification & EMPTY Idempotency
+## 11. Immutable Dataset Snapshots & Verification History
 
-### A. Catalog DDL
+### A. Immutable Snapshot Catalog Schema (DDL)
+To eliminate persistence contradictions, snapshot records in `datasets` are **strictly immutable**. Subsequent physical file verification audits or corruption discoveries are appended to a dedicated `dataset_verification_history` table:
+
 ```sql
 CREATE TABLE IF NOT EXISTS datasets (
     snapshot_id VARCHAR PRIMARY KEY,             -- Unique snapshot ID (e.g. 'snap_f47ac10b8e21')
@@ -487,7 +571,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     ingestion_uuid VARCHAR NOT NULL,
     ingested_at TIMESTAMP WITH TIME ZONE NOT NULL,
     ingestion_status VARCHAR NOT NULL,           -- 'COMMITTED', 'FAILED', 'ABORTED'
-    quality_status VARCHAR NOT NULL              -- 'EMPTY', 'GAP_FREE', 'GAP_CONTAINING', 'CORRUPTED'
+    quality_status VARCHAR NOT NULL              -- 'EMPTY', 'GAP_FREE', 'GAP_CONTAINING'
 );
 
 CREATE TABLE IF NOT EXISTS dataset_gaps (
@@ -496,6 +580,16 @@ CREATE TABLE IF NOT EXISTS dataset_gaps (
     expected_open TIMESTAMP WITH TIME ZONE NOT NULL,
     actual_open TIMESTAMP WITH TIME ZONE NOT NULL,
     missing_count BIGINT NOT NULL
+);
+
+-- Dedicated verification audit log; preserves immutability of datasets table
+CREATE TABLE IF NOT EXISTS dataset_verification_history (
+    verification_id VARCHAR PRIMARY KEY,
+    snapshot_id VARCHAR REFERENCES datasets(snapshot_id),
+    verified_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    verification_result VARCHAR NOT NULL,        -- 'VERIFIED', 'CORRUPTED', 'MISSING_FILE'
+    computed_file_sha256 VARCHAR,
+    error_message VARCHAR
 );
 
 CREATE INDEX IF NOT EXISTS idx_datasets_identity 
@@ -508,7 +602,7 @@ ON datasets(dataset_identity, ingested_at DESC);
    - If a verified `EMPTY` snapshot exists (`quality_status = 'EMPTY'`), the CLI skips exchange queries, logs: `Verified EMPTY dataset already recorded for this range. Skipping ingestion. Use --force to re-query exchange.`, and exits with returncode 0.
 2. **Re-Ingestion (`--force`):**
    - Re-queries Binance vision endpoints.
-   - If still empty, records a new timestamped `EMPTY` snapshot with a fresh `snapshot_id` and updated `ingested_at` timestamp. Historical records remain immutable.
+   - If still empty, records a new immutable `EMPTY` snapshot with a fresh `snapshot_id` and updated `ingested_at` timestamp. Historical records remain immutable.
 
 ---
 
@@ -565,15 +659,16 @@ Catalog Record:        REGISTERED (catalog.duckdb)
 All automated CI test suites run **100% offline** without network access or live exchange calls.
 
 ### Required Deterministic Test Suite
-1. **`test_preflight_market_check_tradable_spot`**: Verifies valid Spot symbols pass pre-flight check, while halted, delisted, or derivative symbols raise `MarketStatusError`.
-2. **`test_ccxt_effective_url_configuration`**: Verifies CCXT 4.4.52 effective URLs contain only public Vision endpoints; all SAPI, fapi, dapi, eapi, papi, and WS entries are purged.
-3. **`test_paginator_enforces_upper_bound_clamp`**: Injects raw exchange responses extending beyond `until`; verifies records with $open\_time \ge until$ are strictly excluded from the dataset.
-4. **`test_clock_drift_compensated_lower_bound`**: Injects simulated elapsed monotonic time; verifies $T_{\text{server\_min\_ms}}$ includes the 100ppm drift reduction and never finalizes early.
-5. **`test_empty_canonical_fingerprint_uniqueness`**: Verifies different empty market identities produce different SHA-256 digests, while identical empty identities produce stable digests.
-6. **`test_staging_durability_fsync_and_atomic_no_clobber`**: Asserts staging file is verified before publication and raises `DatasetPathCollisionError` if destination exists.
-7. **`test_empty_snapshot_deduplication`**: Verifies existing `EMPTY` snapshot skips exchange calls and exits 0 on repeated runs without `--force`.
-8. **`test_canonical_content_fingerprint_negative_zero_normalized`**: Verifies $-0.0$ and $+0.0$ in float fields produce identical SHA-256 digests.
-9. **`test_http_418_immediate_halt`**: Verifies HTTP 418 IP ban aborts immediately with zero retries.
+1. **`test_parquet_row_count_matches_record_count_gap_free`**: Asserts physical Parquet rows strictly equal `record_count` and `record_count == expected_records`.
+2. **`test_parquet_row_count_matches_record_count_gap_containing`**: Asserts physical Parquet rows strictly equal `record_count`, `record_count < expected_records`, and `record_count + missing_intervals == expected_records`.
+3. **`test_empty_dataset_path_committed_without_file`**: Asserts zero admitted candles bypass M0 sequence validator, publish no Parquet file, compute canonical header-only SHA-256, and register a committed EMPTY snapshot.
+4. **`test_crash_recovery_transitions_idempotent`**: Exercises all 7 transitions in the crash-recovery table using mock crashes; asserts reconciliation leaves catalog and files consistent.
+5. **`test_clock_unextrapolated_observation_freshness`**: Injects stale server-time samples ($>60\,\text{s}$); verifies adapter resamples before finalization and never finalizes early.
+6. **`test_binance_http_429_backoff_and_exhaustion`**: Injects HTTP 429 with and without `Retry-After`; asserts backoff respects header and aborts when retries exhaust.
+7. **`test_binance_http_418_immediate_halt`**: Injects HTTP 418; asserts immediate termination with zero retries.
+8. **`test_ccxt_url_sanitization_effective_keys`**: Asserts adapter retains only public Vision URLs; all SAPI, fapi, dapi, eapi, papi, and WS entries are purged.
+9. **`test_paginator_boundary_clamp_discards_future_rows`**: Injects responses extending beyond `until`; asserts records with $open\_time \ge until$ are discarded at the boundary.
+10. **`test_preflight_market_check_tradable_spot`**: Asserts non-tradable or delisted pairs raise `MarketStatusError`.
 
 ---
 
@@ -584,20 +679,21 @@ All automated CI test suites run **100% offline** without network access or live
 | 1 | Pre-flight Spot market metadata check rejecting delisted or non-tradable pairs | Pre-flight unit tests |
 | 2 | Purge all SAPI, futures, options, and private CCXT 4.4.52 URL groups | Effective URL inspection unit test |
 | 3 | Strict $[since, until)$ window boundary clamp discarding $open\_time \ge until$ | Pagination boundary unit test |
-| 4 | Conservative clock uncertainty lower-bound finalization with 100ppm drift allowance | Clock estimator unit tests |
-| 5 | Canonical SHA-256 header fingerprinting for EMPTY datasets | Cryptographic uniqueness tests |
-| 6 | Cross-platform atomic no-clobber Parquet publication with fsync barriers | Storage publication unit tests |
-| 7 | EMPTY snapshot idempotency and deduplication in DuckDB catalog | Catalog deduplication unit tests |
-| 8 | Validate all admitted candles through M0 domain contracts | Pipeline integration test |
-| 9 | 100% offline deterministic test suite passing on Python 3.11 and 3.12 | CI workflow matrix run |
+| 4 | Conservative unextrapolated clock observation finalization (never finalize early) | Clock estimator unit tests |
+| 5 | Clean zero-candle branch committing EMPTY snapshots without Parquet files | Empty-path unit tests |
+| 6 | Parquet physical rows strictly match `record_count`, with `record_count + missing == expected` | Staging verification unit tests |
+| 7 | Cross-platform atomic no-clobber publication with platform sync barriers | Storage publication unit tests |
+| 8 | Complete 7-state crash-recovery transition protocol with durable manifests | Crash-recovery reconciliation tests |
+| 9 | Immutable snapshot catalog with dedicated verification audit history | DuckDB catalog DDL & audit tests |
+| 10 | 100% offline deterministic test suite passing on Python 3.11 and 3.12 | CI workflow matrix run |
 
 ---
 
 ## 15. Risks, Trade-offs & Unresolved Decisions
 
 1. **Exchange Historical Data Corrections:** While rare, exchanges may occasionally revise historical klines. By storing immutable snapshots indexed by `snapshot_id`, OQI ensures backtests are permanently pinned to the dataset state as observed at ingestion time.
-2. **DuckDB In-Process Write Concurrency:** DuckDB supports concurrent readers but a single writer. The active ingestion manifest and CLI process lock serialize write access, preventing database lock contention.
-3. **Dedicated Vision Host Availability:** `data-api.binance.vision` is specifically maintained by Binance for high-throughput public data ingestion. If unreachable, the adapter fails gracefully with clear network error classification.
+2. **Delayed Finalization vs Extrapolation:** Using unextrapolated exchange timestamps avoids unverified local clock drift assumptions at the minor cost of delaying finalization of the latest candle until refreshed. This trade-off prioritizes quantitative data integrity over freshness.
+3. **DuckDB In-Process Concurrency:** DuckDB supports concurrent readers but a single writer. The active ingestion manifest and CLI process lock serialize write access, preventing database lock contention.
 
 ---
-**Milestone M1 Proposal Revision Complete. Final Candidate — Awaiting Technical Approval.**
+**Milestone M1 Proposal Revision Complete. FINAL CANDIDATE — AWAITING TECHNICAL APPROVAL.**
