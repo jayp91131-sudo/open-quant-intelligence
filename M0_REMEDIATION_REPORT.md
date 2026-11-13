@@ -99,7 +99,7 @@ tests/unit/test_validation.py ...................... [100%] (22 passed)
   - Ubuntu / Python 3.12
   - Windows / Python 3.11
   - Windows / Python 3.12
-- Local multi-OS emulation passed. Actual cloud runner execution is pending remote repository publication to GitHub.
+- Verified passing on GitHub Actions workflow run [43402604865](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43402604865) across all 4 jobs.
 
 ---
 

@@ -55,9 +55,7 @@ class MarketIdentity:
 
         parts = clean_symbol.split(sep)
         if len(parts) != 2 or not parts[0].strip() or not parts[1].strip():
-            raise InvalidMarketError(
-                f"Malformed symbol {self.symbol!r}. Base and quote components must be non-empty."
-            )
+            raise InvalidMarketError(f"Malformed symbol {self.symbol!r}. Base and quote components must be non-empty.")
 
         sym_base, sym_quote = parts[0].strip(), parts[1].strip()
 

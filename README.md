@@ -40,19 +40,17 @@ Milestone M0 implements the core architectural domain contracts and validation e
 - Hardened CSV stream validation against short/malformed rows and unheaded extra columns.
 - Empty series policy: in-memory empty sequences and header-only CSVs are marked invalid with structured `EMPTY_DATASET` issue.
 - Unified CLI supporting both `open-quant validate <path>` and `open-quant-validate <path>`.
-- Fully synthetic unit test suite (96 tests, zero network or API credentials required).
+- Fully synthetic unit test suite (104 tests, zero network or API credentials required).
 - CI workflow targeting Windows and Ubuntu on Python 3.11 and 3.12.
 
 ### Verified Functionality
 - **Clean Editable Install**: Verified on Python 3.11.15 and Python 3.12.13.
-- **Unit Test Suite**: 96/96 passing tests on both Windows and Linux runtimes.
-- **Linter & Formatting**: 100% clean under `ruff check .` and `ruff format .`.
+- **Unit Test Suite**: 104/104 passing tests on both Windows and Linux runtimes.
+- **Linter & Formatting**: 100% clean under `ruff check .` and `ruff format --check .`.
 - **Bytecode Compilation**: `python -m compileall -q src tests` verified on both 3.11 and 3.12 (exit code 0).
 - **CLI Ingestion Tests**: Verified across all 11 integration test scenarios (valid CSV, audit gaps, strict gaps, invalid prices, naive timestamps, duplicate timestamps, out-of-order timestamps, missing required columns, empty CSV, nonexistent file, and unheaded extra columns).
 - **Local Multi-OS Matrix**: Verified on local Windows 11 host and local Ubuntu (WSL) for both Python 3.11 and 3.12.
-
-### Outstanding Verification
-- **Cloud-Hosted GitHub Actions Execution**: The workflow `.github/workflows/ci.yml` is configured and passes locally across the full 4-job matrix. Actual cloud-hosted runner execution is pending remote repository creation and push to GitHub.
+- **Cloud-Hosted GitHub Actions CI**: Verified passing on GitHub Actions workflow run [43402604865](https://github.com/jayp91131-sudo/open-quant-intelligence/actions/runs/43402604865) across all matrix jobs (Ubuntu Python 3.11 & 3.12, Windows Python 3.11 & 3.12).
 
 ## Time Semantics Contract
 

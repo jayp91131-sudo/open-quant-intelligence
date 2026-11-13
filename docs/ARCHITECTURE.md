@@ -41,8 +41,8 @@ Live trading, API credentials, order execution, leverage, and AI/ML are explicit
 | :--- | :--- | :--- |
 | `exchange_id` | String | Non-empty string (e.g. `binance`). Case-insensitive normalized to lowercase. |
 | `market_type` | String | Strictly `'spot'`. Derivatives, futures, and margin are rejected in M0. |
-| `symbol` | String | Canonical market symbol (e.g. `BTC/USDT`). Single symbol per file. |
-| `timeframe` | String | Must be in `{'1m', '5m', '15m', '30m', '1h', '4h', '1d'}`. Single timeframe per file. |
+| `symbol` | String | Canonical market symbol (e.g. `BTC/USDT`, `ETH-USDT`). Must contain a valid pair separator (`/`, `-`, `_`) and valid assets matching `MarketIdentity`. Single symbol per file. |
+| `timeframe` | String | Must be a supported interval in `{'1m', '5m', '15m', '30m', '1h', '4h', '1d'}`. Case-sensitive (`'1m'` supported; `'1M'` monthly rejected). Single timeframe per file. |
 | `open_time` | ISO-8601 | Timezone-aware timestamp. Naive timestamps are strictly rejected. Normalized to UTC. |
 | `open` | Float | Finite, strictly positive (`open > 0`). |
 | `high` | Float | Finite, strictly positive (`high >= max(open, close, low)`). |

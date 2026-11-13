@@ -119,10 +119,7 @@ def test_m0_02_mixed_invalid_elements_sequence() -> None:
 
 def test_m0_03_reproduce_short_csv_row_no_attribute_error() -> None:
     """Reproduction and fix for M0-03: A row containing only 'binance' must not raise AttributeError."""
-    csv_text = (
-        "exchange_id,market_type,symbol,timeframe,open_time,open,high,low,close,base_volume\n"
-        "binance\n"
-    )
+    csv_text = "exchange_id,market_type,symbol,timeframe,open_time,open,high,low,close,base_volume\nbinance\n"
     reader = csv.DictReader(io.StringIO(csv_text))
     res = validate_candle_stream(reader)
     assert not res.is_valid
