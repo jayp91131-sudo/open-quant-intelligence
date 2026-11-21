@@ -3,9 +3,6 @@
 from datetime import datetime, timezone
 
 import pytest
-from open_quant_intelligence.data.candle import Candle
-from open_quant_intelligence.data.market import MarketIdentity
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
 
 from open_quant_intelligence.data.quality import (
     GapType,
@@ -13,6 +10,9 @@ from open_quant_intelligence.data.quality import (
     UnalignedCandleError,
     analyze_dataset_quality,
 )
+from open_quant_intelligence.domain.candle import Candle
+from open_quant_intelligence.domain.market import MarketIdentity
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 
 
 def _make_candle(open_ms: int, tf: SupportedTimeframe = SupportedTimeframe.H1) -> Candle:

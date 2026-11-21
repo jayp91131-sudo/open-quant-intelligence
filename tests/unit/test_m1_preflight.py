@@ -1,8 +1,8 @@
 """Unit tests for preflight validation checks."""
 
 import pytest
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
 
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.ingestion.adapter import SpotSymbolMetadata
 from open_quant_intelligence.ingestion.preflight import (
     DelistedSymbolError,

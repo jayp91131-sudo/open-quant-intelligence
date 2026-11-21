@@ -5,10 +5,10 @@ from pathlib import Path
 
 import duckdb
 import pytest
-from open_quant_intelligence.data.candle import Candle
-from open_quant_intelligence.data.market import MarketIdentity
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
 
+from open_quant_intelligence.domain.candle import Candle
+from open_quant_intelligence.domain.market import MarketIdentity
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
 from open_quant_intelligence.storage.parquet_store import (
     RecoveryConflictError,

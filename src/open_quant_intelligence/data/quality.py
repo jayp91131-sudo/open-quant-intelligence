@@ -6,7 +6,8 @@ from enum import Enum
 from typing import Sequence
 
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe, timeframe_to_duration_ms
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.ingestion.time_utils import timeframe_to_duration_ms
 
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 

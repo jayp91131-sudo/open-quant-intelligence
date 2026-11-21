@@ -6,8 +6,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
 from open_quant_intelligence.data.validation import validate_candle_csv
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.ingestion.pipeline import IngestionPipeline, IngestionRequest
 from open_quant_intelligence.ingestion.time_utils import (
     datetime_to_epoch_ms,

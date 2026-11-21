@@ -3,8 +3,8 @@
 from typing import Any, Sequence
 
 import pytest
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
 
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.ingestion.clock import BinanceServerTimeObserver
 from open_quant_intelligence.ingestion.pagination import (
     IncompleteTailCandleError,

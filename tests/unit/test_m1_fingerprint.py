@@ -2,10 +2,9 @@
 
 from datetime import datetime, timezone
 
-from open_quant_intelligence.data.candle import Candle
-from open_quant_intelligence.data.market import MarketIdentity
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
-
+from open_quant_intelligence.domain.candle import Candle
+from open_quant_intelligence.domain.market import MarketIdentity
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.storage.fingerprint import compute_content_fingerprint
 
 

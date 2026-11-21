@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from open_quant_intelligence.data.timeframe import SupportedTimeframe
 
 from open_quant_intelligence.data.quality import QualityStatus
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.ingestion.pipeline import (
     GapFailureError,
     IngestionPipeline,
