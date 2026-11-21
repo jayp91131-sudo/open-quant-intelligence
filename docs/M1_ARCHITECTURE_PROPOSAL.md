@@ -18,14 +18,15 @@ Milestone M1 establishes the foundation for reproducible quantitative research i
 
 The pipeline will:
 1. Validate Spot market tradability, listing status, base asset, and quote asset against Binance exchange metadata via a dedicated allowlisted method `fetch_spot_symbol_metadata(symbol)` before initiating ingestion, immediately rejecting unsupported, delisted, halted, or non-tradable pairs.
-2. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials, mediated through a strict, allowlisted public adapter `PublicExchangeAdapter` that encapsulates CCXT privately, captures response headers for rate-limit monitoring, and explicitly purges all private, SAPI, futures, options, portfolio-margin, and WebSocket endpoint groups.
-3. Enforce the requested half-open interval $[since, until)$ strictly before field-level validation, ensuring out-of-range rows (where $open\_time \ge until$) are discarded immediately and never cause false validation failures due to irrelevant out-of-range corruption.
-4. Prevent permanent omission of incomplete in-range tail candles: when an incomplete candle is detected at the tail of the requested range, the pipeline does not advance the cursor past it or commit a truncated dataset; instead, it retries within a bounded fresh server-time observation policy and aborts safely if the interval remains forming.
-5. Provide an explicit zero-candle branch for legitimate EMPTY ranges that validates market identity and window boundaries, computes a canonical header-only content SHA-256 digest, and records an immutable committed EMPTY catalog entry with nullable artifact fields, without routing empty sequences into M0's sequence validator (which expects at least one candle).
-6. Validate all admitted non-empty candles through the immutable M0 `Candle` domain contract and `validate_candles()` sequence validator, verifying that physical Parquet row counts match `record_count`, and that `record_count + missing_intervals == expected_records` across both `GAP_FREE` and `GAP_CONTAINING` datasets.
-7. Store validated datasets in Apache Parquet files using Snappy compression via a complete, 8-state crash-recovery protocol (`INITIALIZING → STAGING → STAGED → PUBLISHING → PUBLISHED → COMMITTING_CATALOG → COMMITTED → CLEANUP`) with atomic manifest file replacements, cross-platform no-clobber publication, directory synchronization, and safe orphan-cleanup policies.
-8. Maintain an immutable dataset snapshot catalog in DuckDB accompanied by a dedicated `dataset_verification_history` audit table, cleanly separating immutable snapshot identities from verification audit events.
-9. Provide user-facing CLI commands for downloading, cataloging, inspecting, and re-validating historical datasets.
+2. Enforce an unextrapolated exchange server-time preflight check requiring that the requested window upper boundary satisfies $until\_ms \le fresh\_server\_time\_ms$. If $until\_ms$ lies in the future, ingestion aborts immediately with `FutureWindowError` prior to issuing any Kline requests, preventing premature classification of future intervals as missing data.
+3. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials, mediated through a strict, allowlisted public adapter `PublicExchangeAdapter` that encapsulates CCXT privately, captures response headers for rate-limit monitoring, and explicitly purges all private, SAPI, futures, options, portfolio-margin, and WebSocket endpoint groups.
+4. Enforce the requested half-open interval $[since, until)$ strictly before field-level validation, ensuring out-of-range rows (where $open\_time \ge until$) are discarded immediately and never cause false validation failures due to irrelevant out-of-range corruption.
+5. Prevent permanent omission of incomplete in-range tail candles: when an incomplete candle is detected at the tail of the requested range, the pipeline preserves the exact open cursor, waits according to a bounded retry policy, obtains a fresh exchange server-time observation, and explicitly re-fetches fresh OHLCV data from that cursor. Only the newly re-fetched row is validated and admitted once finalized; original incomplete values are never admitted. If retries exhaust, ingestion aborts safely without committing a truncated dataset.
+6. Provide an explicit zero-candle branch for legitimate EMPTY ranges that validates market identity and window boundaries, computes a canonical header-only content SHA-256 digest, and records an immutable committed EMPTY catalog entry with nullable artifact fields, without routing empty sequences into M0's sequence validator (which expects at least one candle).
+7. Validate all admitted non-empty candles through the immutable M0 `Candle` domain contract and `validate_candles()` sequence validator, verifying that physical Parquet row counts match `record_count`, and that `record_count + missing_intervals == expected_records` across both `GAP_FREE` and `GAP_CONTAINING` datasets.
+8. Store validated datasets in Apache Parquet files using Snappy compression via a complete, 8-state crash-recovery protocol (`INITIALIZING → STAGING → STAGED → PUBLISHING → PUBLISHED → COMMITTING_CATALOG → COMMITTED → CLEANUP`) with atomic manifest file replacements, cross-platform no-clobber publication, directory synchronization, and safe orphan-cleanup policies adhering to actual POSIX and Win32 API contracts.
+9. Maintain an immutable dataset snapshot catalog in DuckDB accompanied by a dedicated `dataset_verification_history` audit table, cleanly separating immutable snapshot identities from verification audit events.
+10. Provide user-facing CLI commands for downloading, cataloging, inspecting, and re-validating historical datasets.
 
 ---
 
@@ -106,15 +107,14 @@ src/open_quant_intelligence/
 ├── ingestion/                   # [M1 NEW] Public ingestion pipeline
 │   ├── __init__.py
 │   ├── adapter.py               # Strict allowlisted Binance public vision adapter (encapsulates CCXT)
-│   ├── market_check.py          # Pre-flight Spot market metadata & tradability verification
-│   ├── pagination.py            # Strict raw-page paginator with [since, until) clamp before validation
+│   ├── preflight.py             # Pre-flight Spot market metadata & future-window verification
+│   ├── pagination.py            # Strict raw-page paginator with boundary clamp and re-fetch logic
 │   ├── clock.py                 # Fresh exchange server time observation & maximum-age resampler
-│   ├── finalization.py          # Observation-time candle finalization filter (unextrapolated lower bound)
 │   └── pipeline.py              # Orchestrator: Pre-Flight -> Fetch -> Clamp -> Zero/Non-Zero Branch -> Store
 ├── storage/                     # [M1 NEW] Persistence & Catalog
 │   ├── __init__.py
 │   ├── manifest.py              # Durable manifest manager, 8-state machine transitions, active leases
-│   ├── parquet_store.py         # Staging flush, platform sync barriers, atomic no-clobber publication
+│   ├── parquet_store.py         # Staging flush, Win32/POSIX sync barriers, atomic no-clobber publication
 │   ├── fingerprint.py           # Canonical binary content hashing (data & empty sets) & artifact SHA-256
 │   └── catalog.py               # DuckDB immutable snapshot catalog, gap recording & verification history
 └── cli.py                       # CLI entrypoints (validate, ingest, datasets, inspect, verify)
@@ -125,17 +125,18 @@ src/open_quant_intelligence/
 flowchart TD
     subgraph Binance_Vision["Binance Public Vision Cluster"]
         ExchangeInfo["GET /api/v3/exchangeInfo (Market Metadata & Rate Limits)"]
-        TimeAPI["GET /api/v3/time (Server Time Samples)"]
+        TimeAPI["GET /api/v3/time (Fresh Server Time Samples)"]
         API["GET /api/v3/klines (Public Spot Kline Batches)"]
     end
 
     subgraph Ingestion_Adapter["Adapter Boundary (src/open_quant_intelligence/ingestion/)"]
         Adapter["PublicExchangeAdapter (Strict Interface, Sanitized CCXT 4.4.52)"]
-        PreFlight["Market Metadata Validator (fetch_spot_symbol_metadata)"]
+        MarketPreflight["Market Metadata Preflight (fetch_spot_symbol_metadata)"]
+        WindowPreflight["Future Window Preflight (until_ms <= server_time_ms)"]
         ClockSync["Server Time Observer (Fresh Samples, Max-Age Resampling)"]
         Paginator["Strict Paginator (Ascending Order, Duplicate & Overlap Check)"]
         BoundaryFilter["Window Boundary Enforcer (Clamps open_time < until before Field Validation)"]
-        TailGuard["Incomplete Tail Guard (Bounded Refresh; Never Silently Skip Forming Candle)"]
+        TailRefetch["Incomplete Tail Guard (Preserve Cursor, Wait Finalization, Re-fetch Fresh OHLCV)"]
     end
 
     subgraph Pipeline_Branching["Ingestion Pipeline (Zero vs Non-Zero Branch)"]
@@ -164,18 +165,21 @@ flowchart TD
     end
 
     ExchangeInfo -->|Rate Limits & Symbols| Adapter
-    Adapter --> PreFlight
-    PreFlight -->|Non-Tradable / Delisted| HaltPre["Abort Ingestion with MarketStatusError"]
-    PreFlight -->|Tradable Spot Symbol| Paginator
+    Adapter --> MarketPreflight
+    MarketPreflight -->|Non-Tradable / Delisted| HaltPre["Abort with MarketStatusError"]
+    MarketPreflight -->|Valid Spot Symbol| WindowPreflight
     TimeAPI -->|Server Time Samples| Adapter
     Adapter --> ClockSync
-    ClockSync --> TailGuard
+    ClockSync --> WindowPreflight
+    WindowPreflight -->|until_ms > server_time_ms| HaltFuture["Abort with FutureWindowError (0 Kline requests)"]
+    WindowPreflight -->|Historical Window Valid| Paginator
     API -->|Raw Kline Batches| Adapter
     Adapter -->|Raw Pages| Paginator
     Paginator --> BoundaryFilter
-    BoundaryFilter -->|Filtered: open_time < until| TailGuard
-    TailGuard -->|Unfinished In-Range Tail Unresolved| AbortTail["Abort Ingestion with IncompleteTailCandleError"]
-    TailGuard -->|Finalized Raw Candles| Decision
+    BoundaryFilter -->|Filtered: open_time < until| TailRefetch
+    TailRefetch -->|Re-fetch Fresh OHLCV from Cursor| Adapter
+    TailRefetch -->|Retries Exhausted| AbortTail["Abort with IncompleteTailCandleError"]
+    TailRefetch -->|Finalized Raw Candles| Decision
     
     Decision -->|Zero Candles| EmptyDigest
     EmptyDigest --> EmptyCatalog
@@ -288,9 +292,59 @@ class PublicExchangeAdapter(Protocol):
 
 ---
 
-## 6. Exact Timestamp Arithmetic & Complete Pagination Algorithm
+## 6. Pre-Flight Window Validation & Future Window Rejection
 
-### A. Exact Integer Epoch Timedelta Arithmetic & Grid Alignment
+### A. Strict Request Window Validation
+M1 ingests completed historical data only. Before making any Kline requests, the pipeline validates window ordering, timeframe grid alignment, and rejects future boundaries:
+
+```python
+def validate_request_window_preflight(
+    since_ms: int,
+    until_ms: int,
+    timeframe: SupportedTimeframe,
+    adapter: PublicExchangeAdapter,
+) -> int:
+    """Validate window ordering, grid alignment, and historical completion.
+    
+    Raises:
+        InvalidWindowError: If until_ms <= since_ms.
+        UnalignedBoundaryError: If boundaries are not grid-aligned.
+        FutureWindowError: If until_ms is in the future relative to server time.
+    """
+    if until_ms <= since_ms:
+        raise InvalidWindowError(
+            f"Invalid query window: until_ms ({until_ms}) must be strictly greater than since_ms ({since_ms})."
+        )
+    
+    step_ms = timeframe_to_duration_ms(timeframe)
+    if since_ms % step_ms != 0:
+        raise UnalignedBoundaryError(
+            f"Requested since_ms ({since_ms}) is not aligned to {timeframe.value} grid ({step_ms}ms)."
+        )
+    if until_ms % step_ms != 0:
+        raise UnalignedBoundaryError(
+            f"Requested until_ms ({until_ms}) is not aligned to {timeframe.value} grid ({step_ms}ms)."
+        )
+    
+    # Fresh server time preflight check
+    fresh_server_time_ms = adapter.fetch_time()
+    if until_ms > fresh_server_time_ms:
+        raise FutureWindowError(
+            f"Requested until boundary ({until_ms}ms) is in the future relative to "
+            f"exchange server time ({fresh_server_time_ms}ms). M1 ingests completed historical data only."
+        )
+        
+    return (until_ms - since_ms) // step_ms
+```
+
+### B. Prevention of Misleading Missing Candles
+Rejecting future windows prior to pagination ensures the pipeline never requests incomplete future intervals, never misclassifies future intervals as missing data, and never commits misleading `GAP_CONTAINING` snapshots for time windows that have not yet elapsed on the exchange. Zero Kline requests are issued if the future check fails.
+
+---
+
+## 7. Exact Timestamp Arithmetic & Complete Pagination Algorithm
+
+### A. Exact Integer Epoch Timedelta Arithmetic
 Conversions between Python `datetime` and integer epoch units use exact integer arithmetic anchored to `EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)`:
 
 ```python
@@ -344,62 +398,114 @@ def timeframe_to_duration_ms(timeframe: SupportedTimeframe) -> int:
     if timeframe not in minutes_map:
         raise ValueError(f"Unsupported timeframe: {timeframe}")
     return minutes_map[timeframe] * 60_000
-
-
-def validate_request_window(since_ms: int, until_ms: int, timeframe: SupportedTimeframe) -> int:
-    """Validate window ordering and strict grid alignment, returning expected_count.
-
-    Raises:
-        InvalidWindowError: If until_ms <= since_ms.
-        UnalignedBoundaryError: If since_ms or until_ms is not grid-aligned.
-    """
-    if until_ms <= since_ms:
-        raise InvalidWindowError(
-            f"Invalid query window: until_ms ({until_ms}) must be strictly greater than since_ms ({since_ms})."
-        )
-
-    step_ms = timeframe_to_duration_ms(timeframe)
-    if since_ms % step_ms != 0:
-        raise UnalignedBoundaryError(
-            f"Requested since_ms ({since_ms}) is not aligned to {timeframe.value} grid ({step_ms}ms)."
-        )
-    if until_ms % step_ms != 0:
-        raise UnalignedBoundaryError(
-            f"Requested until_ms ({until_ms}) is not aligned to {timeframe.value} grid ({step_ms}ms)."
-        )
-
-    return (until_ms - since_ms) // step_ms
 ```
 
-### B. Correct Pagination Validation Order & Incomplete Tail Candle Policy
-The paginator follows a strict multi-stage validation sequence:
-1. **Timestamp Inspection & Upper-Bound Clamp:** Identify row `open_time_ms`. Any row with `open_time_ms >= until_ms` or `open_time_ms < since_ms` is **immediately discarded** before field validation. An out-of-range row with corrupted OHLCV values will never trigger validation errors.
-2. **Field-Level Validation for Admitted In-Range Rows:** Validates exact 6-field structure, numeric finiteness, positive prices, and non-negative volume for in-range rows only.
-3. **Ascending Order & Duplicate Verification:** Enforces $t_{i+1} > t_i$ and checks for overlap with previously accepted timestamps.
-4. **Incomplete Tail Candle Guard (Never Silently Skip Forming Candles):**
-   - If an in-range row satisfies $\text{close\_ms} > \tau_{\text{server}}$, it represents an **in-progress candle** still forming on the exchange.
-   - **M1 Policy:** The pipeline does **not** advance the cursor past it or commit a truncated snapshot. It performs fresh server-time observation retries (up to `MAX_TAIL_RETRIES = 3` with 2-second sleep).
-   - If the candle remains unfinalized, ingestion aborts with `IncompleteTailCandleError`. This preserves the requested window for a clean subsequent retry and guarantees in-progress candles are never misclassified as missing gap intervals in a committed snapshot.
-5. **Cursor Advancement:** The cursor advances strictly past finalized, admitted candles: `current_since_ms = max_admitted_open_ms + 1`.
+### B. Correct Pagination Validation Order & Incomplete Tail Re-Fetch Policy
+```python
+def paginate_ohlcv(
+    adapter: PublicExchangeAdapter,
+    symbol: str,
+    timeframe: SupportedTimeframe,
+    since_ms: int,
+    until_ms: int,
+    clock: ServerTimeObserver,
+) -> list[RawKlineRow]:
+    """Deterministically paginate historical OHLCV from Binance vision public endpoints."""
+    step_ms = timeframe_to_duration_ms(timeframe)
+    expected_count = (until_ms - since_ms) // step_ms
+    max_pages = max(50, ((expected_count + 999) // 1000) * 3)
 
----
+    current_since_ms = since_ms
+    admitted_candles: list[RawKlineRow] = []
+    seen_timestamps: set[int] = set()
+    page_count = 0
 
-## 7. Clock Authority & Unextrapolated Observation Lower Bound
+    while current_since_ms < until_ms:
+        page_count += 1
+        if page_count > max_pages:
+            raise PaginationBudgetExceededError(f"Pagination exceeded safety budget of {max_pages} requests.")
 
-### A. Delayed Finalization as Safe Engineering Trade-off
-Extrapolating server time using local monotonic time assumes that local oscillator drift is universally bounded across all hardware environments. To remove this assumption, M1 adopts a **strictly unextrapolated observation model**:
-- The pipeline queries Binance server time (`GET /api/v3/time`).
-- The returned `t_server_ms` is treated as a conservative lower bound of current exchange time at the moment the response arrives.
-- **No extrapolation:** Local monotonic time is **never** added to extrapolate future server time.
-- **Trade-off:** If an observation is several seconds old, a newly completed candle might not be finalized until the next refresh. This trade-off is intentionally accepted: **delayed finalization is strictly preferred over premature finalization.**
+        # Request batch from exchange (max 1000 klines)
+        page = adapter.fetch_ohlcv(symbol, timeframe.value, since_ms=current_since_ms, limit=1000)
+        
+        # 1. Empty page: Exchange has no further data in range
+        if not page:
+            break
 
-### B. Freshness & Resampling Protocol
-1. **Observation Lifetime:** Server time samples expire after `MAX_CLOCK_AGE_SEC = 60` seconds.
-2. **Fresh Resampling:** Before evaluating tail candle finalization, if the cached server time is older than 60 seconds, the adapter fetches a fresh timestamp.
-3. **Latency & Skew Safeguards:**
-   - If round-trip latency during clock fetching exceeds 2,000 ms, the sample is retried up to 3 times.
-   - If all 3 attempts fail, or if $|\tau_{\text{exchange}} - \tau_{\text{local}}| > 3,000\,\text{ms}$, ingestion aborts with `UnreliableClockError`.
-   - **Exchange Accuracy Assumption:** The pipeline assumes the Binance exchange server clock is internally synchronized via NTP and does not step backward during the session.
+        # 2. Extract timestamps and enforce boundary clamp BEFORE field validation
+        # Out-of-range rows (open_time >= until_ms or open_time < since_ms) are discarded immediately
+        in_range_rows: list[RawKlineRow] = []
+        for row in page:
+            if not isinstance(row, (list, tuple)) or len(row) < 1 or not isinstance(row[0], int):
+                continue
+            t = row[0]
+            if since_ms <= t < until_ms:
+                in_range_rows.append(row)
+
+        if not in_range_rows:
+            # If all returned rows were >= until_ms, pagination has reached completion
+            if page[0][0] >= until_ms:
+                break
+            # Otherwise advance cursor past max raw timestamp
+            current_since_ms = max(r[0] for r in page if isinstance(r[0], int)) + 1
+            continue
+
+        # 3. Field validation for admitted in-range rows only
+        # Corrupted OHLCV fields in discarded out-of-range rows will never fail ingestion
+        page_timestamps: list[int] = []
+        for i, row in enumerate(in_range_rows):
+            if len(row) != 6:
+                raise MalformedKlineError(f"Row {i} is not a sequence of exactly 6 elements: {row!r}")
+            t, o, h, l, c, v = row
+            for val_name, val in [("open", o), ("high", h), ("low", l), ("close", c), ("volume", v)]:
+                if not isinstance(val, (int, float)) or isinstance(val, bool) or not math.isfinite(val):
+                    raise MalformedKlineError(f"Row {i} field {val_name} {val!r} is invalid.")
+            if min(o, h, l, c) <= 0 or v < 0:
+                raise MalformedKlineError(f"Row {i} contains invalid price/volume values.")
+
+            if page_timestamps and t <= page_timestamps[-1]:
+                raise MalformedPageError(f"Page timestamps not strictly increasing: {page_timestamps[-1]} -> {t}")
+            if t in seen_timestamps:
+                raise PageOverlapError(f"Timestamp {t} was already accepted in a previous page.")
+            page_timestamps.append(t)
+
+        # 4. Incomplete Tail Candle Handling: Re-fetch after finalization
+        obs_server_time_ms = clock.get_fresh_server_time_ms()
+
+        for raw_kline in in_range_rows:
+            open_ms = raw_kline[0]
+            close_ms = open_ms + step_ms
+
+            if close_ms > obs_server_time_ms:
+                # Candle is forming / incomplete at observation time
+                # DO NOT advance cursor past it or commit truncated data
+                finalized = False
+                for attempt in range(3):  # MAX_TAIL_RETRIES = 3
+                    time.sleep(2)
+                    fresh_server_time_ms = clock.get_fresh_server_time_ms()
+                    if close_ms <= fresh_server_time_ms:
+                        # Re-fetch fresh OHLCV from the exact cursor to obtain finalized values
+                        refetched = adapter.fetch_ohlcv(symbol, timeframe.value, since_ms=open_ms, limit=1)
+                        if refetched and refetched[0][0] == open_ms:
+                            refetched_row = refetched[0]
+                            # Validate newly fetched row, discarding cached incomplete row
+                            validate_raw_kline_fields(refetched_row)
+                            admitted_candles.append(refetched_row)
+                            seen_timestamps.add(open_ms)
+                            current_since_ms = open_ms + 1
+                            finalized = True
+                            break
+                if not finalized:
+                    raise IncompleteTailCandleError(
+                        f"Candle at open_time {open_ms}ms remained forming after retries. Aborting ingestion."
+                    )
+            else:
+                admitted_candles.append(raw_kline)
+                seen_timestamps.add(open_ms)
+                current_since_ms = open_ms + 1
+
+    return admitted_candles
+```
 
 ---
 
@@ -482,28 +588,34 @@ def normalize_float(val: float) -> float:
 
 ---
 
-## 10. Complete Storage Durability, Sync Barriers & Crash Recovery
+## 10. Complete Storage Durability, Win32/POSIX APIs & Crash Recovery
 
-### A. Manifest State Machine
-The ingestion lifecycle follows an explicit 8-state machine:
+### A. Windows Storage Durability Protocol (Win32 API Contracts)
+To guarantee data integrity on Windows, the storage engine adheres strictly to documented Win32 contracts:
+
+1. **Staging File Creation & Flush:**
+   - Staging files are opened using `CreateFileW` with `FILE_FLAG_WRITE_THROUGH` (or standard Python `open()` followed by `FlushFileBuffers(handle)`).
+   - Python executes `f.flush()` followed by `os.fsync(f.fileno())` (which invokes `FlushFileBuffers` internally on Windows) to commit staging data to non-volatile disk blocks.
+2. **Same-Volume No-Clobber Publication:**
+   - Staging files are allocated on the exact same filesystem volume as the target directory (`data/datasets/`).
+   - Publication is performed via `MoveFileExW(staging_path, target_path, MOVEFILE_WRITE_THROUGH)`.
+   - **Crucially:** `MOVEFILE_REPLACE_EXISTING` is **OMITTED**. If `target_path` already exists, `MoveFileExW` fails atomically and sets `GetLastError() == ERROR_ALREADY_EXISTS`, raising `FileExistsError` in Python without modifying the destination.
+3. **Manifest Temporary Replacement:**
+   - Manifest state transitions write to a temporary manifest file (`.ingest_manifest_<uuid>.json.tmp`), flushed via `FlushFileBuffers`.
+   - Manifest replacement intentionally uses atomic replacement: `MoveFileExW(tmp_path, manifest_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (or `os.replace()`), ensuring the active manifest is updated atomically without clobbering datasets.
+4. **Hardware & Filesystem Limitations:**
+   - On Windows, `FlushFileBuffers` flushes filesystem driver cache to disk controller cache; consumer drives with volatile write caching enabled may acknowledge flushes before magnetic/NAND writes complete unless battery-backed.
+   - Windows NTFS does not expose directory file descriptors for directory-level `fsync`; `MOVEFILE_WRITE_THROUGH` commits directory metadata changes directly.
+
+### B. POSIX Storage Durability Protocol
+1. Staging file is flushed and committed via `os.fsync(fd)`.
+2. Manifest updates write to `.tmp`, execute `os.fsync(fd)`, atomically replace via `os.replace()`, and call `os.fsync(dir_fd)` on the parent directory.
+3. Publication executes `os.link(staging, target)` followed by `os.unlink(staging)`. If target exists, `os.link()` raises `FileExistsError` atomically.
+4. Directory synchronization executes `os.fsync(dir_fd)` on the dataset parent directory.
+
+### C. Manifest 8-State Machine & Comprehensive Crash-Recovery Table
+
 $$\text{INITIALIZING} \to \text{STAGING} \to \text{STAGED} \to \text{PUBLISHING} \to \text{PUBLISHED} \to \text{COMMITTING\_CATALOG} \to \text{COMMITTED} \to \text{CLEANUP}$$
-
-### B. Atomic Manifest Updates & Filesystem Sync Barriers
-1. **Manifest State Updates:**
-   - Write updated manifest to `.ingest_manifest_<uuid>.json.tmp`.
-   - Execute `os.fsync(fd)` (POSIX) or Win32 `FlushFileBuffers(handle)` (Windows).
-   - Atomically replace: `os.replace('.ingest_manifest_<uuid>.json.tmp', '.ingest_manifest_<uuid>.json')`.
-   - On POSIX, synchronize parent directory: `os.fsync(dir_fd)`.
-2. **Staging File Creation & Publication:**
-   - Staging write to `<target_path>.tmp_<uuid>`.
-   - Flush and sync: `os.fsync(file_fd)` (POSIX) or `FlushFileBuffers` with `FILE_FLAG_WRITE_THROUGH` (Windows).
-   - Staging verification: DuckDB verifies row count equals `record_count` and computes `file_sha256`.
-   - Advance manifest state to `PUBLISHING`.
-   - Atomic no-clobber publication: `os.link(staging, target)` followed by `os.unlink(staging)` on POSIX; Win32 `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` on Windows. If destination exists, raises `FileExistsError` / `DatasetPathCollisionError` without touching target.
-   - On POSIX, execute parent directory `os.fsync(dir_fd)`.
-   - Advance manifest state to `PUBLISHED`, then `COMMITTING_CATALOG`.
-
-### C. Comprehensive Crash-Recovery Transition Table
 
 | Crash Point | Filesystem State | Catalog State | Manifest State | Startup Reconciliation Recovery Action |
 |---|---|---|---|---|
@@ -511,14 +623,10 @@ $$\text{INITIALIZING} \to \text{STAGING} \to \text{STAGED} \to \text{PUBLISHING}
 | **2. After manifest temp flush, before replacement** | `.tmp` manifest exists; no main manifest | No record | No main manifest | Reconciler cleans up orphaned `.tmp` manifest and associated staging file. |
 | **3. During staging write** | Incomplete staging `.tmp` file | No record | `INITIALIZING` or `STAGING` | Reconciler inspects manifest lease: if PID dead and lease expired, deletes staging `.tmp` and unlinks manifest. |
 | **4. After staging verified, before publication** | Staging `.tmp` verified; target does not exist | No record | `STAGED` | Reconciler verifies staging `.tmp` hash. If valid, resumes publication $\to$ advances manifest $\to$ commits catalog. If invalid, deletes `.tmp` and manifest. |
-| **5. Crash after hard-link created, before staging unlink** | Both staging `.tmp` and target `.parquet` exist | No record | `PUBLISHING` | Reconciler checks target `.parquet`: if hash matches manifest, unlinks redundant staging `.tmp`, advances manifest to `PUBLISHED`, and proceeds to catalog commit. |
+| **5. Crash after publication link, before staging unlink** | Both staging `.tmp` and target `.parquet` exist | No record | `PUBLISHING` | Reconciler checks target `.parquet`: if hash matches manifest, unlinks redundant staging `.tmp`, advances manifest to `PUBLISHED`, and proceeds to catalog commit. |
 | **6. Crash after publication, before catalog commit** | Target `.parquet` exists; staging unlinked | No record | `PUBLISHED` or `COMMITTING_CATALOG` | Reconciler verifies target `.parquet` against manifest hash: if valid, executes DuckDB commit transaction $\to$ advances manifest to `COMMITTED`. If target hash mismatches, quarantines target file. |
 | **7. After DuckDB commit, before manifest unlink** | Target `.parquet` exists | Committed record exists | `COMMITTED` or `COMMITTING_CATALOG` | Reconciler observes transaction already committed in DuckDB for `ingestion_uuid`; safely unlinks orphaned manifest. |
 | **8. During cleanup (staging/manifest unlink)** | Target `.parquet` exists | Committed record exists | Residual manifest or `.tmp` | Reconciler verifies catalog commit, removes residual manifest or `.tmp`. Idempotent. |
-
-### D. Orphaned File Cleanup & Collision Handling
-- **Orphan Files Without Manifest:** Any `.tmp` file lacking an active manifest is inspected against active OS process lockfiles. If unowned and modified $>1\,\text{hour}$ ago, it is safely unlinked.
-- **Path Collisions:** Target files are **never overwritten**. If an existing target does not match the manifest, it is quarantined to `data/quarantine/<timestamp>_<filename>` and logged.
 
 ---
 
@@ -640,16 +748,19 @@ All automated CI test suites run **100% offline** without network access or live
 
 ### Required Deterministic Test Suite
 1. **`test_adapter_spot_symbol_metadata_contract`**: Asserts `fetch_spot_symbol_metadata` returns valid `SpotSymbolMetadata`, verifies symbol status and spot permissions, and rejects delisted or halted pairs with `MarketStatusError`.
-2. **`test_out_of_range_row_corruption_ignored`**: Injects an exchange page containing rows beyond `until` with malformed OHLCV fields; asserts out-of-range rows are discarded before validation and do not cause ingestion failure.
-3. **`test_incomplete_tail_candle_retry_and_abort`**: Injects forming candle at tail of range; asserts paginator retries fresh clock sampling and aborts with `IncompleteTailCandleError` rather than silently skipping or committing.
-4. **`test_invalid_and_unaligned_request_windows`**: Asserts `until_ms <= since_ms` raises `InvalidWindowError`, and unaligned `since` or `until` raises `UnalignedBoundaryError`.
-5. **`test_parquet_row_count_matches_record_count_gap_free`**: Asserts physical Parquet rows strictly equal `record_count` and `record_count == expected_records`.
-6. **`test_parquet_row_count_matches_record_count_gap_containing`**: Asserts physical Parquet rows strictly equal `record_count`, `record_count < expected_records`, and `record_count + missing_intervals == expected_records`.
-7. **`test_empty_dataset_path_committed_without_file`**: Asserts zero admitted candles bypass M0 sequence validator, publish no Parquet file, compute canonical header-only SHA-256, and register a committed EMPTY snapshot.
-8. **`test_crash_recovery_all_transitions_idempotent`**: Exercises all 8 transitions in the crash-recovery table using mock crashes; asserts reconciliation leaves catalog and files consistent.
-9. **`test_binance_http_429_backoff_and_exhaustion`**: Injects HTTP 429 with and without `Retry-After`; asserts backoff respects header and aborts when retries exhaust.
-10. **`test_binance_http_418_immediate_halt`**: Injects HTTP 418; asserts immediate termination with zero retries.
-11. **`test_ccxt_url_sanitization_effective_keys`**: Asserts adapter retains only public Vision URLs; all SAPI, fapi, dapi, eapi, papi, and WS entries are purged.
+2. **`test_future_window_rejected_zero_requests`**: Asserts requesting `until_ms > server_time_ms` raises `FutureWindowError` and issues zero Kline queries.
+3. **`test_out_of_range_row_corruption_ignored`**: Injects an exchange page containing rows beyond `until` with malformed OHLCV fields; asserts out-of-range rows are discarded before validation and do not cause ingestion failure.
+4. **`test_incomplete_tail_candle_refetch_after_finalization`**: Injects forming candle at tail; asserts paginator pauses, verifies cursor remains unchanged, re-fetches fresh OHLCV upon finalization, and admits updated values while discarding initial incomplete values.
+5. **`test_incomplete_tail_retry_exhaustion_aborts`**: Injects candle remaining incomplete across all 3 retries; asserts ingestion aborts with `IncompleteTailCandleError` without committing dataset.
+6. **`test_invalid_and_unaligned_request_windows`**: Asserts `until_ms <= since_ms` raises `InvalidWindowError`, and unaligned `since` or `until` raises `UnalignedBoundaryError`.
+7. **`test_parquet_row_count_matches_record_count_gap_free`**: Asserts physical Parquet rows strictly equal `record_count` and `record_count == expected_records`.
+8. **`test_parquet_row_count_matches_record_count_gap_containing`**: Asserts physical Parquet rows strictly equal `record_count`, `record_count < expected_records`, and `record_count + missing_intervals == expected_records`.
+9. **`test_empty_dataset_path_committed_without_file`**: Asserts zero admitted candles bypass M0 sequence validator, publish no Parquet file, compute canonical header-only SHA-256, and register a committed EMPTY snapshot.
+10. **`test_crash_recovery_all_transitions_idempotent`**: Exercises all 8 transitions in the crash-recovery table using mock crashes; asserts reconciliation leaves catalog and files consistent.
+11. **`test_binance_http_429_backoff_and_exhaustion`**: Injects HTTP 429 with and without `Retry-After`; asserts backoff respects header and aborts when retries exhaust.
+12. **`test_binance_http_418_immediate_halt`**: Injects HTTP 418; asserts immediate termination with zero retries.
+13. **`test_ccxt_url_sanitization_effective_keys`**: Asserts adapter retains only public Vision URLs; all SAPI, fapi, dapi, eapi, papi, and WS entries are purged.
+14. **`test_win32_no_clobber_publication_flag`**: Verifies Windows publication uses `MOVEFILE_WRITE_THROUGH` without `MOVEFILE_REPLACE_EXISTING`, raising `DatasetPathCollisionError` on destination collision.
 
 ---
 
@@ -658,15 +769,16 @@ All automated CI test suites run **100% offline** without network access or live
 | # | Criterion | Verification Method |
 |---|---|---|
 | 1 | Allowlisted `fetch_spot_symbol_metadata` contract rejecting delisted or non-tradable pairs | Pre-flight unit tests |
-| 2 | Purge all SAPI, futures, options, and private CCXT 4.4.52 URL groups | Effective URL inspection unit test |
-| 3 | Upper-bound clamp $[since, until)$ before field validation (out-of-range corruption ignored) | Pagination boundary unit test |
-| 4 | Incomplete in-range tail candle guarded: retries fresh clock, never silently skips forming candle | Tail guard unit tests |
-| 5 | Clean zero-candle branch committing EMPTY snapshots without Parquet files | Empty-path unit tests |
-| 6 | Parquet physical rows strictly match `record_count`, with `record_count + missing == expected` | Staging verification unit tests |
-| 7 | Cross-platform atomic no-clobber publication with platform sync barriers | Storage publication unit tests |
-| 8 | Complete 8-state crash-recovery transition protocol with durable manifests | Crash-recovery reconciliation tests |
-| 9 | Immutable snapshot catalog with dedicated verification audit history | DuckDB catalog DDL & audit tests |
-| 10 | 100% offline deterministic test suite passing on Python 3.11 and 3.12 | CI workflow matrix run |
+| 2 | Reject future request windows ($until\_ms > server\_time\_ms$) with zero Kline requests | Pre-flight window unit tests |
+| 3 | Purge all SAPI, futures, options, and private CCXT 4.4.52 URL groups | Effective URL inspection unit test |
+| 4 | Upper-bound clamp $[since, until)$ before field validation (out-of-range corruption ignored) | Pagination boundary unit test |
+| 5 | Incomplete in-range tail candle guarded: re-fetches fresh OHLCV upon finalization, aborts on retry exhaustion | Tail guard unit tests |
+| 6 | Clean zero-candle branch committing EMPTY snapshots without Parquet files | Empty-path unit tests |
+| 7 | Parquet physical rows strictly match `record_count`, with `record_count + missing == expected` | Staging verification unit tests |
+| 8 | Cross-platform atomic no-clobber publication adhering to Win32 and POSIX API contracts | Storage publication unit tests |
+| 9 | Complete 8-state crash-recovery transition protocol with durable manifests | Crash-recovery reconciliation tests |
+| 10 | Immutable snapshot catalog with dedicated verification audit history | DuckDB catalog DDL & audit tests |
+| 11 | 100% offline deterministic test suite passing on Python 3.11 and 3.12 | CI workflow matrix run |
 
 ---
 
