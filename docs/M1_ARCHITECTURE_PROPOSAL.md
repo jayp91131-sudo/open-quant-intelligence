@@ -21,10 +21,10 @@ The pipeline will:
 2. Enforce an unextrapolated exchange server-time preflight check requiring that the requested window upper boundary satisfies $until\_ms \le fresh\_server\_time\_ms$. If $until\_ms$ lies in the future, ingestion aborts immediately with `FutureWindowError` prior to issuing any Kline requests, preventing premature classification of future intervals as missing data.
 3. Collect public spot OHLCV data from Binance's dedicated public market data cluster (`https://data-api.binance.vision`) using CCXT without authentication or credentials, mediated through a strict, allowlisted public adapter `PublicExchangeAdapter` that encapsulates CCXT privately, captures response headers for rate-limit monitoring, and explicitly purges all private, SAPI, futures, options, portfolio-margin, and WebSocket endpoint groups.
 4. Execute strict pagination ordering: inspect raw timestamp types and reject unparseable or non-integer timestamps; discard valid rows where $open\_time \ge until\_ms$ or $open\_time < since\_ms$ before field validation; and ensure every non-terminal iteration achieves strictly positive cursor advancement or raises a structured error.
-5. Prevent permanent omission of incomplete in-range tail candles: discard the original forming OHLCV payload without validating prices or volume, preserve the exact cursor, query a genuinely fresh exchange-time sample on every retry, wait for finalization, and explicitly re-fetch fresh OHLCV from that cursor. Apply full validation exclusively to the newly fetched row. If retries exhaust, abort safely without committing a truncated dataset.
+5. Prevent permanent omission of incomplete in-range tail candles: discard the original forming OHLCV payload without validating prices or volume, preserve the exact cursor, query a genuinely fresh exchange-time sample (`force_refresh=True`) on every retry, wait for finalization, and explicitly re-fetch fresh OHLCV from that cursor. Fully harden the re-fetched response (require non-empty, exactly 1 row, 6 elements, matching timestamp) before field validation. If retries exhaust, abort safely without committing a truncated dataset.
 6. Provide full requested-window coverage analysis: detect leading gaps (before first candle), internal gaps (between candles), and trailing gaps (after last candle), enforcing that every admitted candle aligns strictly to the requested timeframe grid: $(candle\_open\_ms - since\_ms) \pmod{\Delta} == 0$. Compute $missing\_intervals = expected\_records - record\_count$.
 7. Provide an explicit zero-candle branch for legitimate EMPTY ranges that validates market identity and window boundaries, computes a canonical header-only content SHA-256 digest, and records an immutable committed EMPTY catalog entry with nullable artifact fields, without routing empty sequences into M0's sequence validator (which expects at least one candle).
-8. Store validated datasets in Apache Parquet files using Snappy compression via a complete, 8-state crash-recovery protocol (`INITIALIZING → STAGING → STAGED → PUBLISHING → PUBLISHED → COMMITTING_CATALOG → COMMITTED → CLEANUP`) adhering strictly to cross-platform no-clobber invariants. Pre-existing target files with mismatched hashes are never automatically quarantined, moved, or deleted; collisions raise structured `RecoveryConflictError` / `DatasetPathCollisionError` and preserve the destination byte-for-byte unchanged.
+8. Store validated datasets in Apache Parquet files using Snappy compression via a complete, 8-state crash-recovery protocol (`INITIALIZING → STAGING → STAGED → PUBLISHING → PUBLISHED → COMMITTING_CATALOG → COMMITTED → CLEANUP`) adhering strictly to cross-platform no-clobber invariants and precise OS API semantics (`_commit(fd)` via `os.fsync` on Windows CRT; `FlushFileBuffers` on Win32 handles; `os.fsync` and directory sync on POSIX). Pre-existing target files with mismatched hashes are never automatically quarantined, moved, or deleted; collisions raise structured `RecoveryConflictError` / `DatasetPathCollisionError` and preserve the destination byte-for-byte unchanged.
 9. Maintain an immutable dataset snapshot catalog in DuckDB accompanied by a dedicated `dataset_verification_history` audit table, cleanly separating immutable snapshot identities from verification audit events.
 10. Provide user-facing CLI commands for downloading, cataloging, inspecting, and re-validating historical datasets.
 
@@ -108,7 +108,7 @@ src/open_quant_intelligence/
 │   ├── __init__.py
 │   ├── adapter.py               # Strict allowlisted Binance public vision adapter (encapsulates CCXT)
 │   ├── preflight.py             # Pre-flight Spot market metadata & future-window verification
-│   ├── pagination.py            # Strict paginator with malformed-row rejection and tail re-fetch
+│   ├── pagination.py            # Strict paginator with malformed-row rejection and hardened tail re-fetch
 │   ├── clock.py                 # Fresh exchange server time observation & ServerTimeObserver protocol
 │   └── pipeline.py              # Orchestrator: Pre-Flight -> Fetch -> Edge Gap Analysis -> Store
 ├── storage/                     # [M1 NEW] Persistence & Catalog
@@ -133,9 +133,9 @@ flowchart TD
         Adapter["PublicExchangeAdapter (Strict Interface, Sanitized CCXT 4.4.52)"]
         MarketPreflight["Market Metadata Preflight (fetch_spot_symbol_metadata)"]
         WindowPreflight["Future Window Preflight (until_ms <= server_time_ms)"]
-        ClockSync["Server Time Observer (Fresh Sample Protocol)"]
+        ClockSync["Server Time Observer (Fresh Sample Protocol, MAX_CLOCK_AGE_SEC = 60)"]
         Paginator["Strict Paginator (Timestamp Inspection, In-Range Filtering)"]
-        TailRefetch["Incomplete Tail Guard (Preserve Cursor, Wait Finalization, Re-fetch Fresh OHLCV)"]
+        TailRefetch["Incomplete Tail Guard (Hardened Re-fetch: 1 row, 6 elements, exact open_ms)"]
     end
 
     subgraph Coverage_Validation["Coverage & Domain Validation (src/open_quant_intelligence/data/)"]
@@ -346,8 +346,8 @@ Rejecting future windows prior to pagination ensures the pipeline never requests
 
 ## 7. Complete Pagination Algorithm & Incomplete Tail Re-Fetch Policy
 
-### A. ServerTimeObserver Protocol
-The observation layer defines a strict protocol ensuring fresh server time is fetched without stale cached assumptions during retries:
+### A. ServerTimeObserver Protocol & Cache Freshness Specification
+To avoid unverified local clock drift assumptions, server time is strictly unextrapolated. The observation layer defines:
 
 ```python
 class ServerTimeObserver(Protocol):
@@ -356,9 +356,14 @@ class ServerTimeObserver(Protocol):
     def get_fresh_server_time_ms(self, force_refresh: bool = False) -> int:
         """Return the exchange server time in milliseconds.
         
-        Args:
-            force_refresh: If True, bypasses any short-term cache and issues
-                           an actual GET /api/v3/time HTTP request immediately.
+        Cache Freshness Invariants:
+        1. When force_refresh=False: Returns the cached server time if its age is
+           strictly <= MAX_CLOCK_AGE_SEC (60 seconds). If older than 60 seconds,
+           it automatically issues an actual GET /api/v3/time HTTP request.
+        2. When force_refresh=True: Unconditionally bypasses any cached value and
+           issues a real GET /api/v3/time HTTP request immediately.
+        3. No local monotonic extrapolation: The observed timestamp is strictly
+           the raw integer returned by the exchange server.
         """
         ...
 ```
@@ -480,13 +485,28 @@ def paginate_ohlcv(
                     if close_ms <= fresh_server_time_ms:
                         # Re-fetch fresh OHLCV from the exact cursor to obtain finalized values
                         refetched = adapter.fetch_ohlcv(symbol, timeframe.value, since_ms=open_ms, limit=1)
-                        if not refetched or refetched[0][0] != open_ms:
-                            raise IncompleteTailCandleError(
-                                f"Re-fetched candle at {open_ms}ms returned missing or mismatched timestamp."
+                        
+                        # Hardened re-fetch response validation:
+                        # 1. Non-empty
+                        if not refetched:
+                            raise RefetchEmptyError(f"Re-fetch at cursor {open_ms}ms returned empty response.")
+                        # 2. Exactly one row
+                        if len(refetched) != 1:
+                            raise RefetchRowCountError(
+                                f"Re-fetch at cursor {open_ms}ms returned {len(refetched)} rows; expected 1."
                             )
                         refetched_row = refetched[0]
-                        # Fully validate newly fetched row
+                        # 3. Exactly 6 elements
+                        if not isinstance(refetched_row, (list, tuple)) or len(refetched_row) != 6:
+                            raise MalformedKlineError(f"Re-fetched row is not a 6-element sequence: {refetched_row!r}")
+                        # 4. Matching timestamp
+                        if refetched_row[0] != open_ms:
+                            raise RefetchTimestampMismatchError(
+                                f"Re-fetch at cursor {open_ms}ms returned mismatched timestamp {refetched_row[0]}ms."
+                            )
+                        # 5. Full OHLCV field validation
                         validate_raw_kline_fields(refetched_row)
+                        
                         admitted_candles.append(refetched_row)
                         seen_timestamps.add(open_ms)
                         current_since_ms = open_ms + 1
@@ -545,9 +565,9 @@ To naturally represent trailing gaps where no subsequent candle exists, `subsequ
 CREATE TABLE IF NOT EXISTS dataset_gaps (
     gap_id VARCHAR PRIMARY KEY,
     snapshot_id VARCHAR REFERENCES datasets(snapshot_id),
-    gap_type VARCHAR NOT NULL,                   -- 'LEADING', 'INTERNAL', 'TRAILING'
+    gap_type VARCHAR NOT NULL,                   -- 'LEADING', 'INTERNAL', 'TRAILING', 'FULL_WINDOW'
     expected_open TIMESTAMP WITH TIME ZONE NOT NULL,
-    subsequent_open TIMESTAMP WITH TIME ZONE,    -- NULL for TRAILING gaps
+    subsequent_open TIMESTAMP WITH TIME ZONE,    -- NULL for TRAILING and FULL_WINDOW gaps
     missing_count BIGINT NOT NULL
 );
 ```
@@ -602,17 +622,21 @@ For EMPTY datasets, the digest is computed over `[Header Block]` with `Candle Co
 
 ## 10. Complete Storage Durability, Win32/POSIX APIs & Crash Recovery
 
-### A. Windows Storage Durability Protocol (Win32 API Contracts)
+### A. Windows Storage Durability Protocol (Win32 & CRT API Contracts)
+To guarantee data integrity on Windows, the storage engine adheres strictly to documented CRT and Win32 contracts:
+
 1. **Staging File Creation & Flush:**
    - Staging files are written to `<target_path>.tmp_<uuid>`.
-   - Flushed via Python `f.flush()` followed by `os.fsync(f.fileno())` (which invokes Win32 `FlushFileBuffers(handle)` internally) to commit data to non-volatile disk blocks.
+   - Flushed via Python `f.flush()` followed by `os.fsync(f.fileno())`.
+   - On Windows, Python's runtime implements `os.fsync(fd)` by invoking Microsoft CRT `_commit(fd)`, which forces the file buffers associated with `fd` to be written to disk.
+   - For applications managing low-level Win32 file handles directly, `FlushFileBuffers(handle)` provides equivalent disk-flushing capability, while `CreateFileW` with `FILE_FLAG_WRITE_THROUGH` forces writes to bypass intermediate write caches.
 2. **Same-Volume No-Clobber Publication:**
    - Staging and target reside on the same filesystem volume (`data/datasets/`).
    - Publication uses Win32 `MoveFileExW(staging_path, target_path, MOVEFILE_WRITE_THROUGH)`.
    - **Crucial Invariant:** `MOVEFILE_REPLACE_EXISTING` is **OMITTED**. If `target_path` already exists, `MoveFileExW` fails atomically with `GetLastError() == ERROR_ALREADY_EXISTS`, raising `FileExistsError` in Python without modifying the destination.
 3. **Manifest Temporary Replacement:**
-   - Manifest transitions write to `.ingest_manifest_<uuid>.json.tmp`, flushed via `FlushFileBuffers`.
-   - Replaces manifest atomically: `MoveFileExW(tmp_path, manifest_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
+   - Manifest transitions write to `.ingest_manifest_<uuid>.json.tmp`, committed via CRT `_commit()` / `os.fsync()`.
+   - Replaces manifest atomically: `MoveFileExW(tmp_path, manifest_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` (or Python `os.replace()`).
 4. **Hardware Limitations:** Documented that consumer disk write caches may delay physical media writes unless battery-backed.
 
 ### B. POSIX Storage Durability Protocol
@@ -763,19 +787,21 @@ All automated CI test suites run **100% offline** without network access or live
 
 ### Required Deterministic Test Suite
 1. **`test_incomplete_tail_discard_refetch_validate`**: Asserts incomplete candle original values are discarded without price validation, cursor is preserved, fresh server time is fetched on retry, and refetched row is fully validated upon finalization.
-2. **`test_incomplete_tail_retry_exhaustion_aborts`**: Injects candle remaining incomplete across all 3 retries; asserts ingestion aborts with `IncompleteTailCandleError` without committing dataset.
-3. **`test_future_window_rejected_zero_requests`**: Asserts requesting `until_ms > server_time_ms` raises `FutureWindowError` and issues zero Kline queries.
-4. **`test_full_window_coverage_leading_gap`**: Asserts missing first interval is correctly classified as a `LEADING` gap and increments `missing_intervals`.
-5. **`test_full_window_coverage_trailing_gap`**: Asserts missing last interval is correctly classified as a `TRAILING` gap with `subsequent_open = NULL`.
-6. **`test_full_window_coverage_internal_gap`**: Asserts gap between consecutive candles is recorded as `INTERNAL`.
-7. **`test_unaligned_candle_timestamp_aborts`**: Asserts candle with timestamp not on the requested timeframe grid raises `UnalignedCandleError`.
-8. **`test_coverage_invariant_holds`**: Asserts `record_count + missing_intervals == expected_records` across all gap permutations.
-9. **`test_preexisting_target_collision_preserved_byte_for_byte`**: Asserts pre-existing target file with mismatched hash causes `RecoveryConflictError` and remains completely unmodified.
-10. **`test_malformed_timestamp_raises_structured_error`**: Asserts row with string, missing, or negative timestamp raises `MalformedPageError` without silent skipping.
-11. **`test_pagination_regression_and_stall_rejection`**: Asserts page with timestamps prior to cursor or with zero forward progress raises `PaginationRegressionError`.
-12. **`test_out_of_range_row_corruption_ignored`**: Injects an exchange page containing rows beyond `until` with malformed OHLCV fields; asserts out-of-range rows are discarded before validation and do not cause ingestion failure.
-13. **`test_empty_dataset_path_committed_without_file`**: Asserts zero admitted candles bypass M0 sequence validator, publish no Parquet file, compute canonical header-only SHA-256, and register a committed EMPTY snapshot.
-14. **`test_crash_recovery_all_transitions_idempotent`**: Exercises all 8 transitions in the crash-recovery table using mock crashes; asserts reconciliation leaves catalog and files consistent.
+2. **`test_refetched_response_structural_failure_cases`**: Covers all four re-fetch failure modes: empty response (`RefetchEmptyError`), multiple rows returned (`RefetchRowCountError`), malformed row (`MalformedKlineError`), and mismatched timestamp (`RefetchTimestampMismatchError`).
+3. **`test_server_time_observer_cache_freshness_and_forced_refresh`**: Asserts samples $\le 60\,\text{s}$ are returned from cache when `force_refresh=False`, samples $>60\,\text{s}$ trigger fresh requests, and `force_refresh=True` unconditionally queries fresh server time.
+4. **`test_incomplete_tail_retry_exhaustion_aborts`**: Injects candle remaining incomplete across all 3 retries; asserts ingestion aborts with `IncompleteTailCandleError` without committing dataset.
+5. **`test_future_window_rejected_zero_requests`**: Asserts requesting `until_ms > server_time_ms` raises `FutureWindowError` and issues zero Kline queries.
+6. **`test_full_window_coverage_leading_gap`**: Asserts missing first interval is correctly classified as a `LEADING` gap and increments `missing_intervals`.
+7. **`test_full_window_coverage_trailing_gap`**: Asserts missing last interval is correctly classified as a `TRAILING` gap with `subsequent_open = NULL`.
+8. **`test_full_window_coverage_internal_gap`**: Asserts gap between consecutive candles is recorded as `INTERNAL`.
+9. **`test_unaligned_candle_timestamp_aborts`**: Asserts candle with timestamp not on the requested timeframe grid raises `UnalignedCandleError`.
+10. **`test_coverage_invariant_holds`**: Asserts `record_count + missing_intervals == expected_records` across all gap permutations.
+11. **`test_preexisting_target_collision_preserved_byte_for_byte`**: Asserts pre-existing target file with mismatched hash causes `RecoveryConflictError` and remains completely unmodified.
+12. **`test_malformed_timestamp_raises_structured_error`**: Asserts row with string, missing, or negative timestamp raises `MalformedPageError` without silent skipping.
+13. **`test_pagination_regression_and_stall_rejection`**: Asserts page with timestamps prior to cursor or with zero forward progress raises `PaginationRegressionError`.
+14. **`test_out_of_range_row_corruption_ignored`**: Injects an exchange page containing rows beyond `until` with malformed OHLCV fields; asserts out-of-range rows are discarded before validation and do not cause ingestion failure.
+15. **`test_empty_dataset_path_committed_without_file`**: Asserts zero admitted candles bypass M0 sequence validator, publish no Parquet file, compute canonical header-only SHA-256, and register a committed EMPTY snapshot.
+16. **`test_crash_recovery_all_transitions_idempotent`**: Exercises all 8 transitions in the crash-recovery table using mock crashes; asserts reconciliation leaves catalog and files consistent.
 
 ---
 
@@ -787,7 +813,7 @@ All automated CI test suites run **100% offline** without network access or live
 | 2 | Reject future request windows ($until\_ms > server\_time\_ms$) with zero Kline requests | Pre-flight window unit tests |
 | 3 | Reject malformed timestamps and non-advancing pages with structured errors | Pagination unit tests |
 | 4 | Upper-bound clamp $[since, until)$ before field validation (out-of-range corruption ignored) | Pagination boundary unit test |
-| 5 | Incomplete tail candle: original values discarded, fresh time per retry, re-fetch upon finalization | Tail guard unit tests |
+| 5 | Incomplete tail candle: original values discarded, fresh time per retry, hardened re-fetch upon finalization | Tail guard unit tests |
 | 6 | Full window coverage: leading, internal, trailing gaps, and grid alignment invariant | Gap analysis unit tests |
 | 7 | Clean zero-candle branch committing EMPTY snapshots without Parquet files | Empty-path unit tests |
 | 8 | Pre-existing target files protected against overwrite or automatic quarantine on hash collision | Collision preservation unit tests |
