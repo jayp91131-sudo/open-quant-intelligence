@@ -63,6 +63,8 @@ def recovery_env(tmp_path: Path) -> tuple[ManifestManager, DuckDBCatalog, Path, 
     manifest_mgr = ManifestManager(manifests_dir)
     catalog_path = tmp_path / "catalog.duckdb"
     catalog = DuckDBCatalog(catalog_path)
+    datasets_dir = tmp_path / "datasets"
+    datasets_dir.mkdir(parents=True, exist_ok=True)
     engine = RecoveryEngine(manifest_mgr, catalog, base_data_dir=tmp_path)
     return manifest_mgr, catalog, tmp_path, engine
 
@@ -102,7 +104,9 @@ def test_crash_recovery_initializing_and_staging(
 ) -> None:
     """Crash at INITIALIZING/STAGING cleans up partial files and unlinks manifest."""
     mgr, catalog, base_dir, engine = recovery_env
-    staging_file = base_dir / "staging_partial.parquet.tmp"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "target.parquet"
+    staging_file = datasets_dir / "target.parquet.tmp"
     staging_file.write_text("partial corrupt staging bytes", encoding="utf-8")
 
     test_uuid = str(uuid.uuid4())
@@ -117,7 +121,7 @@ def test_crash_recovery_initializing_and_staging(
         record_count=0,
         missing_intervals=2,
         staging_file_path=str(staging_file),
-        target_file_path=str(base_dir / "target.parquet"),
+        target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
 
@@ -133,8 +137,9 @@ def test_crash_recovery_staged_valid(
 ) -> None:
     """Crash at STAGED with valid staging file completes publication and catalog commit."""
     mgr, catalog, base_dir, engine = recovery_env
-    staging_file = base_dir / "valid_stage.parquet.tmp"
-    target_file = base_dir / "final_target.parquet"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "final_target.parquet"
+    staging_file = datasets_dir / "final_target.parquet.tmp"
 
     candles = _make_test_candles(2)
     write_staging_parquet(staging_file, candles, record_count=2)
@@ -179,7 +184,9 @@ def test_crash_recovery_staged_corrupted_fails_safely(
 ) -> None:
     """Crash at STAGED with corrupted staging file raises RecoveryFailureError and cleans up."""
     mgr, _, base_dir, engine = recovery_env
-    staging_file = base_dir / "corrupted.parquet.tmp"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "target.parquet"
+    staging_file = datasets_dir / "target.parquet.tmp"
     staging_file.write_text("corrupted bytes", encoding="utf-8")
 
     test_uuid = str(uuid.uuid4())
@@ -196,7 +203,7 @@ def test_crash_recovery_staged_corrupted_fails_safely(
         missing_intervals=0,
         file_sha256=dummy_hash,
         staging_file_path=str(staging_file),
-        target_file_path=str(base_dir / "target.parquet"),
+        target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
 
@@ -212,7 +219,9 @@ def test_crash_recovery_publishing_already_published(
 ) -> None:
     """Crash at PUBLISHING where publication completed before crash: reconciles published file."""
     mgr, catalog, base_dir, engine = recovery_env
-    target_file = base_dir / "published_target.parquet"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "published_target.parquet"
+    staging_file = datasets_dir / "published_target.parquet.tmp"
     candles = _make_test_candles(2)
     write_staging_parquet(target_file, candles, record_count=2)
     t_hash = compute_file_sha256(target_file)
@@ -229,6 +238,7 @@ def test_crash_recovery_publishing_already_published(
         record_count=2,
         missing_intervals=0,
         file_sha256=t_hash,
+        staging_file_path=str(staging_file),
         target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
@@ -249,7 +259,9 @@ def test_crash_recovery_publishing_conflict_preserved_byte_for_byte(
 ) -> None:
     """Pre-existing conflicting target is preserved byte-for-byte; raises RecoveryConflictError."""
     mgr, _, base_dir, engine = recovery_env
-    target_file = base_dir / "conflict_target.parquet"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "conflict_target.parquet"
+    staging_file = datasets_dir / "conflict_target.parquet.tmp"
     target_file.write_text("ORIGINAL CONFLICTING DATA BYTES", encoding="utf-8")
     orig_bytes = target_file.read_bytes()
     orig_sha = compute_file_sha256(target_file)
@@ -267,6 +279,7 @@ def test_crash_recovery_publishing_conflict_preserved_byte_for_byte(
         record_count=2,
         missing_intervals=0,
         file_sha256=diff_sha,
+        staging_file_path=str(staging_file),
         target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
@@ -284,7 +297,9 @@ def test_crash_recovery_published_and_committing_catalog_idempotency(
 ) -> None:
     """Crash at PUBLISHED/COMMITTING_CATALOG commits catalog idempotently without duplicate records."""
     mgr, catalog, base_dir, engine = recovery_env
-    target_file = base_dir / "idempotent_target.parquet"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "idempotent_target.parquet"
+    staging_file = datasets_dir / "idempotent_target.parquet.tmp"
     candles = _make_test_candles(2)
     write_staging_parquet(target_file, candles, record_count=2)
     t_hash = compute_file_sha256(target_file)
@@ -301,6 +316,7 @@ def test_crash_recovery_published_and_committing_catalog_idempotency(
         record_count=2,
         missing_intervals=0,
         file_sha256=t_hash,
+        staging_file_path=str(staging_file),
         target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
@@ -326,7 +342,8 @@ def test_crash_recovery_active_lease_protection(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
     """Active lease held by another live process is protected and not hijacked."""
-    mgr, _, _, engine = recovery_env
+    mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
     future_time = "2099-01-01T00:00:00Z"
     test_uuid = str(uuid.uuid4())
     manifest = IngestionManifest(
@@ -341,6 +358,8 @@ def test_crash_recovery_active_lease_protection(
         missing_intervals=2,
         lease_owner_pid=99999,
         lease_expires_at_utc=future_time,
+        staging_file_path=str(datasets_dir / "target.parquet.tmp"),
+        target_file_path=str(datasets_dir / "target.parquet"),
     )
     mgr.write_manifest(manifest)
 
@@ -360,14 +379,8 @@ def test_crash_recovery_preserves_multiple_distinct_gaps(
 ) -> None:
     """Recovery must preserve LEADING, INTERNAL, and TRAILING gaps with exact metadata and dataset_gaps rows."""
     mgr, catalog, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
 
-    # Window: 0 to 6 hours (6 intervals of 1h)
-    # Available candles: hour 1 (3600000) and hour 4 (14400000)
-    # Gaps:
-    #   LEADING: hour 0 (1 missing)
-    #   INTERNAL: hours 2, 3 (2 missing)
-    #   TRAILING: hour 5 (1 missing)
-    # Total missing = 4, record_count = 2, expected_records = 6
     c1 = Candle(
         exchange_id="binance",
         market_type="spot",
@@ -408,7 +421,8 @@ def test_crash_recovery_preserves_multiple_distinct_gaps(
         GapType.TRAILING,
     ]
 
-    target_file = base_dir / "multi_gap_target.parquet"
+    target_file = datasets_dir / "multi_gap_target.parquet"
+    staging_file = datasets_dir / "multi_gap_target.parquet.tmp"
     write_staging_parquet(target_file, candles, record_count=2)
     t_hash = compute_file_sha256(target_file)
 
@@ -434,6 +448,7 @@ def test_crash_recovery_preserves_multiple_distinct_gaps(
             for g in expected_report.gaps
         ],
         file_sha256=t_hash,
+        staging_file_path=str(staging_file),
         target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
@@ -462,7 +477,9 @@ def test_crash_recovery_missing_hash_fails_safely(
 ) -> None:
     """A STAGED manifest with missing or invalid hash must fail validation safely."""
     mgr, _, base_dir, engine = recovery_env
-    staging_file = base_dir / "stage_missing_hash.parquet.tmp"
+    datasets_dir = base_dir / "datasets"
+    staging_file = datasets_dir / "stage_missing_hash.parquet.tmp"
+    target_file = datasets_dir / "stage_missing_hash.parquet"
     candles = _make_test_candles(2)
     write_staging_parquet(staging_file, candles, record_count=2)
 
@@ -479,7 +496,7 @@ def test_crash_recovery_missing_hash_fails_safely(
         missing_intervals=0,
         file_sha256="",  # Empty hash!
         staging_file_path=str(staging_file),
-        target_file_path=str(base_dir / "target.parquet"),
+        target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
 
@@ -495,7 +512,9 @@ def test_crash_recovery_row_count_mismatch_fails_safely(
 ) -> None:
     """Row count mismatch between physical parquet file and manifest must raise RecoveryFailureError."""
     mgr, _, base_dir, engine = recovery_env
-    target_file = base_dir / "row_count_mismatch.parquet"
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "row_count_mismatch.parquet"
+    staging_file = datasets_dir / "row_count_mismatch.parquet.tmp"
     candles = _make_test_candles(2)
     write_staging_parquet(target_file, candles, record_count=2)
     t_hash = compute_file_sha256(target_file)
@@ -512,6 +531,7 @@ def test_crash_recovery_row_count_mismatch_fails_safely(
         record_count=3,  # Claims 3, but physical parquet has 2!
         missing_intervals=0,
         file_sha256=t_hash,
+        staging_file_path=str(staging_file),
         target_file_path=str(target_file),
     )
     mgr.write_manifest(manifest)
@@ -525,6 +545,7 @@ def test_crash_recovery_invariant_violation_fails_safely(
 ) -> None:
     """Manifest violating record_count + missing_intervals == expected_records fails safely."""
     mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
     test_uuid = str(uuid.uuid4())
     manifest = IngestionManifest(
         ingestion_uuid=test_uuid,
@@ -536,8 +557,8 @@ def test_crash_recovery_invariant_violation_fails_safely(
         expected_records=2,
         record_count=1,
         missing_intervals=0,  # 1 + 0 != 2!
-        staging_file_path=str(base_dir / "stage.tmp"),
-        target_file_path=str(base_dir / "target.parquet"),
+        staging_file_path=str(datasets_dir / "target.parquet.tmp"),
+        target_file_path=str(datasets_dir / "target.parquet"),
     )
     mgr.write_manifest(manifest)
 
@@ -550,7 +571,8 @@ def test_crash_recovery_invalid_manifest_fails_safely(
 ) -> None:
     """Invalid schema version, invalid UUID, or invalid stage fails safely without touching files."""
     mgr, _, base_dir, engine = recovery_env
-    staging_file = base_dir / "do_not_delete.tmp"
+    datasets_dir = base_dir / "datasets"
+    staging_file = datasets_dir / "do_not_delete.parquet.tmp"
     staging_file.write_text("precious data", encoding="utf-8")
 
     # Invalid UUID
@@ -558,6 +580,7 @@ def test_crash_recovery_invalid_manifest_fails_safely(
         ingestion_uuid="not-a-valid-uuid-format",
         stage=ManifestStage.STAGING.value,
         staging_file_path=str(staging_file),
+        target_file_path=str(datasets_dir / "do_not_delete.parquet"),
     )
     mgr.write_manifest(manifest1)
 
@@ -573,6 +596,7 @@ def test_crash_recovery_invalid_manifest_fails_safely(
         schema_version=99,
         stage=ManifestStage.STAGING.value,
         staging_file_path=str(staging_file),
+        target_file_path=str(datasets_dir / "do_not_delete.parquet"),
     )
     mgr.write_manifest(manifest2)
 
@@ -586,9 +610,10 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
 ) -> None:
     """Path traversal ('..') and external symlinks are rejected and never deleted or overwritten."""
     mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
 
     # 1. Path traversal with ..
-    traversal_path = str(base_dir / "sub" / ".." / ".." / "unrelated.parquet")
+    traversal_path = str(datasets_dir / "sub" / ".." / ".." / "unrelated.parquet")
     test_uuid = str(uuid.uuid4())
     manifest = IngestionManifest(
         ingestion_uuid=test_uuid,
@@ -601,7 +626,7 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
         record_count=0,
         missing_intervals=2,
         staging_file_path=traversal_path,
-        target_file_path=str(base_dir / "target.parquet"),
+        target_file_path=str(datasets_dir / "target.parquet"),
     )
     mgr.write_manifest(manifest)
 
@@ -610,10 +635,10 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
 
     mgr.cleanup_manifest(test_uuid)
 
-    # 2. External path outside base_dir
+    # 2. External path outside datasets_dir
     external_dir = base_dir.parent / "unrelated_dir"
     external_dir.mkdir(parents=True, exist_ok=True)
-    unrelated_file = external_dir / "secret.txt"
+    unrelated_file = external_dir / "secret.parquet"
     unrelated_file.write_text("top secret", encoding="utf-8")
 
     test_uuid2 = str(uuid.uuid4())
@@ -628,11 +653,11 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
         record_count=0,
         missing_intervals=2,
         staging_file_path=str(unrelated_file),
-        target_file_path=str(base_dir / "target.parquet"),
+        target_file_path=str(datasets_dir / "target.parquet"),
     )
     mgr.write_manifest(manifest2)
 
-    with pytest.raises(RecoveryFailureError, match="outside base directory"):
+    with pytest.raises(RecoveryFailureError, match="outside authorized dataset directory"):
         engine.scan_and_recover()
 
     # Verify unrelated file was NEVER touched or deleted
@@ -640,11 +665,15 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
     assert unrelated_file.read_text(encoding="utf-8") == "top secret"
 
 
-def test_crash_recovery_atomic_single_writer_lock(
+def test_crash_recovery_rejects_catalog_as_staging(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
-    """Concurrent recovery processes cannot race; lock acquisition protects manifest."""
-    mgr, _, base_dir, engine = recovery_env
+    """A valid manifest attempting to use catalog.duckdb as its staging path must be rejected and catalog untouched."""
+    mgr, catalog, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
+    catalog_path = catalog.db_path
+    catalog_bytes_orig = catalog_path.read_bytes()
+
     test_uuid = str(uuid.uuid4())
     manifest = IngestionManifest(
         ingestion_uuid=test_uuid,
@@ -656,17 +685,209 @@ def test_crash_recovery_atomic_single_writer_lock(
         expected_records=2,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(base_dir / "staging.tmp"),
-        target_file_path=str(base_dir / "target.parquet"),
+        staging_file_path=str(catalog_path),
+        target_file_path=str(datasets_dir / "target.parquet"),
     )
     mgr.write_manifest(manifest)
 
-    # Pre-acquire the single-writer lock externally
-    with mgr.lock_manifest(test_uuid):
-        # Scan and recover should skip held lock by default
-        actions = engine.scan_and_recover(allow_active_lease_skip=True)
-        assert len(actions) == 0
+    with pytest.raises(RecoveryFailureError, match="Unauthorized path role|outside authorized dataset"):
+        engine.scan_and_recover()
 
-        # When allow_active_lease_skip=False, raise LeaseActiveError
-        with pytest.raises(LeaseActiveError, match="Could not acquire atomic lock"):
-            engine.scan_and_recover(allow_active_lease_skip=False)
+    # Catalog remains byte-for-byte untouched
+    assert catalog_path.read_bytes() == catalog_bytes_orig
+
+
+def test_crash_recovery_rejects_manifest_as_staging(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """A valid manifest attempting to use a manifest JSON file as its staging path must be rejected and untouched."""
+    mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
+    manifest_file = base_dir / "manifests" / "important_manifest.json"
+    manifest_file.write_text('{"important": "metadata"}', encoding="utf-8")
+    orig_bytes = manifest_file.read_bytes()
+
+    test_uuid = str(uuid.uuid4())
+    manifest = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=ManifestStage.STAGING.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=7_200_000,
+        expected_records=2,
+        record_count=0,
+        missing_intervals=2,
+        staging_file_path=str(manifest_file),
+        target_file_path=str(datasets_dir / "target.parquet"),
+    )
+    mgr.write_manifest(manifest)
+
+    with pytest.raises(RecoveryFailureError, match="Unauthorized path role|outside authorized dataset"):
+        engine.scan_and_recover()
+
+    assert manifest_file.read_bytes() == orig_bytes
+
+
+def test_crash_recovery_rejects_config_file_as_staging(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """A valid manifest attempting to use a configuration file as staging path is rejected and untouched."""
+    mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
+    config_file = base_dir / "config.yaml"
+    config_file.write_text("database:\n  host: localhost\n", encoding="utf-8")
+    orig_bytes = config_file.read_bytes()
+
+    test_uuid = str(uuid.uuid4())
+    manifest = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=ManifestStage.STAGING.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=7_200_000,
+        expected_records=2,
+        record_count=0,
+        missing_intervals=2,
+        staging_file_path=str(config_file),
+        target_file_path=str(datasets_dir / "target.parquet"),
+    )
+    mgr.write_manifest(manifest)
+
+    with pytest.raises(RecoveryFailureError, match="Unauthorized path role|outside authorized dataset"):
+        engine.scan_and_recover()
+
+    assert config_file.read_bytes() == orig_bytes
+
+
+def test_crash_recovery_rejects_same_path_for_staging_and_target(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Staging and target using the exact same path must be rejected."""
+    mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
+    same_path = datasets_dir / "same_dataset.parquet"
+
+    test_uuid = str(uuid.uuid4())
+    manifest = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=ManifestStage.STAGING.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=7_200_000,
+        expected_records=2,
+        record_count=0,
+        missing_intervals=2,
+        staging_file_path=str(same_path),
+        target_file_path=str(same_path),
+    )
+    mgr.write_manifest(manifest)
+
+    with pytest.raises(RecoveryFailureError, match="distinct paths"):
+        engine.scan_and_recover()
+
+
+def test_crash_recovery_rejects_directory_as_staging(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Staging path pointing to a directory must be rejected."""
+    mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
+    sub_dir = datasets_dir / "sub_folder"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+
+    test_uuid = str(uuid.uuid4())
+    manifest = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=ManifestStage.STAGING.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=7_200_000,
+        expected_records=2,
+        record_count=0,
+        missing_intervals=2,
+        staging_file_path=str(sub_dir),
+        target_file_path=str(datasets_dir / "target.parquet"),
+    )
+    mgr.write_manifest(manifest)
+
+    with pytest.raises(RecoveryFailureError, match="points to a directory"):
+        engine.scan_and_recover()
+
+
+def test_crash_recovery_gap_metadata_validation(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Inconsistent gap metadata is rejected prior to catalog insertion."""
+    mgr, _, base_dir, engine = recovery_env
+    datasets_dir = base_dir / "datasets"
+    target_file = datasets_dir / "gap_test.parquet"
+    staging_file = datasets_dir / "gap_test.parquet.tmp"
+    candles = _make_test_candles(2)
+    write_staging_parquet(target_file, candles, record_count=2)
+    t_hash = compute_file_sha256(target_file)
+
+    test_uuid = str(uuid.uuid4())
+    # 1. len(gaps) != gap_count
+    manifest_bad_count = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=10_800_000,
+        expected_records=3,
+        record_count=2,
+        missing_intervals=1,
+        gap_count=5,  # Claims 5, but gaps list has 1!
+        gaps=[
+            {
+                "gap_type": "LEADING",
+                "expected_open_ms": 0,
+                "subsequent_open_ms": 3_600_000,
+                "missing_count": 1,
+            }
+        ],
+        file_sha256=t_hash,
+        staging_file_path=str(staging_file),
+        target_file_path=str(target_file),
+    )
+    mgr.write_manifest(manifest_bad_count)
+
+    with pytest.raises(RecoveryFailureError, match="Inconsistent gap metadata: len.*gap_count"):
+        engine.scan_and_recover()
+
+    mgr.cleanup_manifest(test_uuid)
+
+    # 2. sum(missing_count) != missing_intervals
+    test_uuid2 = str(uuid.uuid4())
+    manifest_bad_sum = IngestionManifest(
+        ingestion_uuid=test_uuid2,
+        stage=ManifestStage.PUBLISHED.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=10_800_000,
+        expected_records=3,
+        record_count=2,
+        missing_intervals=1,  # Invariant: 2 + 1 == 3
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "LEADING",
+                "expected_open_ms": 0,
+                "subsequent_open_ms": 7_200_000,
+                "missing_count": 2,  # Sum is 2, but missing_intervals is 1!
+            }
+        ],
+        file_sha256=t_hash,
+        staging_file_path=str(staging_file),
+        target_file_path=str(target_file),
+    )
+    mgr.write_manifest(manifest_bad_sum)
+
+    with pytest.raises(RecoveryFailureError, match="Inconsistent gap metadata: sum.*missing_intervals"):
+        engine.scan_and_recover()

@@ -59,46 +59,111 @@ class RecoveryAction:
     target_file_sha256: str | None = None
 
 
-def _validate_safe_path(path_str: str | None, base_dir: Path) -> Path | None:
-    """Validate that path does not escape base directory via traversal or symlinks.
+def validate_dataset_paths(
+    staging_path_str: str | None,
+    target_path_str: str | None,
+    base_data_dir: Path,
+) -> tuple[Path | None, Path | None]:
+    """Validate that staging and target files strictly obey dataset storage roles.
 
-    Raises RecoveryFailureError on violation and does not modify any files.
+    Rules:
+    - Staging and target files must be inside the authorized dataset storage area (base_data_dir / 'datasets').
+    - Staging and target files must be distinct sibling paths in the same directory.
+    - Validate expected filename and suffix relationships (target ends with .parquet, staging with .tmp).
+    - Reject paths pointing to catalog.duckdb, manifests, configuration files,
+      directories, or arbitrary non-dataset files.
+    - Reject path traversal ('..') and symlink escapes pointing outside the dataset directory.
+    - Returns resolved, validated Path objects.
+    - Never deletes or modifies any files on error.
     """
-    if not path_str:
-        return None
+    datasets_root = (base_data_dir / "datasets").resolve()
+    manifests_root = (base_data_dir / "manifests").resolve()
 
-    p = Path(path_str)
-    if ".." in p.parts:
-        raise RecoveryFailureError(f"Path traversal detected in path: {path_str}")
+    def _validate_single_path(p_str: str | None, is_target: bool) -> Path | None:
+        if not p_str:
+            return None
 
-    base_resolved = base_dir.resolve()
-    resolved = p.resolve()
+        p = Path(p_str)
+        if ".." in p.parts:
+            raise RecoveryFailureError(f"Path traversal detected in path: {p_str}")
 
-    try:
-        if not resolved.is_relative_to(base_resolved):
+        # Reject directories
+        if p.is_dir():
+            raise RecoveryFailureError(f"Path points to a directory, not a dataset file: {p_str}")
+
+        # Reject protected files and configuration extensions
+        name_lower = p.name.lower()
+        if "catalog.duckdb" in name_lower or name_lower.endswith(
+            (".duckdb", ".duckdb.wal", ".json", ".yaml", ".yml", ".toml", ".ini", ".conf", ".cfg", ".env")
+        ):
+            raise RecoveryFailureError(f"Unauthorized path role (protected system or config file): {p_str}")
+
+        resolved = p.resolve()
+        if resolved.is_dir():
+            raise RecoveryFailureError(f"Resolved path points to a directory, not a dataset file: {p_str}")
+
+        # Must be inside datasets_root
+        try:
+            if not resolved.is_relative_to(datasets_root):
+                raise RecoveryFailureError(
+                    f"Path {p_str} resolves outside authorized dataset directory {datasets_root}"
+                )
+        except AttributeError as e:
+            if not str(resolved).startswith(str(datasets_root)):
+                raise RecoveryFailureError(
+                    f"Path {p_str} resolves outside authorized dataset directory {datasets_root}"
+                ) from e
+
+        # Ensure not in manifests or catalog
+        try:
+            if resolved.is_relative_to(manifests_root):
+                raise RecoveryFailureError(f"Path cannot point inside manifests directory: {p_str}")
+        except AttributeError:
+            pass
+
+        if "catalog.duckdb" in str(resolved).lower():
+            raise RecoveryFailureError(f"Path cannot point to catalog database: {p_str}")
+
+        # Symlink escape verification
+        curr = p
+        while True:
+            if curr.is_symlink():
+                try:
+                    sym_target = curr.resolve()
+                    if not sym_target.is_relative_to(datasets_root):
+                        raise RecoveryFailureError(
+                            f"Symlink escape detected: {curr} points to {sym_target} outside {datasets_root}"
+                        )
+                except OSError:
+                    pass
+            if curr.parent == curr:
+                break
+            curr = curr.parent
+
+        if is_target and not resolved.name.endswith(".parquet"):
+            raise RecoveryFailureError(f"Target dataset file must end with .parquet: {resolved.name}")
+
+        return resolved
+
+    resolved_staging = _validate_single_path(staging_path_str, is_target=False)
+    resolved_target = _validate_single_path(target_path_str, is_target=True)
+
+    if resolved_staging is not None and resolved_target is not None:
+        if resolved_staging == resolved_target:
+            raise RecoveryFailureError("Staging path and target path must be distinct paths.")
+        if resolved_staging.parent != resolved_target.parent:
+            raise RecoveryFailureError("Staging file and target file must be sibling paths in the same directory.")
+        # Suffix relationship
+        if not (
+            resolved_staging.name.startswith(resolved_target.name)
+            or resolved_staging.name.startswith(resolved_target.stem)
+        ) or not (".tmp" in resolved_staging.name or resolved_staging.name.endswith(".tmp")):
             raise RecoveryFailureError(
-                f"Path {path_str} resolves to {resolved}, outside base directory {base_resolved}"
+                f"Staging filename '{resolved_staging.name}' is not a valid sibling temporary file "
+                f"for target '{resolved_target.name}'."
             )
-    except AttributeError as e:
-        if not str(resolved).startswith(str(base_resolved)):
-            raise RecoveryFailureError(f"Path {path_str} resolves outside base directory {base_resolved}") from e
 
-    curr = p
-    while True:
-        if curr.is_symlink():
-            try:
-                sym_target = curr.resolve()
-                if not sym_target.is_relative_to(base_resolved):
-                    raise RecoveryFailureError(
-                        f"Symlink escape detected: {curr} points to {sym_target} outside {base_resolved}"
-                    )
-            except OSError:
-                pass
-        if curr.parent == curr:
-            break
-        curr = curr.parent
-
-    return resolved
+    return resolved_staging, resolved_target
 
 
 def _verify_parquet_file(file_path: Path, expected_record_count: int) -> None:
@@ -123,8 +188,11 @@ def _verify_parquet_file(file_path: Path, expected_record_count: int) -> None:
         )
 
 
-def validate_manifest_integrity(manifest: IngestionManifest, base_dir: Path) -> None:
-    """Validate manifest fields, stage, schema_version, UUID, and path safety before taking action."""
+def validate_manifest_integrity(
+    manifest: IngestionManifest,
+    base_dir: Path,
+) -> tuple[Path | None, Path | None]:
+    """Validate manifest fields, stage, schema_version, UUID, gap metadata, and path roles before action."""
     if manifest.schema_version != 1:
         raise RecoveryFailureError(
             f"Unsupported schema_version {manifest.schema_version} in manifest {manifest.ingestion_uuid}."
@@ -157,8 +225,45 @@ def validate_manifest_integrity(manifest: IngestionManifest, base_dir: Path) -> 
             f"missing_intervals ({manifest.missing_intervals}) != expected_records ({manifest.expected_records})"
         )
 
-    _validate_safe_path(manifest.staging_file_path, base_dir)
-    _validate_safe_path(manifest.target_file_path, base_dir)
+    # Gap metadata validation
+    if manifest.gaps:
+        if len(manifest.gaps) != manifest.gap_count:
+            raise RecoveryFailureError(
+                f"Inconsistent gap metadata: len(gaps) ({len(manifest.gaps)}) != gap_count ({manifest.gap_count})"
+            )
+        valid_gap_types = {gt.value for gt in GapType}
+        total_missing = 0
+        for idx, g in enumerate(manifest.gaps):
+            if not isinstance(g, dict):
+                raise RecoveryFailureError(f"Gap at index {idx} must be a dictionary.")
+            g_type = g.get("gap_type")
+            if g_type not in valid_gap_types:
+                raise RecoveryFailureError(f"Invalid gap_type at index {idx}: {g_type}")
+            missing_count = g.get("missing_count")
+            if not isinstance(missing_count, int) or missing_count <= 0:
+                raise RecoveryFailureError(f"missing_count at index {idx} must be a positive int: {missing_count}")
+            total_missing += missing_count
+            exp_open = g.get("expected_open_ms")
+            if not isinstance(exp_open, int) or exp_open < 0:
+                raise RecoveryFailureError(f"expected_open_ms at index {idx} must be a non-negative int: {exp_open}")
+            if g_type in (GapType.LEADING.value, GapType.INTERNAL.value):
+                sub_open = g.get("subsequent_open_ms")
+                if not isinstance(sub_open, int) or sub_open <= exp_open:
+                    raise RecoveryFailureError(
+                        f"subsequent_open_ms at index {idx} must be an int strictly greater than expected_open_ms."
+                    )
+
+        if total_missing != manifest.missing_intervals:
+            raise RecoveryFailureError(
+                f"Inconsistent gap metadata: sum(missing_count) ({total_missing}) != "
+                f"missing_intervals ({manifest.missing_intervals})"
+            )
+
+    resolved_s, resolved_t = validate_dataset_paths(
+        manifest.staging_file_path,
+        manifest.target_file_path,
+        base_dir,
+    )
 
     if manifest.stage in (ManifestStage.STAGED.value, ManifestStage.PUBLISHING.value):
         raw_hash = manifest.file_sha256.removeprefix("sha256:")
@@ -167,6 +272,8 @@ def validate_manifest_integrity(manifest: IngestionManifest, base_dir: Path) -> 
                 f"STAGED or PUBLISHING manifest {manifest.ingestion_uuid} must contain a valid, "
                 f"non-empty SHA-256 digest (found: {manifest.file_sha256!r})."
             )
+
+    return resolved_s, resolved_t
 
 
 class RecoveryEngine:
@@ -245,8 +352,8 @@ class RecoveryEngine:
                     f"Manifest {manifest.ingestion_uuid} is actively held by PID {manifest.lease_owner_pid}."
                 )
 
-        # 2. Integrity and safe paths validation (never touches unrelated files on failure)
-        validate_manifest_integrity(manifest, self.base_data_dir)
+        # 2. Integrity and safe dataset paths validation (never touches unrelated files on failure)
+        s_path, t_path = validate_manifest_integrity(manifest, self.base_data_dir)
 
         # Claim lease for recovery coordinator
         manifest.lease_owner_pid = os.getpid()
@@ -254,8 +361,6 @@ class RecoveryEngine:
         self.manifest_manager.write_manifest(manifest)
 
         orig_stage = manifest.stage
-        s_path = Path(manifest.staging_file_path) if manifest.staging_file_path else None
-        t_path = Path(manifest.target_file_path) if manifest.target_file_path else None
 
         # 3. Interrupted State Handling
         if orig_stage in (ManifestStage.INITIALIZING.value, ManifestStage.STAGING.value):

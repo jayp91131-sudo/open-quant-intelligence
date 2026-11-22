@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -62,7 +63,10 @@ _ALLOWED_STAGE_TRANSITIONS: dict[str, set[str]] = {
 
 
 def is_pid_alive(pid: int) -> bool:
-    """Check whether a process with the given PID is actively running."""
+    """Check whether a process with the given PID is actively running.
+
+    Conservative: Returns True if PID cannot be definitively determined to be dead.
+    """
     if pid <= 0:
         return False
     if sys.platform == "win32":
@@ -73,21 +77,43 @@ def is_pid_alive(pid: int) -> bool:
         SYNCHRONIZE = 0x00100000
         handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
         if not handle:
-            return False
-        STILL_ACTIVE = 259
-        exit_code = ctypes.c_ulong()
+            err = kernel32.GetLastError()
+            ERROR_ACCESS_DENIED = 5
+            ERROR_INVALID_PARAMETER = 87
+            if err == ERROR_ACCESS_DENIED:
+                # Process exists, belongs to another user or elevated
+                return True
+            if err == ERROR_INVALID_PARAMETER:
+                # Process definitely does not exist
+                return False
+            return True
+
         try:
+            WAIT_OBJECT_0 = 0
+            WAIT_TIMEOUT = 258
+            res = kernel32.WaitForSingleObject(handle, 0)
+            if res == WAIT_TIMEOUT:
+                return True
+            if res == WAIT_OBJECT_0:
+                return False
+
+            STILL_ACTIVE = 259
+            exit_code = ctypes.c_ulong()
             if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
                 return exit_code.value == STILL_ACTIVE
-            return False
+            return True
         finally:
             kernel32.CloseHandle(handle)
     else:
         try:
             os.kill(pid, 0)
             return True
-        except OSError:
+        except PermissionError:
+            return True
+        except ProcessLookupError:
             return False
+        except OSError:
+            return True
 
 
 def is_lease_active(manifest: "IngestionManifest") -> bool:
@@ -106,11 +132,14 @@ def is_lease_active(manifest: "IngestionManifest") -> bool:
 
 
 class ManifestLock:
-    """Atomic single-writer file lock for manifest mutation and recovery."""
+    """Atomic single-writer file lock for manifest mutation and recovery with race-safe reclamation."""
 
     def __init__(self, manifest_path: Path, timeout_seconds: float = 5.0) -> None:
         self.lock_path = manifest_path.with_suffix(".lock")
+        self.reclaim_path = manifest_path.with_suffix(".lock_reclaim")
         self.timeout_seconds = timeout_seconds
+        self.lock_token = f"{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
+        self._acquired = False
 
     def acquire(self) -> None:
         start_time = time.time()
@@ -118,29 +147,90 @@ class ManifestLock:
             try:
                 flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
                 fd = os.open(str(self.lock_path), flags)
-                payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode("utf-8")
+                payload = json.dumps(
+                    {
+                        "token": self.lock_token,
+                        "pid": os.getpid(),
+                        "time": time.time(),
+                    }
+                ).encode("utf-8")
                 os.write(fd, payload)
                 os.close(fd)
+                self._acquired = True
                 return
             except FileExistsError:
+                pass
+
+            self._try_reclaim_stale_lock()
+
+            if time.time() - start_time > self.timeout_seconds:
+                raise ManifestLockError(
+                    f"Could not acquire atomic lock on {self.lock_path} within {self.timeout_seconds}s."
+                ) from None
+            time.sleep(0.05)
+
+    def _try_reclaim_stale_lock(self) -> None:
+        try:
+            reclaim_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            reclaim_fd = os.open(str(self.reclaim_path), reclaim_flags)
+        except FileExistsError:
+            try:
+                with open(self.reclaim_path, "r", encoding="utf-8") as rf:
+                    rdata = json.load(rf)
+                rpid = rdata.get("pid", 0)
+                if rpid > 0 and not is_pid_alive(rpid):
+                    self.reclaim_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return
+
+        try:
+            reclaim_payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode("utf-8")
+            os.write(reclaim_fd, reclaim_payload)
+            os.close(reclaim_fd)
+
+            if not self.lock_path.exists():
+                return
+
+            try:
+                with open(self.lock_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                # Malformed lock file: do not steal if ownership is uncertain
+                return
+
+            owner_pid = data.get("pid", 0)
+            owner_token = data.get("token", "")
+
+            if not isinstance(owner_pid, int) or owner_pid <= 0 or not owner_token:
+                return
+
+            if not is_pid_alive(owner_pid):
                 try:
                     with open(self.lock_path, "r", encoding="utf-8") as f:
-                        lock_data = json.load(f)
-                    owner_pid = lock_data.get("pid", 0)
-                    if not is_pid_alive(owner_pid):
+                        curr = json.load(f)
+                    if curr.get("token") == owner_token:
                         self.lock_path.unlink(missing_ok=True)
-                        continue
                 except Exception:
                     pass
-
-                if time.time() - start_time > self.timeout_seconds:
-                    raise ManifestLockError(
-                        f"Could not acquire atomic lock on {self.lock_path} within {self.timeout_seconds}s."
-                    ) from None
-                time.sleep(0.05)
+        finally:
+            self.reclaim_path.unlink(missing_ok=True)
 
     def release(self) -> None:
-        self.lock_path.unlink(missing_ok=True)
+        if not self._acquired:
+            return
+        if not self.lock_path.exists():
+            self._acquired = False
+            return
+        try:
+            with open(self.lock_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("token") == self.lock_token:
+                self.lock_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        finally:
+            self._acquired = False
 
     def __enter__(self) -> "ManifestLock":
         self.acquire()
@@ -157,18 +247,29 @@ def sync_directory(
 ) -> bool:
     """Synchronize directory metadata to persistent storage.
 
-    On POSIX, open directory with os.O_RDONLY and call os.fsync(dir_fd).
-    On Windows, directory changes are journaled by NTFS/FAT transactions.
+    Distinction between file content durability and directory entry durability:
+    - File content durability: Handled via write-through flags and os.fsync() / _commit(),
+      forcing physical file data bytes and file stream allocations to disk.
+    - Directory entry durability: Synchronizes directory table entries (filenames, links).
+      * POSIX: Supported via open(dir, O_RDONLY) + os.fsync(dir_fd).
+      * Windows: The Win32 subsystem explicitly prohibits flushing directory handles
+        (FlushFileBuffers on a directory handle fails with ERROR_ACCESS_DENIED).
+        While NTFS journals metadata transactions via $LogFile, directory-level fsync
+        cannot be verified or forced from user-mode. Therefore, full directory durability
+        is unsupported on Windows and classified as DEGRADED.
 
     Args:
         dir_path: Path to directory to synchronize.
         raise_on_failure: Legacy flag; if True, raises DurabilityError on failure.
-        durability_mode: DurabilityMode.STRICT (raises on failure) or
-            DurabilityMode.DEGRADED_ALLOWED (returns False on failure).
+        durability_mode: DurabilityMode.STRICT (raises on failure or if unsupported) or
+            DurabilityMode.DEGRADED_ALLOWED (returns False on failure or if unsupported).
 
     Returns:
-        True if synchronization succeeded or was a no-op on Windows.
-        False if directory sync failed on POSIX.
+        True if directory synchronization succeeded.
+        False if directory synchronization is unsupported (Windows) or failed (POSIX).
+
+    Raises:
+        DurabilityError: In STRICT mode if directory synchronization fails or is unsupported.
     """
     strict = (
         raise_on_failure
@@ -177,7 +278,12 @@ def sync_directory(
     )
 
     if sys.platform == "win32":
-        return True
+        if strict:
+            raise DurabilityError(
+                f"Directory synchronization for {dir_path} is unsupported on Windows: "
+                "Win32 prohibits flushing directory handles. STRICT durability cannot be guaranteed."
+            )
+        return False
 
     path = Path(dir_path)
     if not path.is_dir():
@@ -339,13 +445,32 @@ class ManifestManager:
             os.fsync(f.fileno())
 
         # Atomic replacement of main manifest
-        os.replace(tmp_path, final_path)
+        if sys.platform == "win32":
+            import ctypes
 
-        # Directory sync on POSIX
+            kernel32 = ctypes.windll.kernel32
+            MoveFileExW = kernel32.MoveFileExW
+            MoveFileExW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+            MoveFileExW.restype = ctypes.c_bool
+            MOVEFILE_REPLACE_EXISTING = 0x1
+            MOVEFILE_WRITE_THROUGH = 0x8
+            success = MoveFileExW(str(tmp_path), str(final_path), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)
+            if not success:
+                os.replace(tmp_path, final_path)
+        else:
+            os.replace(tmp_path, final_path)
+
+        # Directory sync
         synced = sync_directory(self.manifests_dir, durability_mode=self.durability_mode)
         if not synced:
             self.last_durability_status = DurabilityStatus.DEGRADED
-            self.durability_warning = f"Directory sync failed for {self.manifests_dir}"
+            if sys.platform == "win32":
+                self.durability_warning = (
+                    f"Directory-entry durability is unsupported on Windows for {self.manifests_dir} "
+                    "(file content flushed with write-through/commit, but directory fsync is unavailable)"
+                )
+            else:
+                self.durability_warning = f"Directory sync failed for {self.manifests_dir}"
             manifest.durability_status = DurabilityStatus.DEGRADED.value
             manifest.durability_warning = self.durability_warning
         else:
@@ -370,11 +495,16 @@ class ManifestManager:
             data = json.load(f)
         return IngestionManifest(**data)
 
-    def unlink_manifest(self, ingestion_uuid: str) -> None:
+    def unlink_manifest(self, ingestion_uuid: str) -> bool:
         path = self.manifest_path_for(ingestion_uuid)
+        synced = True
         if path.is_file():
             path.unlink(missing_ok=True)
-            sync_directory(self.manifests_dir, durability_mode=self.durability_mode)
+            synced = sync_directory(self.manifests_dir, durability_mode=self.durability_mode)
         lock_path = path.with_suffix(".lock")
         if lock_path.is_file():
             lock_path.unlink(missing_ok=True)
+        reclaim_path = path.with_suffix(".lock_reclaim")
+        if reclaim_path.is_file():
+            reclaim_path.unlink(missing_ok=True)
+        return synced

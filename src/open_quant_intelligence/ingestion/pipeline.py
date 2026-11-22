@@ -56,7 +56,7 @@ class IngestionRequest:
     exchange_id: str = "binance"
     fail_on_gaps: bool = False
     force: bool = False
-    durability_mode: DurabilityMode = DurabilityMode.DEGRADED_ALLOWED
+    durability_mode: DurabilityMode | str | None = None
 
 
 @dataclass
@@ -508,7 +508,12 @@ class IngestionPipeline:
         self.manifest_manager.update_stage(manifest, ManifestStage.CLEANUP)
 
         # Cleanup manifest
-        self.manifest_manager.unlink_manifest(ingestion_uuid)
+        cleanup_synced = self.manifest_manager.unlink_manifest(ingestion_uuid)
+        if not cleanup_synced and manifest.durability_status != DurabilityStatus.DEGRADED.value:
+            manifest.durability_status = DurabilityStatus.DEGRADED.value
+            manifest.durability_warning = (
+                f"Directory sync failed during manifest cleanup for {self.manifest_manager.manifests_dir}"
+            )
 
         return IngestionResult(
             snapshot_id=snapshot_id,
