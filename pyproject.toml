@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "open-quant-intelligence"
-version = "0.1.0"
-description = "Research-first quantitative cryptocurrency research platform (V2 M0 Foundation)"
+version = "0.2.0"
+description = "Research-first quantitative cryptocurrency research platform (V2 M1 Data Ingestion & Storage)"
 readme = "README.md"
 requires-python = ">=3.11, <3.13"
 authors = [
@@ -18,12 +18,16 @@ classifiers = [
     "Operating System :: OS Independent",
     "Topic :: Scientific/Engineering",
 ]
-dependencies = []
+dependencies = [
+    "ccxt>=4.4.52,<5.0.0",
+    "duckdb>=1.1.0,<2.0.0",
+]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.4.0",
+    "pyarrow>=15.0.0,<19.0.0",
 ]
 
 [project.scripts]
