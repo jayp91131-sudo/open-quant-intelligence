@@ -4,8 +4,10 @@ import json
 import multiprocessing
 import os
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import pytest
 
@@ -15,6 +17,8 @@ from open_quant_intelligence.storage.manifest import (
     ManifestLockError,
     ManifestManager,
     ManifestStage,
+    _atomic_publish_no_clobber,
+    _safe_delete_lock_file,
 )
 
 
@@ -28,6 +32,18 @@ def _worker_acquire_lock(manifest_path: str, timeout: float, out_queue: Any) -> 
             time.sleep(0.15)
             end_t = time.time()
             out_queue.put(("releasing", os.getpid(), end_t))
+    except Exception as e:
+        out_queue.put(("error", os.getpid(), str(e)))
+
+
+def _worker_unlink_manifest(manifest_dir: str, uuid_str: str, out_queue: Any, barrier: Any = None) -> None:
+    """Multiprocess worker for unlink_manifest racing with reclamation."""
+    try:
+        if barrier is not None:
+            barrier.wait(timeout=5.0)
+        mgr = ManifestManager(Path(manifest_dir))
+        res = mgr.unlink_manifest(uuid_str)
+        out_queue.put(("unlinked", os.getpid(), res))
     except Exception as e:
         out_queue.put(("error", os.getpid(), str(e)))
 
@@ -302,3 +318,158 @@ def test_ownership_safe_lock_cleanup_unlink_manifest(tmp_path: Path) -> None:
     # unlink_manifest again should clean up the dead process's reclaim file
     mgr.unlink_manifest(test_uuid)
     assert not reclaim_path.exists()
+
+
+def test_new_writer_during_rename_window_token_mismatch_preserves_new_writer(tmp_path: Path) -> None:
+    """A new writer acquiring the lock during a cleanup rename window is preserved without clobbering."""
+    manifest_file = tmp_path / "race_window_manifest.json"
+    manifest_file.write_text("{}", encoding="utf-8")
+    lock_path = manifest_file.with_suffix(".lock")
+
+    # 1. Existing lock with stale token
+    stale_payload = json.dumps({"token": "token_stale_111", "pid": 99999999, "time": time.time()})
+    lock_path.write_text(stale_payload, encoding="utf-8")
+
+    orig_rename = os.rename
+    new_writer = ManifestLock(manifest_file, timeout_seconds=2.0)
+
+    def rename_hook(src: str, dst: str) -> None:
+        orig_rename(src, dst)
+        if ".del_" in dst:
+            # Right at this instant, lock_path has been renamed to temp_del.
+            # A new writer acquires lock_path!
+            new_writer.acquire()
+
+    with patch("os.rename", side_effect=rename_hook):
+        # Trigger cleanup on lock_path with mismatched expected_token
+        safe_del_result = _safe_delete_lock_file(lock_path, expected_token="token_mismatch_expected")
+
+    assert safe_del_result is False
+
+    # Crucial assertion: new writer's lock payload remains 100% untouched!
+    assert lock_path.exists()
+    with open(lock_path, "r", encoding="utf-8") as f:
+        current_data = json.load(f)
+    assert current_data["token"] == new_writer.lock_token
+    assert current_data["pid"] == os.getpid()
+
+    # New writer releases cleanly
+    new_writer.release()
+    assert not lock_path.exists()
+
+
+def test_new_writer_during_reclaim_rename_window_token_mismatch(tmp_path: Path) -> None:
+    """A new process acquiring .lock_reclaim during cleanup rename is preserved without clobbering."""
+    manifest_file = tmp_path / "race_reclaim_manifest.json"
+    manifest_file.write_text("{}", encoding="utf-8")
+    reclaim_path = manifest_file.with_suffix(".lock_reclaim")
+
+    # 1. Existing reclaim lock with stale token
+    stale_payload = json.dumps({"token": "reclaim_stale_222", "pid": 99999999, "time": time.time()})
+    reclaim_path.write_text(stale_payload, encoding="utf-8")
+
+    orig_rename = os.rename
+    new_reclaim_token = f"reclaim_new_{uuid.uuid4().hex}"
+
+    def rename_hook_reclaim(src: str, dst: str) -> None:
+        orig_rename(src, dst)
+        if ".del_" in dst:
+            # Right at this instant, reclaim_path has been renamed to temp_del.
+            # A new process publishes a new reclaim_path!
+            tmp_pub = reclaim_path.with_name(f"{reclaim_path.name}.pub_{uuid.uuid4().hex}")
+            tmp_pub.write_text(
+                json.dumps({"token": new_reclaim_token, "pid": os.getpid(), "time": time.time()}),
+                encoding="utf-8",
+            )
+            assert _atomic_publish_no_clobber(tmp_pub, reclaim_path) is True
+
+    with patch("os.rename", side_effect=rename_hook_reclaim):
+        safe_del_result = _safe_delete_lock_file(reclaim_path, expected_token="token_wrong")
+
+    assert safe_del_result is False
+
+    # Crucial assertion: new process's reclaim lock remains untouched!
+    assert reclaim_path.exists()
+    with open(reclaim_path, "r", encoding="utf-8") as f:
+        current_data = json.load(f)
+    assert current_data["token"] == new_reclaim_token
+    assert current_data["pid"] == os.getpid()
+
+    # Clean up
+    assert _safe_delete_lock_file(reclaim_path, expected_token=new_reclaim_token) is True
+    assert not reclaim_path.exists()
+
+
+def test_interrupted_lock_creation_recovers_safely(tmp_path: Path) -> None:
+    """Interrupted lock creation (empty or malformed lock file) is safely reclaimed on acquisition."""
+    manifest_file = tmp_path / "interrupted_manifest.json"
+    manifest_file.write_text("{}", encoding="utf-8")
+    lock_file = manifest_file.with_suffix(".lock")
+
+    # Case 1: Empty lock file (simulating crash between O_CREAT|O_EXCL and write)
+    lock_file.write_bytes(b"")
+    time.sleep(0.06)  # Ensure st_mtime >= 0.05s
+
+    lock1 = ManifestLock(manifest_file, timeout_seconds=2.0)
+    lock1.acquire()
+    assert lock1._acquired is True
+    assert lock_file.exists()
+
+    with open(lock_file, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["token"] == lock1.lock_token
+    assert data["pid"] == os.getpid()
+
+    lock1.release()
+    assert not lock_file.exists()
+
+    # Case 2: Malformed/truncated JSON in lock file
+    lock_file.write_text('{"token": "partial_truncate_tok', encoding="utf-8")
+    time.sleep(0.06)
+
+    lock2 = ManifestLock(manifest_file, timeout_seconds=2.0)
+    lock2.acquire()
+    assert lock2._acquired is True
+
+    with open(lock_file, "r", encoding="utf-8") as f:
+        data2 = json.load(f)
+    assert data2["token"] == lock2.lock_token
+    assert data2["pid"] == os.getpid()
+
+    lock2.release()
+    assert not lock_file.exists()
+
+
+def test_unlink_manifest_and_stale_reclaim_multiprocess_race(tmp_path: Path) -> None:
+    """Race between unlink_manifest() and stale-lock reclamation is serialized through .lock_reclaim."""
+    manifest_dir = tmp_path / "race_manifests"
+    mgr = ManifestManager(manifest_dir)
+    uuid_str = "race_uuid_555"
+    man_path = mgr.manifest_path_for(uuid_str)
+    man_path.write_text("{}", encoding="utf-8")
+    lock_file = man_path.with_suffix(".lock")
+
+    # Stale lock with dead PID
+    stale_payload = json.dumps({"token": "stale_race_tok", "pid": 99999999, "time": time.time() - 100})
+    lock_file.write_text(stale_payload, encoding="utf-8")
+
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    barrier = ctx.Barrier(2)
+
+    p1 = ctx.Process(target=_worker_unlink_manifest, args=(str(manifest_dir), uuid_str, queue, barrier))
+    p2 = ctx.Process(target=_worker_acquire_stale_reclaim, args=(str(man_path), 5.0, queue, barrier))
+
+    p1.start()
+    p2.start()
+
+    p1.join(timeout=6.0)
+    p2.join(timeout=6.0)
+
+    events = []
+    while not queue.empty():
+        events.append(queue.get())
+
+    errors = [e for e in events if e[0] == "error"]
+    assert len(errors) == 0, f"Multiprocess race resulted in errors: {errors}"
+    assert len(events) >= 2

@@ -130,6 +130,23 @@ def validate_gap_metadata(
     tf = SupportedTimeframe(timeframe) if isinstance(timeframe, str) else timeframe
     step_ms = int(timeframe_to_timedelta(tf).total_seconds() * 1000)
 
+    # Validate window boundaries and calculate independent expected interval count
+    if until_ms <= since_ms:
+        raise RecoveryFailureError(
+            f"Invalid requested window: until_ms ({until_ms}) must be strictly greater than since_ms ({since_ms})."
+        )
+    if (since_ms % step_ms != 0) or (until_ms % step_ms != 0) or ((until_ms - since_ms) % step_ms != 0):
+        raise RecoveryFailureError(
+            f"Requested window [{since_ms}, {until_ms}) is not aligned to {tf.value} grid ({step_ms}ms)."
+        )
+
+    expected_intervals = (until_ms - since_ms) // step_ms
+    if expected_records != expected_intervals:
+        raise RecoveryFailureError(
+            f"Window interval mismatch: expected_records ({expected_records}) != calculated "
+            f"interval count ({expected_intervals}) for [{since_ms}, {until_ms}) at {tf.value}."
+        )
+
     # 1. missing_intervals == 0 implies gap_count == 0 and no gap events
     if missing_intervals == 0:
         if gap_count != 0:
@@ -192,6 +209,20 @@ def validate_gap_metadata(
         if not isinstance(exp_open, int) or exp_open < 0:
             raise RecoveryFailureError(f"expected_open_ms at index {idx} must be a non-negative int: {exp_open}")
 
+        # Gap must be strictly inside requested half-open window [since_ms, until_ms)
+        if exp_open < since_ms or exp_open >= until_ms:
+            raise RecoveryFailureError(
+                f"Gap at index {idx} expected_open_ms ({exp_open}) must be strictly inside "
+                f"requested window [{since_ms}, {until_ms})."
+            )
+
+        # Missing interval range must not exceed until_ms
+        if exp_open + missing_count * step_ms > until_ms:
+            raise RecoveryFailureError(
+                f"Gap at index {idx} missing interval range [{exp_open}, {exp_open + missing_count * step_ms}) "
+                f"exceeds requested window until_ms ({until_ms})."
+            )
+
         # Grid alignment
         if (exp_open - since_ms) % step_ms != 0:
             raise RecoveryFailureError(
@@ -242,6 +273,10 @@ def validate_gap_metadata(
                 )
             if sub_open is None:
                 raise RecoveryFailureError("LEADING gap must have non-null subsequent_open_ms.")
+            if sub_open >= until_ms:
+                raise RecoveryFailureError(
+                    f"LEADING gap subsequent_open_ms ({sub_open}) must be strictly less than until_ms ({until_ms})."
+                )
             if (sub_open - exp_open) != missing_count * step_ms:
                 raise RecoveryFailureError(
                     f"LEADING gap missing-count arithmetic error: (subsequent_open_ms - expected_open_ms) "
@@ -254,8 +289,16 @@ def validate_gap_metadata(
                 raise RecoveryFailureError(
                     f"INTERNAL gap expected_open_ms ({exp_open}) must be strictly greater than since_ms ({since_ms})."
                 )
+            if exp_open >= until_ms:
+                raise RecoveryFailureError(
+                    f"INTERNAL gap expected_open_ms ({exp_open}) must be strictly less than until_ms ({until_ms})."
+                )
             if sub_open is None:
                 raise RecoveryFailureError("INTERNAL gap must have non-null subsequent_open_ms.")
+            if sub_open >= until_ms:
+                raise RecoveryFailureError(
+                    f"INTERNAL gap subsequent_open_ms ({sub_open}) must be strictly less than until_ms ({until_ms})."
+                )
             if (sub_open - exp_open) != missing_count * step_ms:
                 raise RecoveryFailureError(
                     f"INTERNAL gap missing-count arithmetic error: (subsequent_open_ms - expected_open_ms) "
@@ -267,6 +310,10 @@ def validate_gap_metadata(
             if exp_open <= since_ms:
                 raise RecoveryFailureError(
                     f"TRAILING gap expected_open_ms ({exp_open}) must be strictly greater than since_ms ({since_ms})."
+                )
+            if exp_open >= until_ms:
+                raise RecoveryFailureError(
+                    f"TRAILING gap expected_open_ms ({exp_open}) must be strictly less than until_ms ({until_ms})."
                 )
             if sub_open is not None:
                 raise RecoveryFailureError(f"TRAILING gap must have subsequent_open_ms == None, found {sub_open}.")
@@ -396,46 +443,47 @@ def validate_dataset_paths(
     if manifest is not None:
         expected_staging, expected_target = derive_canonical_paths_for_manifest(base_data_dir, manifest)
         expected_partition_dir = expected_target.parent.resolve()
-        uuid_prefix = manifest.ingestion_uuid[:8]
+
+        # Stages that expect a produced artifact must possess a valid 64-char sha256 content fingerprint
+        artifact_stages = {
+            ManifestStage.STAGED.value,
+            ManifestStage.PUBLISHING.value,
+            ManifestStage.PUBLISHED.value,
+            ManifestStage.COMMITTING_CATALOG.value,
+            ManifestStage.COMMITTED.value,
+            ManifestStage.CLEANUP.value,
+        }
+        manifest_stage_val = manifest.stage.value if hasattr(manifest.stage, "value") else str(manifest.stage)
+        if manifest_stage_val in artifact_stages:
+            fp = manifest.content_fingerprint_sha256
+            clean_fp = fp.split(":")[-1] if (fp and ":" in fp) else (fp or "")
+            if not clean_fp or len(clean_fp) != 64 or clean_fp == "nofp":
+                raise RecoveryFailureError(
+                    f"Stage '{manifest.stage}' requires a valid 64-character hex content_fingerprint_sha256, "
+                    f"found '{fp}'."
+                )
 
         if resolved_target is not None:
             if resolved_target.parent != expected_partition_dir:
                 raise RecoveryFailureError(
                     f"Target file partition mismatch: {resolved_target.parent} != expected {expected_partition_dir}"
                 )
-            if manifest.content_fingerprint_sha256:
-                if resolved_target.name != expected_target.name:
-                    raise RecoveryFailureError(
-                        f"Target filename '{resolved_target.name}' does not match canonical name "
-                        f"'{expected_target.name}' bound to manifest {manifest.ingestion_uuid}."
-                    )
-            else:
-                if not resolved_target.name.endswith(f"_{uuid_prefix}.parquet"):
-                    raise RecoveryFailureError(
-                        f"Target filename '{resolved_target.name}' does not match canonical name: "
-                        f"UUID prefix mismatch (expected {uuid_prefix})."
-                    )
+            if resolved_target.name != expected_target.name:
+                raise RecoveryFailureError(
+                    f"Target filename '{resolved_target.name}' does not match canonical name "
+                    f"'{expected_target.name}' bound to manifest {manifest.ingestion_uuid}."
+                )
 
         if resolved_staging is not None:
             if resolved_staging.parent != expected_partition_dir:
                 raise RecoveryFailureError(
                     f"Staging file partition mismatch: {resolved_staging.parent} != expected {expected_partition_dir}"
                 )
-            if manifest.content_fingerprint_sha256:
-                if resolved_staging.name != expected_staging.name:
-                    raise RecoveryFailureError(
-                        f"Staging filename '{resolved_staging.name}' does not match canonical name "
-                        f"'{expected_staging.name}' bound to manifest {manifest.ingestion_uuid}."
-                    )
-            else:
-                if not (
-                    resolved_staging.name.endswith(f".tmp_{uuid_prefix}")
-                    or f".tmp_{uuid_prefix}" in resolved_staging.name
-                ):
-                    raise RecoveryFailureError(
-                        f"Staging filename '{resolved_staging.name}' does not match canonical name: "
-                        f"UUID prefix mismatch (expected {uuid_prefix})."
-                    )
+            if resolved_staging.name != expected_staging.name:
+                raise RecoveryFailureError(
+                    f"Staging filename '{resolved_staging.name}' does not match canonical name "
+                    f"'{expected_staging.name}' bound to manifest {manifest.ingestion_uuid}."
+                )
 
     if resolved_staging is not None and resolved_target is not None:
         # Suffix relationship

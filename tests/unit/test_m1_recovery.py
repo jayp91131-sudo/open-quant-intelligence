@@ -1,5 +1,6 @@
 """Tests for crash recovery, manifest lifecycle reconciliation, integrity, and gap preservation."""
 
+import multiprocessing
 import os
 import time
 import uuid
@@ -64,6 +65,41 @@ def _make_test_candles(
     return candles
 
 
+def _worker_pipeline_hold_staging(
+    base_dir_str: str,
+    manifest_uuid: str,
+    ready_event: Any,
+    release_event: Any,
+    out_queue: Any,
+) -> None:
+    """Multiprocess worker simulating normal ingestion holding lock and staging artifact."""
+    try:
+        base_dir = Path(base_dir_str)
+        mgr = ManifestManager(base_dir / "manifests")
+        lock = mgr.lock_manifest(manifest_uuid)
+        with lock:
+            candles = _make_test_candles(count=2)
+            c_fp = compute_content_fingerprint(candles)
+            manifest, staging_path, target_path = make_test_manifest_and_paths(
+                base_dir=base_dir,
+                test_uuid=manifest_uuid,
+                stage=ManifestStage.STAGING,
+                content_fingerprint=c_fp,
+            )
+            manifest.lease_owner_pid = os.getpid()
+            write_staging_parquet(staging_path, candles, record_count=2)
+            mgr.write_manifest(manifest)
+
+            out_queue.put(("staged", os.getpid(), str(staging_path)))
+            ready_event.set()
+
+            # Hold the lock and staging file until test process signals release
+            release_event.wait(timeout=10.0)
+    except Exception as e:
+        out_queue.put(("error", os.getpid(), str(e)))
+        ready_event.set()
+
+
 def make_test_manifest_and_paths(
     base_dir: Path,
     test_uuid: str,
@@ -77,10 +113,19 @@ def make_test_manifest_and_paths(
     missing_intervals: int = 0,
     gap_count: int = 0,
     gaps: list[dict[str, Any]] | None = None,
-    content_fingerprint: str = "",
+    content_fingerprint: str | None = None,
     file_sha256: str = "",
 ) -> tuple[IngestionManifest, Path, Path]:
     """Generate canonical test manifest and file paths strictly bound to dataset identity."""
+    stage_val = stage.value if hasattr(stage, "value") else str(stage)
+    if content_fingerprint is None:
+        if stage_val in {"STAGED", "PUBLISHING", "PUBLISHED", "COMMITTING_CATALOG", "COMMITTED", "CLEANUP"}:
+            fp = "a" * 64
+        else:
+            fp = ""
+    else:
+        fp = content_fingerprint
+
     staging_file, target_file = derive_canonical_dataset_paths(
         base_data_dir=base_dir,
         exchange_id="binance",
@@ -89,11 +134,10 @@ def make_test_manifest_and_paths(
         timeframe=timeframe,
         since_ms=since_ms,
         until_ms=until_ms,
-        content_fingerprint=content_fingerprint,
+        content_fingerprint=fp,
         ingestion_uuid=test_uuid,
     )
     staging_file.parent.mkdir(parents=True, exist_ok=True)
-    stage_val = stage.value if hasattr(stage, "value") else str(stage)
     manifest = IngestionManifest(
         ingestion_uuid=test_uuid,
         stage=stage_val,
@@ -106,7 +150,7 @@ def make_test_manifest_and_paths(
         missing_intervals=missing_intervals,
         gap_count=gap_count,
         gaps=gaps or [],
-        content_fingerprint_sha256=content_fingerprint,
+        content_fingerprint_sha256=fp,
         file_sha256=file_sha256,
         staging_file_path=str(staging_file),
         target_file_path=str(target_file),
@@ -493,6 +537,9 @@ def test_crash_recovery_row_count_mismatch_fails_safely(
         base_dir=base_dir,
         test_uuid=test_uuid,
         stage=ManifestStage.STAGED,
+        since_ms=0,
+        until_ms=10 * 3_600_000,
+        expected_records=10,
         record_count=10,  # Claims 10 records
     )
     candles = _make_test_candles(2)  # Physical has only 2!
@@ -963,6 +1010,8 @@ def test_empty_gap_list_with_nonzero_gap_count_rejected(
         base_dir=base_dir,
         test_uuid=test_uuid,
         stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=5 * 3_600_000,
         expected_records=5,
         record_count=3,
         missing_intervals=2,
@@ -988,6 +1037,8 @@ def test_gap_timestamp_alignment_and_arithmetic_invariants(
         base_dir=base_dir,
         test_uuid=uuid1,
         stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=4 * 3_600_000,
         expected_records=4,
         record_count=3,
         missing_intervals=1,
@@ -1013,6 +1064,8 @@ def test_gap_timestamp_alignment_and_arithmetic_invariants(
         base_dir=base_dir,
         test_uuid=uuid2,
         stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=6 * 3_600_000,
         expected_records=6,
         record_count=3,
         missing_intervals=3,
@@ -1039,6 +1092,7 @@ def test_gap_timestamp_alignment_and_arithmetic_invariants(
         test_uuid=uuid3,
         stage=ManifestStage.PUBLISHED,
         since_ms=0,
+        until_ms=4 * 3_600_000,
         expected_records=4,
         record_count=3,
         missing_intervals=1,
@@ -1082,4 +1136,218 @@ def test_gap_timestamp_alignment_and_arithmetic_invariants(
     )
     mgr.write_manifest(m4)
     with pytest.raises(RecoveryFailureError, match="TRAILING gap must have subsequent_open_ms == None"):
+        engine.scan_and_recover()
+
+
+def test_zero_gap_manifest_with_incorrect_interval_count(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement D: Zero-gap manifest cannot pass when window implies more records than expected_records."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    # Window [0, 7200000) at 1h has 2 intervals, but expected_records is falsely set to 5
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=7_200_000,
+        expected_records=5,  # Mismatch! Calculated count is 2
+        record_count=5,
+        missing_intervals=0,
+        gap_count=0,
+        gaps=[],
+        file_sha256="sha256:" + ("a" * 64),
+    )
+    mgr.write_manifest(manifest)
+    with pytest.raises(RecoveryFailureError, match="Window interval mismatch"):
+        engine.scan_and_recover()
+
+
+def test_internal_gap_subsequent_ge_until_rejected(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement D: For INTERNAL gaps, reject subsequent_open_ms >= until_ms."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    # Window [0, 7200000) at 1h (2 intervals). Internal gap with subsequent_open_ms = 7200000 (== until_ms)
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=7_200_000,
+        expected_records=2,
+        record_count=1,
+        missing_intervals=1,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "INTERNAL",
+                "expected_open_ms": 3_600_000,
+                "subsequent_open_ms": 7_200_000,  # >= until_ms!
+                "missing_count": 1,
+            }
+        ],
+        file_sha256="sha256:" + ("b" * 64),
+    )
+    mgr.write_manifest(manifest)
+    with pytest.raises(RecoveryFailureError, match="INTERNAL gap subsequent_open_ms.*strictly less than until_ms"):
+        engine.scan_and_recover()
+
+
+def test_internal_gap_expected_ge_until_rejected(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement D: For INTERNAL gaps, reject expected_open_ms >= until_ms."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=7_200_000,
+        expected_records=2,
+        record_count=1,
+        missing_intervals=1,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "INTERNAL",
+                "expected_open_ms": 7_200_000,  # >= until_ms!
+                "subsequent_open_ms": 10_800_000,
+                "missing_count": 1,
+            }
+        ],
+        file_sha256="sha256:" + ("c" * 64),
+    )
+    mgr.write_manifest(manifest)
+    with pytest.raises(RecoveryFailureError, match="strictly inside requested window|strictly less than until_ms"):
+        engine.scan_and_recover()
+
+
+def test_leading_gap_subsequent_eq_until_rejected(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement D: For LEADING gaps, reject subsequent_open_ms == until_ms (should be FULL_WINDOW)."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=7_200_000,
+        expected_records=2,
+        record_count=0,
+        missing_intervals=2,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "LEADING",
+                "expected_open_ms": 0,
+                "subsequent_open_ms": 7_200_000,  # == until_ms!
+                "missing_count": 2,
+            }
+        ],
+        file_sha256="sha256:" + ("d" * 64),
+    )
+    mgr.write_manifest(manifest)
+    with pytest.raises(RecoveryFailureError, match="LEADING gap subsequent_open_ms.*strictly less than until_ms"):
+        engine.scan_and_recover()
+
+
+def test_missing_fingerprint_in_artifact_stages_rejected(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement C: For stages expecting artifacts, require valid content fingerprint."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        content_fingerprint="",  # Missing content fingerprint!
+        file_sha256="sha256:" + ("e" * 64),
+    )
+    mgr.write_manifest(manifest)
+    with pytest.raises(RecoveryFailureError, match="requires a valid 64-character hex content_fingerprint_sha256"):
+        engine.scan_and_recover()
+
+
+def test_empty_fingerprint_cannot_point_to_arbitrary_parquet_filename(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement C: Empty fingerprint manifest cannot point to arbitrary Parquet filename in partition."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, staging_path, target_path = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.INITIALIZING,
+        content_fingerprint="",
+    )
+    # Point target_file_path to an arbitrary parquet file in the same partition
+    arbitrary_target = target_path.parent / "arbitrary_attack_file.parquet"
+    manifest.target_file_path = str(arbitrary_target)
+    mgr.write_manifest(manifest)
+
+    with pytest.raises(RecoveryFailureError, match="does not match canonical name"):
+        engine.scan_and_recover()
+
+
+def test_cross_process_pipeline_and_recovery_safety(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement B: Genuine cross-process test ensuring recovery does not delete/modify active pipeline artifacts."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+
+    ctx = multiprocessing.get_context("spawn")
+    ready_event = ctx.Event()
+    release_event = ctx.Event()
+    out_queue = ctx.Queue()
+
+    proc = ctx.Process(
+        target=_worker_pipeline_hold_staging,
+        args=(str(base_dir), test_uuid, ready_event, release_event, out_queue),
+    )
+    proc.start()
+
+    try:
+        assert ready_event.wait(timeout=5.0), "Worker did not signal staging ready in time"
+        worker_events = []
+        while not out_queue.empty():
+            worker_events.append(out_queue.get())
+        errors = [e for e in worker_events if e[0] == "error"]
+        assert len(errors) == 0, f"Worker process error: {errors}"
+        staging_path = Path(worker_events[0][2])
+        assert staging_path.exists()
+        initial_bytes = staging_path.read_bytes()
+        initial_sha = compute_file_sha256(staging_path)
+
+        # Process B (Recovery) scans and recovers
+        recovered_actions = engine.scan_and_recover()
+        assert len(recovered_actions) == 0
+
+        # Invariant: Active pipeline artifacts must NOT be deleted or modified
+        assert staging_path.exists()
+        assert staging_path.read_bytes() == initial_bytes
+        assert compute_file_sha256(staging_path) == initial_sha
+
+        # Manifest must still exist and lease must still be active
+        man = mgr.read_manifest(test_uuid)
+        assert man is not None
+        assert is_lease_active(man) is True
+
+    finally:
+        # Signal Process A to release its lock and finish
+        release_event.set()
+        proc.join(timeout=5.0)
+
+    # After Process A has terminated/released lock:
+    man_after = mgr.read_manifest(test_uuid)
+    if man_after is not None:
+        # Next recovery behaves correctly without error
         engine.scan_and_recover()
