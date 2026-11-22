@@ -4,10 +4,24 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
+
+
+class DurabilityMode(str, Enum):
+    """Execution policy for filesystem directory synchronization failures."""
+
+    STRICT = "STRICT"
+    DEGRADED_ALLOWED = "DEGRADED_ALLOWED"
+
+
+class DurabilityStatus(str, Enum):
+    """Observable durability classification."""
+
+    GUARANTEED = "GUARANTEED"
+    DEGRADED = "DEGRADED"
 
 
 class ManifestStage(str, Enum):
@@ -29,6 +43,10 @@ class InvalidStageTransitionError(ValueError):
 
 class DurabilityError(Exception):
     """Raised when critical filesystem durability synchronization fails."""
+
+
+class ManifestLockError(Exception):
+    """Raised when an atomic single-writer lock cannot be acquired."""
 
 
 _ALLOWED_STAGE_TRANSITIONS: dict[str, set[str]] = {
@@ -87,7 +105,56 @@ def is_lease_active(manifest: "IngestionManifest") -> bool:
     return is_pid_alive(manifest.lease_owner_pid)
 
 
-def sync_directory(dir_path: Path | str, raise_on_failure: bool = False) -> bool:
+class ManifestLock:
+    """Atomic single-writer file lock for manifest mutation and recovery."""
+
+    def __init__(self, manifest_path: Path, timeout_seconds: float = 5.0) -> None:
+        self.lock_path = manifest_path.with_suffix(".lock")
+        self.timeout_seconds = timeout_seconds
+
+    def acquire(self) -> None:
+        start_time = time.time()
+        while True:
+            try:
+                flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                fd = os.open(str(self.lock_path), flags)
+                payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode("utf-8")
+                os.write(fd, payload)
+                os.close(fd)
+                return
+            except FileExistsError:
+                try:
+                    with open(self.lock_path, "r", encoding="utf-8") as f:
+                        lock_data = json.load(f)
+                    owner_pid = lock_data.get("pid", 0)
+                    if not is_pid_alive(owner_pid):
+                        self.lock_path.unlink(missing_ok=True)
+                        continue
+                except Exception:
+                    pass
+
+                if time.time() - start_time > self.timeout_seconds:
+                    raise ManifestLockError(
+                        f"Could not acquire atomic lock on {self.lock_path} within {self.timeout_seconds}s."
+                    ) from None
+                time.sleep(0.05)
+
+    def release(self) -> None:
+        self.lock_path.unlink(missing_ok=True)
+
+    def __enter__(self) -> "ManifestLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
+
+
+def sync_directory(
+    dir_path: Path | str,
+    raise_on_failure: bool | None = None,
+    durability_mode: DurabilityMode | str = DurabilityMode.DEGRADED_ALLOWED,
+) -> bool:
     """Synchronize directory metadata to persistent storage.
 
     On POSIX, open directory with os.O_RDONLY and call os.fsync(dir_fd).
@@ -95,12 +162,20 @@ def sync_directory(dir_path: Path | str, raise_on_failure: bool = False) -> bool
 
     Args:
         dir_path: Path to directory to synchronize.
-        raise_on_failure: If True, raise DurabilityError on failure instead of returning False.
+        raise_on_failure: Legacy flag; if True, raises DurabilityError on failure.
+        durability_mode: DurabilityMode.STRICT (raises on failure) or
+            DurabilityMode.DEGRADED_ALLOWED (returns False on failure).
 
     Returns:
         True if synchronization succeeded or was a no-op on Windows.
         False if directory sync failed on POSIX.
     """
+    strict = (
+        raise_on_failure
+        if raise_on_failure is not None
+        else (durability_mode == DurabilityMode.STRICT or durability_mode == DurabilityMode.STRICT.value)
+    )
+
     if sys.platform == "win32":
         return True
 
@@ -116,7 +191,7 @@ def sync_directory(dir_path: Path | str, raise_on_failure: bool = False) -> bool
         finally:
             os.close(dir_fd)
     except OSError as e:
-        if raise_on_failure:
+        if strict:
             raise DurabilityError(f"Directory fsync failed for {path}: {e}") from e
         return False
 
@@ -142,6 +217,8 @@ class IngestionManifest:
     expected_records: int = 0
     record_count: int = 0
     missing_intervals: int = 0
+    gap_count: int = 0
+    gaps: list[dict[str, Any]] = field(default_factory=list)
     content_fingerprint_sha256: str = ""
     file_sha256: str = ""
     lease_owner_pid: int = 0
@@ -150,6 +227,8 @@ class IngestionManifest:
     ccxt_version: str = "4.4.52"
     created_at_utc: str = ""
     updated_at_utc: str = ""
+    durability_status: str = DurabilityStatus.GUARANTEED.value
+    durability_warning: str | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.stage, ManifestStage):
@@ -158,6 +237,8 @@ class IngestionManifest:
             self.requested_since_ms = self.since_ms
         if self.requested_until_ms == 0 and self.until_ms != 0:
             self.requested_until_ms = self.until_ms
+        if self.gaps and not self.gap_count:
+            self.gap_count = len(self.gaps)
 
     @property
     def staging_file_sha256(self) -> str:
@@ -186,12 +267,24 @@ class IngestionManifest:
 class ManifestManager:
     """Manages atomic creation, update, and durability of ingestion manifests."""
 
-    def __init__(self, manifests_dir: Path | str) -> None:
+    def __init__(
+        self,
+        manifests_dir: Path | str,
+        durability_mode: DurabilityMode | str = DurabilityMode.DEGRADED_ALLOWED,
+    ) -> None:
         self.manifests_dir = Path(manifests_dir)
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
+        self.durability_mode = (
+            durability_mode if isinstance(durability_mode, DurabilityMode) else DurabilityMode(str(durability_mode))
+        )
+        self.last_durability_status: DurabilityStatus = DurabilityStatus.GUARANTEED
+        self.durability_warning: str | None = None
 
     def manifest_path_for(self, ingestion_uuid: str) -> Path:
         return self.manifests_dir / f".ingest_manifest_{ingestion_uuid}.json"
+
+    def lock_manifest(self, ingestion_uuid: str, timeout_seconds: float = 5.0) -> ManifestLock:
+        return ManifestLock(self.manifest_path_for(ingestion_uuid), timeout_seconds=timeout_seconds)
 
     def save_manifest(self, manifest: IngestionManifest) -> Path:
         return self.write_manifest(manifest)
@@ -226,7 +319,7 @@ class ManifestManager:
     def list_active_manifests(self) -> list[IngestionManifest]:
         res = []
         for p in self.manifests_dir.glob(".ingest_manifest_*.json"):
-            if not p.name.endswith(".tmp"):
+            if not p.name.endswith(".tmp") and not p.name.endswith(".lock"):
                 uuid_str = p.stem.replace(".ingest_manifest_", "")
                 m = self.read_manifest(uuid_str)
                 if m:
@@ -249,7 +342,15 @@ class ManifestManager:
         os.replace(tmp_path, final_path)
 
         # Directory sync on POSIX
-        sync_directory(self.manifests_dir, raise_on_failure=False)
+        synced = sync_directory(self.manifests_dir, durability_mode=self.durability_mode)
+        if not synced:
+            self.last_durability_status = DurabilityStatus.DEGRADED
+            self.durability_warning = f"Directory sync failed for {self.manifests_dir}"
+            manifest.durability_status = DurabilityStatus.DEGRADED.value
+            manifest.durability_warning = self.durability_warning
+        else:
+            self.last_durability_status = DurabilityStatus.GUARANTEED
+            self.durability_warning = None
 
         return final_path
 
@@ -273,4 +374,7 @@ class ManifestManager:
         path = self.manifest_path_for(ingestion_uuid)
         if path.is_file():
             path.unlink(missing_ok=True)
-            sync_directory(self.manifests_dir, raise_on_failure=False)
+            sync_directory(self.manifests_dir, durability_mode=self.durability_mode)
+        lock_path = path.with_suffix(".lock")
+        if lock_path.is_file():
+            lock_path.unlink(missing_ok=True)

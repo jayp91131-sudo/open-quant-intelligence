@@ -28,9 +28,12 @@ from open_quant_intelligence.storage.fingerprint import (
     compute_file_sha256,
 )
 from open_quant_intelligence.storage.manifest import (
+    DurabilityMode,
+    DurabilityStatus,
     IngestionManifest,
     ManifestManager,
     ManifestStage,
+    sync_directory,
 )
 from open_quant_intelligence.storage.parquet_store import (
     publish_staging_file_no_clobber,
@@ -53,6 +56,7 @@ class IngestionRequest:
     exchange_id: str = "binance"
     fail_on_gaps: bool = False
     force: bool = False
+    durability_mode: DurabilityMode = DurabilityMode.DEGRADED_ALLOWED
 
 
 @dataclass
@@ -75,6 +79,8 @@ class IngestionResult:
     actual_first_open: datetime | None = None
     actual_last_close: datetime | None = None
     ingestion_status: str = "COMMITTED"
+    durability_status: str = DurabilityStatus.GUARANTEED.value
+    durability_warning: str | None = None
 
     @property
     def content_fingerprint(self) -> str:
@@ -99,17 +105,23 @@ class IngestionPipeline:
         catalog: DuckDBCatalog | None = None,
         manifest_manager: ManifestManager | None = None,
         base_data_dir: Path | str | None = None,
+        durability_mode: DurabilityMode | str = DurabilityMode.DEGRADED_ALLOWED,
     ) -> None:
         target_dir = Path(base_data_dir if base_data_dir is not None else output_dir)
         self.base_data_dir = target_dir
         self.output_dir = target_dir
         self.adapter = adapter if adapter is not None else BinanceVisionPublicAdapter()
         self.catalog = catalog if catalog is not None else DuckDBCatalog(target_dir / "catalog.duckdb")
+        self.durability_mode = (
+            durability_mode if isinstance(durability_mode, DurabilityMode) else DurabilityMode(str(durability_mode))
+        )
         self.manifest_manager = (
-            manifest_manager if manifest_manager is not None else ManifestManager(target_dir / "manifests")
+            manifest_manager
+            if manifest_manager is not None
+            else ManifestManager(target_dir / "manifests", durability_mode=self.durability_mode)
         )
         self.clock = BinanceServerTimeObserver(self.adapter)
-        self.recovery_engine = RecoveryEngine(self.manifest_manager, self.catalog)
+        self.recovery_engine = RecoveryEngine(self.manifest_manager, self.catalog, base_data_dir=self.base_data_dir)
 
     def recover_active_manifests(self, allow_active_lease_skip: bool = True) -> list[RecoveryAction]:
         """Scan and recover all in-flight or interrupted manifests."""
@@ -124,6 +136,7 @@ class IngestionPipeline:
             until_ms=request.until_ms,
             force=request.force,
             fail_on_gaps=request.fail_on_gaps,
+            durability_mode=request.durability_mode,
         )
 
     def run(
@@ -134,7 +147,13 @@ class IngestionPipeline:
         until_ms: int,
         force: bool = False,
         fail_on_gaps: bool = False,
+        durability_mode: DurabilityMode | str | None = None,
     ) -> IngestionResult:
+        effective_durability = (
+            (durability_mode if isinstance(durability_mode, DurabilityMode) else DurabilityMode(str(durability_mode)))
+            if durability_mode is not None
+            else self.durability_mode
+        )
         # Scan and reconcile any interrupted manifests before starting
         self.recover_active_manifests()
 
@@ -293,7 +312,19 @@ class IngestionPipeline:
                 expected_records=expected_records,
                 record_count=0,
                 missing_intervals=expected_records,
+                gap_count=empty_report.gap_count,
+                gaps=[
+                    {
+                        "gap_type": g.gap_type.value,
+                        "expected_open_ms": g.expected_open_ms,
+                        "subsequent_open_ms": g.subsequent_open_ms,
+                        "missing_count": g.missing_count,
+                    }
+                    for g in empty_report.gaps
+                ],
                 content_fingerprint_sha256=content_fingerprint,
+                durability_status=self.manifest_manager.last_durability_status.value,
+                durability_warning=self.manifest_manager.durability_warning,
             )
 
             return IngestionResult(
@@ -312,6 +343,8 @@ class IngestionPipeline:
                 actual_first_open=None,
                 actual_last_close=None,
                 ingestion_status="COMMITTED",
+                durability_status=empty_manifest.durability_status,
+                durability_warning=empty_manifest.durability_warning,
             )
 
         # NON-ZERO BRANCH: Convert raw rows to M0 Candle instances
@@ -402,11 +435,23 @@ class IngestionPipeline:
             expected_records=expected_records,
             record_count=len(candles),
             missing_intervals=quality_report.missing_intervals,
+            gap_count=quality_report.gap_count,
+            gaps=[
+                {
+                    "gap_type": g.gap_type.value,
+                    "expected_open_ms": g.expected_open_ms,
+                    "subsequent_open_ms": g.subsequent_open_ms,
+                    "missing_count": g.missing_count,
+                }
+                for g in quality_report.gaps
+            ],
             content_fingerprint_sha256=content_fingerprint,
             file_sha256="",
             stage=ManifestStage.INITIALIZING.value,
             created_at_utc=now_utc_str,
             updated_at_utc=now_utc_str,
+            durability_status=self.manifest_manager.last_durability_status.value,
+            durability_warning=self.manifest_manager.durability_warning,
         )
         self.manifest_manager.write_manifest(manifest)
 
@@ -418,7 +463,15 @@ class IngestionPipeline:
 
         # Publication
         self.manifest_manager.update_stage(manifest, ManifestStage.PUBLISHING)
-        file_sha256 = publish_staging_file_no_clobber(staging_file_path, target_file_path)
+        file_sha256 = publish_staging_file_no_clobber(
+            staging_file_path,
+            target_file_path,
+            durability_mode=effective_durability,
+        )
+        parent_synced = sync_directory(target_file_path.parent, durability_mode=effective_durability)
+        if not parent_synced:
+            manifest.durability_status = DurabilityStatus.DEGRADED.value
+            manifest.durability_warning = f"Directory sync failed for {target_file_path.parent}"
         self.manifest_manager.update_stage(manifest, ManifestStage.PUBLISHED)
 
         # Catalog commit
@@ -473,4 +526,6 @@ class IngestionPipeline:
             actual_first_open=candles[0].open_time,
             actual_last_close=candles[-1].close_time,
             ingestion_status="COMMITTED",
+            durability_status=manifest.durability_status,
+            durability_warning=manifest.durability_warning,
         )

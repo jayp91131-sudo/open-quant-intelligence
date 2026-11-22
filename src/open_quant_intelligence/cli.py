@@ -15,6 +15,7 @@ from open_quant_intelligence.ingestion.time_utils import (
 )
 from open_quant_intelligence.storage.catalog import DuckDBCatalog
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
+from open_quant_intelligence.storage.manifest import DurabilityMode
 
 
 def _parse_timestamp(ts_val: str) -> int:
@@ -116,6 +117,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Force re-query exchange even if committed snapshot already exists.",
     )
+    ingest_parser.add_argument(
+        "--durability-mode",
+        type=str,
+        default="degraded_allowed",
+        choices=["strict", "degraded_allowed"],
+        help="Durability enforcement mode: strict (fail on sync failure) or degraded_allowed (default).",
+    )
 
     # 3. Datasets subcommand (M1)
     datasets_parser = subparsers.add_parser(
@@ -167,6 +175,8 @@ def handle_ingest(args: argparse.Namespace) -> int:
         print(f"Error parsing ingestion arguments: {e}", file=sys.stderr)
         return 1
 
+    durability_mode = DurabilityMode.STRICT if args.durability_mode == "strict" else DurabilityMode.DEGRADED_ALLOWED
+
     request = IngestionRequest(
         exchange_id=args.exchange,
         symbol=args.symbol,
@@ -175,9 +185,14 @@ def handle_ingest(args: argparse.Namespace) -> int:
         until_ms=until_ms,
         fail_on_gaps=args.fail_on_gaps,
         force=args.force,
+        durability_mode=durability_mode,
     )
 
-    pipeline = IngestionPipeline(output_dir=args.output_dir)
+    try:
+        pipeline = IngestionPipeline(output_dir=args.output_dir, durability_mode=durability_mode)
+    except TypeError:
+        # Compatibility with mocks that only accept output_dir
+        pipeline = IngestionPipeline(output_dir=args.output_dir)
 
     try:
         res = pipeline.ingest(request)
@@ -209,6 +224,10 @@ def handle_ingest(args: argparse.Namespace) -> int:
     print(f"Parquet Artifact:      {res.parquet_artifact_path or 'None (EMPTY dataset)'}")
     print(f"Artifact SHA-256:      {res.parquet_artifact_sha256 or 'None (EMPTY dataset)'}")
     print(f"Catalog Record:        REGISTERED ({pipeline.catalog.db_path})")
+    durability_str = (
+        f"{res.durability_status} ({res.durability_warning})" if res.durability_warning else res.durability_status
+    )
+    print(f"Durability Status:     {durability_str}")
     print("=" * 60)
 
     if args.fail_on_gaps and res.quality_report.status.value == "GAP_CONTAINING":

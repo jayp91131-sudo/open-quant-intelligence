@@ -1,16 +1,26 @@
 """Targeted tests for directory synchronization, filesystem durability, and atomic publication."""
 
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
+from open_quant_intelligence.cli import main
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.ingestion.pipeline import IngestionPipeline, IngestionRequest
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
-from open_quant_intelligence.storage.manifest import DurabilityError, sync_directory
+from open_quant_intelligence.storage.manifest import (
+    DurabilityError,
+    DurabilityMode,
+    DurabilityStatus,
+    sync_directory,
+)
 from open_quant_intelligence.storage.parquet_store import (
     DatasetPathCollisionError,
     publish_staging_file_no_clobber,
 )
+from tests.fakes.fake_binance_adapter import FakeBinanceAdapter
 
 
 def test_sync_directory_success_or_noop(tmp_path: Path) -> None:
@@ -87,3 +97,104 @@ def test_publication_idempotent_when_hashes_match(tmp_path: Path) -> None:
     assert compute_file_sha256(target) == expected_sha
     # Staging cleaned up
     assert not staging.exists()
+
+
+def test_pipeline_strict_durability_mode_fails_safely_on_sync_failure(tmp_path: Path) -> None:
+    """In STRICT durability mode, sync failure raises DurabilityError and aborts safely."""
+    klines: list[list[Any]] = [
+        [0, 100.0, 105.0, 95.0, 102.0, 10.0],
+    ]
+    fake = FakeBinanceAdapter(server_time_ms=10_000_000, default_klines=klines)
+    pipeline = IngestionPipeline(
+        output_dir=tmp_path,
+        adapter=fake,
+        durability_mode=DurabilityMode.STRICT,
+    )
+
+    request = IngestionRequest(
+        symbol="BTC/USDT",
+        timeframe=SupportedTimeframe.H1,
+        since_ms=0,
+        until_ms=3_600_000,
+        durability_mode=DurabilityMode.STRICT,
+    )
+
+    with patch(
+        "open_quant_intelligence.storage.manifest.sync_directory",
+        side_effect=DurabilityError("Simulated directory fsync hardware error"),
+    ):
+        with pytest.raises(DurabilityError, match="Simulated directory fsync hardware error"):
+            pipeline.ingest(request)
+
+
+def test_pipeline_degraded_durability_mode_exposes_status(tmp_path: Path) -> None:
+    """In DEGRADED_ALLOWED mode, directory sync failure exposes DEGRADED durability status."""
+    klines: list[list[Any]] = [
+        [0, 100.0, 105.0, 95.0, 102.0, 10.0],
+    ]
+    fake = FakeBinanceAdapter(server_time_ms=10_000_000, default_klines=klines)
+    pipeline = IngestionPipeline(
+        output_dir=tmp_path,
+        adapter=fake,
+        durability_mode=DurabilityMode.DEGRADED_ALLOWED,
+    )
+
+    request = IngestionRequest(
+        symbol="BTC/USDT",
+        timeframe=SupportedTimeframe.H1,
+        since_ms=0,
+        until_ms=3_600_000,
+        durability_mode=DurabilityMode.DEGRADED_ALLOWED,
+    )
+
+    # Simulate sync_directory returning False (failure on non-strict/degraded mode)
+    with patch(
+        "open_quant_intelligence.storage.manifest.sync_directory",
+        return_value=False,
+    ):
+        res = pipeline.ingest(request)
+
+    assert res.durability_status == DurabilityStatus.DEGRADED.value
+    assert res.durability_warning is not None
+    assert "Directory sync failed" in res.durability_warning
+    assert res.manifest.durability_status == DurabilityStatus.DEGRADED.value
+
+
+def test_cli_ingest_exposes_durability_status_and_accepts_mode(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """CLI ingest outputs durability status and accepts --durability-mode flag."""
+    klines: list[list[Any]] = [
+        [0, 100.0, 105.0, 95.0, 102.0, 10.0],
+    ]
+    fake = FakeBinanceAdapter(server_time_ms=10_000_000, default_klines=klines)
+
+    with patch(
+        "open_quant_intelligence.cli.IngestionPipeline",
+        side_effect=lambda output_dir, durability_mode=DurabilityMode.DEGRADED_ALLOWED: IngestionPipeline(
+            output_dir=output_dir,
+            adapter=fake,
+            durability_mode=durability_mode,
+        ),
+    ):
+        code = main(
+            [
+                "ingest",
+                "--symbol",
+                "BTC/USDT",
+                "--timeframe",
+                "1h",
+                "--since",
+                "1970-01-01T00:00:00Z",
+                "--until",
+                "1970-01-01T01:00:00Z",
+                "--output-dir",
+                str(tmp_path),
+                "--durability-mode",
+                "degraded_allowed",
+            ]
+        )
+        assert code == 0
+        captured = capsys.readouterr()
+        assert "Durability Status:     GUARANTEED" in captured.out
