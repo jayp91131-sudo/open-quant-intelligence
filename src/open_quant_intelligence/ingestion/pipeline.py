@@ -21,6 +21,7 @@ from open_quant_intelligence.ingestion.preflight import (
     validate_request_window_preflight,
     validate_spot_market_preflight,
 )
+from open_quant_intelligence.ingestion.recovery import RecoveryAction, RecoveryEngine
 from open_quant_intelligence.storage.catalog import CatalogDatasetRecord, DuckDBCatalog
 from open_quant_intelligence.storage.fingerprint import (
     compute_content_fingerprint,
@@ -108,6 +109,11 @@ class IngestionPipeline:
             manifest_manager if manifest_manager is not None else ManifestManager(target_dir / "manifests")
         )
         self.clock = BinanceServerTimeObserver(self.adapter)
+        self.recovery_engine = RecoveryEngine(self.manifest_manager, self.catalog)
+
+    def recover_active_manifests(self, allow_active_lease_skip: bool = True) -> list[RecoveryAction]:
+        """Scan and recover all in-flight or interrupted manifests."""
+        return self.recovery_engine.scan_and_recover(allow_active_lease_skip=allow_active_lease_skip)
 
     def ingest(self, request: IngestionRequest) -> IngestionResult:
         """Execute ingestion pipeline for a structured IngestionRequest."""
@@ -129,6 +135,9 @@ class IngestionPipeline:
         force: bool = False,
         fail_on_gaps: bool = False,
     ) -> IngestionResult:
+        # Scan and reconcile any interrupted manifests before starting
+        self.recover_active_manifests()
+
         exchange_id = "binance"
         market_type = "spot"
         dataset_identity = f"{exchange_id}:{market_type}:{symbol}:{timeframe.value}:{since_ms}:{until_ms}"
@@ -443,6 +452,7 @@ class IngestionPipeline:
 
         self.catalog.commit_dataset_snapshot(catalog_record, quality_report.gaps)
         self.manifest_manager.update_stage(manifest, ManifestStage.COMMITTED)
+        self.manifest_manager.update_stage(manifest, ManifestStage.CLEANUP)
 
         # Cleanup manifest
         self.manifest_manager.unlink_manifest(ingestion_uuid)

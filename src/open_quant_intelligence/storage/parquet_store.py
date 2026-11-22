@@ -182,13 +182,8 @@ def publish_staging_file_no_clobber(
         os.unlink(str(s_path))
 
         # Parent directory sync
-        try:
-            dir_fd = os.open(str(t_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+        from open_quant_intelligence.storage.manifest import sync_directory
+
+        sync_directory(t_path.parent, raise_on_failure=False)
 
     return compute_file_sha256(t_path)

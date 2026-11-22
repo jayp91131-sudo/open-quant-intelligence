@@ -23,6 +23,104 @@ class ManifestStage(str, Enum):
     CLEANUP = "CLEANUP"
 
 
+class InvalidStageTransitionError(ValueError):
+    """Raised when an illegal or non-monotonic manifest stage transition is attempted."""
+
+
+class DurabilityError(Exception):
+    """Raised when critical filesystem durability synchronization fails."""
+
+
+_ALLOWED_STAGE_TRANSITIONS: dict[str, set[str]] = {
+    ManifestStage.INITIALIZING.value: {ManifestStage.STAGING.value, ManifestStage.CLEANUP.value},
+    ManifestStage.STAGING.value: {ManifestStage.STAGED.value, ManifestStage.CLEANUP.value},
+    ManifestStage.STAGED.value: {ManifestStage.PUBLISHING.value, ManifestStage.CLEANUP.value},
+    ManifestStage.PUBLISHING.value: {ManifestStage.PUBLISHED.value, ManifestStage.CLEANUP.value},
+    ManifestStage.PUBLISHED.value: {ManifestStage.COMMITTING_CATALOG.value, ManifestStage.CLEANUP.value},
+    ManifestStage.COMMITTING_CATALOG.value: {ManifestStage.COMMITTED.value, ManifestStage.CLEANUP.value},
+    ManifestStage.COMMITTED.value: {ManifestStage.CLEANUP.value},
+    ManifestStage.CLEANUP.value: set(),
+}
+
+
+def is_pid_alive(pid: int) -> bool:
+    """Check whether a process with the given PID is actively running."""
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        SYNCHRONIZE = 0x00100000
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+        if not handle:
+            return False
+        STILL_ACTIVE = 259
+        exit_code = ctypes.c_ulong()
+        try:
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return exit_code.value == STILL_ACTIVE
+            return False
+        finally:
+            kernel32.CloseHandle(handle)
+    else:
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+
+def is_lease_active(manifest: "IngestionManifest") -> bool:
+    """Determine if a manifest's lease is actively held by a live process."""
+    if not manifest.lease_owner_pid:
+        return False
+    if manifest.lease_expires_at_utc:
+        try:
+            exp_time = time.strptime(manifest.lease_expires_at_utc, "%Y-%m-%dT%H:%M:%SZ")
+            now_time = time.gmtime()
+            if time.mktime(now_time) > time.mktime(exp_time):
+                return False
+        except (ValueError, TypeError):
+            pass
+    return is_pid_alive(manifest.lease_owner_pid)
+
+
+def sync_directory(dir_path: Path | str, raise_on_failure: bool = False) -> bool:
+    """Synchronize directory metadata to persistent storage.
+
+    On POSIX, open directory with os.O_RDONLY and call os.fsync(dir_fd).
+    On Windows, directory changes are journaled by NTFS/FAT transactions.
+
+    Args:
+        dir_path: Path to directory to synchronize.
+        raise_on_failure: If True, raise DurabilityError on failure instead of returning False.
+
+    Returns:
+        True if synchronization succeeded or was a no-op on Windows.
+        False if directory sync failed on POSIX.
+    """
+    if sys.platform == "win32":
+        return True
+
+    path = Path(dir_path)
+    if not path.is_dir():
+        return True
+
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+            return True
+        finally:
+            os.close(dir_fd)
+    except OSError as e:
+        if raise_on_failure:
+            raise DurabilityError(f"Directory fsync failed for {path}: {e}") from e
+        return False
+
+
 @dataclass
 class IngestionManifest:
     """Durable state record for an in-flight or committed ingestion job."""
@@ -102,9 +200,18 @@ class ManifestManager:
         self,
         manifest: IngestionManifest,
         new_stage: ManifestStage | str,
+        force: bool = False,
         **kwargs: Any,
     ) -> IngestionManifest:
         stage_val = new_stage.value if isinstance(new_stage, ManifestStage) else str(new_stage)
+        current_val = manifest.stage
+        if not force and current_val != stage_val:
+            allowed = _ALLOWED_STAGE_TRANSITIONS.get(current_val, set())
+            if stage_val not in allowed:
+                raise InvalidStageTransitionError(
+                    f"Illegal stage transition from {current_val} to {stage_val} "
+                    f"for ingestion {manifest.ingestion_uuid}."
+                )
         manifest.stage = stage_val
         for k, v in kwargs.items():
             if hasattr(manifest, k):
@@ -142,22 +249,17 @@ class ManifestManager:
         os.replace(tmp_path, final_path)
 
         # Directory sync on POSIX
-        if sys.platform != "win32":
-            try:
-                dir_fd = os.open(str(self.manifests_dir), os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                pass
+        sync_directory(self.manifests_dir, raise_on_failure=False)
 
         return final_path
 
-    def update_stage(self, manifest: IngestionManifest, new_stage: ManifestStage) -> None:
-        manifest.stage = new_stage.value
-        manifest.updated_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        self.write_manifest(manifest)
+    def update_stage(
+        self,
+        manifest: IngestionManifest,
+        new_stage: ManifestStage | str,
+        force: bool = False,
+    ) -> None:
+        self.transition_stage(manifest, new_stage, force=force)
 
     def read_manifest(self, ingestion_uuid: str) -> IngestionManifest | None:
         path = self.manifest_path_for(ingestion_uuid)
@@ -171,12 +273,4 @@ class ManifestManager:
         path = self.manifest_path_for(ingestion_uuid)
         if path.is_file():
             path.unlink(missing_ok=True)
-            if sys.platform != "win32":
-                try:
-                    dir_fd = os.open(str(self.manifests_dir), os.O_RDONLY)
-                    try:
-                        os.fsync(dir_fd)
-                    finally:
-                        os.close(dir_fd)
-                except OSError:
-                    pass
+            sync_directory(self.manifests_dir, raise_on_failure=False)
