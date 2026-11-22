@@ -1,7 +1,7 @@
 """Public exchange adapter interfaces and Binance Vision client wrapper."""
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence, runtime_checkable
 
 
 class PublicAdapterError(Exception):
@@ -35,6 +35,31 @@ class SpotSymbolMetadata:
     base_asset: str
     quote_asset: str
 
+    def __init__(
+        self,
+        symbol: str,
+        status: str = "TRADING",
+        is_spot_trading_allowed: bool = True,
+        permissions: tuple[str, ...] = ("SPOT",),
+        base_asset: str = "",
+        quote_asset: str = "",
+        base: str | None = None,
+        quote: str | None = None,
+        active: bool | None = None,
+        spot: bool | None = None,
+        trading_status: str | None = None,
+    ) -> None:
+        object.__setattr__(self, "symbol", symbol)
+        final_status = trading_status if trading_status is not None else status
+        if active is False:
+            final_status = "BREAK"
+        object.__setattr__(self, "status", final_status)
+        final_spot = spot if spot is not None else is_spot_trading_allowed
+        object.__setattr__(self, "is_spot_trading_allowed", final_spot)
+        object.__setattr__(self, "permissions", permissions)
+        object.__setattr__(self, "base_asset", base if base is not None else base_asset)
+        object.__setattr__(self, "quote_asset", quote if quote is not None else quote_asset)
+
     @property
     def base(self) -> str:
         return self.base_asset
@@ -59,6 +84,11 @@ class SpotSymbolMetadata:
 RawKlineRow = list[Any]
 
 
+def _sealed_method(*args: Any, **kwargs: Any) -> None:
+    raise RuntimeError("Sealed: private trading and account operations are prohibited in M1.")
+
+
+@runtime_checkable
 class PublicExchangeAdapter(Protocol):
     """Strict allowlisted public market data interface encapsulating CCXT."""
 
@@ -66,7 +96,14 @@ class PublicExchangeAdapter(Protocol):
         """Fetch Spot market metadata from Binance exchangeInfo."""
         ...
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str, since_ms: int, limit: int = 1000) -> list[RawKlineRow]:
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        since: int | None = None,
+        limit: int | None = 1000,
+        **kwargs: Any,
+    ) -> Sequence[Sequence[Any]]:
         """Fetch raw public OHLCV candles from Binance vision cluster."""
         ...
 
@@ -80,6 +117,10 @@ class PublicExchangeAdapter(Protocol):
 
     def get_last_used_weight_1m(self) -> int:
         """Return the latest recorded X-MBX-USED-WEIGHT-1M header value."""
+        ...
+
+    def get_last_response_headers(self) -> dict[str, str]:
+        """Return raw response headers from the last HTTP request."""
         ...
 
 
@@ -115,13 +156,32 @@ class BinanceVisionPublicAdapter:
             self._exchange.urls["ws"] = {}
 
         # Seal unnecessary and private methods
-        self._exchange.create_order = None
-        self._exchange.cancel_order = None
-        self._exchange.fetch_balance = None
-        self._exchange.fetch_orders = None
+        trading_methods = [
+            "create_order",
+            "cancel_order",
+            "cancel_all_orders",
+            "edit_order",
+            "fetch_balance",
+            "fetch_my_trades",
+            "fetch_orders",
+            "fetch_open_orders",
+            "fetch_closed_orders",
+            "transfer",
+            "withdraw",
+            "deposit",
+        ]
+        for m in trading_methods:
+            setattr(self._exchange, m, _sealed_method)
 
         self._cached_rate_limit: int | None = None
         self._last_used_weight_1m: int = 0
+
+    @property
+    def client(self) -> Any:
+        return self._exchange
+
+    def get_last_response_headers(self) -> dict[str, str]:
+        return getattr(self._exchange, "last_response_headers", {}) or {}
 
     def _capture_headers(self) -> None:
         headers = getattr(self._exchange, "last_response_headers", {}) or {}
@@ -162,9 +222,18 @@ class BinanceVisionPublicAdapter:
             quote_asset=quote_asset,
         )
 
-    def fetch_ohlcv(self, symbol: str, timeframe: str, since_ms: int, limit: int = 1000) -> list[RawKlineRow]:
+    def fetch_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str = "1m",
+        since: int | None = None,
+        limit: int | None = 1000,
+        since_ms: int | None = None,
+        **kwargs: Any,
+    ) -> list[RawKlineRow]:
+        effective_since = since if since is not None else since_ms
         try:
-            rows = self._exchange.fetch_ohlcv(symbol, timeframe, since=since_ms, limit=limit)
+            rows = self._exchange.fetch_ohlcv(symbol, timeframe, since=effective_since, limit=limit)
             self._capture_headers()
             return rows
         except Exception as e:

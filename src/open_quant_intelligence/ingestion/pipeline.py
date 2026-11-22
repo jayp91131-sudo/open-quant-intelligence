@@ -137,6 +137,33 @@ class IngestionPipeline:
         if not force:
             existing = self.catalog.find_latest_committed(dataset_identity)
             if existing:
+                cached_manifest = IngestionManifest(
+                    ingestion_uuid=existing.ingestion_uuid,
+                    stage=ManifestStage.COMMITTED.value,
+                    exchange_id=existing.exchange_id,
+                    market_type=existing.market_type,
+                    symbol=existing.symbol,
+                    timeframe=existing.timeframe,
+                    requested_since_ms=since_ms,
+                    requested_until_ms=until_ms,
+                    expected_records=existing.expected_records,
+                    record_count=existing.record_count,
+                    missing_intervals=existing.missing_intervals,
+                    content_fingerprint_sha256=existing.content_fingerprint_sha256,
+                    file_sha256=existing.file_sha256 or "",
+                    target_file_path=existing.file_path or "",
+                )
+                cached_report = DataQualityReport(
+                    requested_since_ms=since_ms,
+                    requested_until_ms=until_ms,
+                    timeframe=timeframe,
+                    expected_records=existing.expected_records,
+                    record_count=existing.record_count,
+                    missing_intervals=existing.missing_intervals,
+                    gap_count=existing.gap_count,
+                    gaps=(),
+                    quality_status=existing.quality_status,
+                )
                 if existing.quality_status == "EMPTY":
                     return IngestionResult(
                         snapshot_id=existing.snapshot_id,
@@ -150,6 +177,11 @@ class IngestionPipeline:
                         file_path=None,
                         file_sha256=None,
                         skipped=True,
+                        manifest=cached_manifest,
+                        quality_report=cached_report,
+                        actual_first_open=None,
+                        actual_last_close=None,
+                        ingestion_status="COMMITTED",
                     )
                 if existing.file_path and Path(existing.file_path).is_file():
                     actual_hash = compute_file_sha256(existing.file_path)
@@ -166,6 +198,11 @@ class IngestionPipeline:
                             file_path=existing.file_path,
                             file_sha256=existing.file_sha256,
                             skipped=True,
+                            manifest=cached_manifest,
+                            quality_report=cached_report,
+                            actual_first_open=existing.actual_first_open,
+                            actual_last_close=existing.actual_last_close,
+                            ingestion_status="COMMITTED",
                         )
 
         # 2. Preflight checks
@@ -235,6 +272,21 @@ class IngestionPipeline:
 
             self.catalog.commit_dataset_snapshot(catalog_record, empty_report.gaps)
 
+            empty_manifest = IngestionManifest(
+                ingestion_uuid=ingestion_uuid,
+                stage=ManifestStage.COMMITTED.value,
+                exchange_id=exchange_id,
+                market_type=market_type,
+                symbol=symbol,
+                timeframe=timeframe.value,
+                requested_since_ms=since_ms,
+                requested_until_ms=until_ms,
+                expected_records=expected_records,
+                record_count=0,
+                missing_intervals=expected_records,
+                content_fingerprint_sha256=content_fingerprint,
+            )
+
             return IngestionResult(
                 snapshot_id=snapshot_id,
                 ingestion_uuid=ingestion_uuid,
@@ -242,10 +294,15 @@ class IngestionPipeline:
                 quality_status="EMPTY",
                 record_count=0,
                 missing_intervals=expected_records,
-                gap_count=1,
+                gap_count=empty_report.gap_count,
                 content_fingerprint_sha256=content_fingerprint,
                 file_path=None,
                 file_sha256=None,
+                manifest=empty_manifest,
+                quality_report=empty_report,
+                actual_first_open=None,
+                actual_last_close=None,
+                ingestion_status="COMMITTED",
             )
 
         # NON-ZERO BRANCH: Convert raw rows to M0 Candle instances
@@ -395,4 +452,9 @@ class IngestionPipeline:
             content_fingerprint_sha256=content_fingerprint,
             file_path=str(target_file_path),
             file_sha256=file_sha256,
+            manifest=manifest,
+            quality_report=quality_report,
+            actual_first_open=candles[0].open_time,
+            actual_last_close=candles[-1].close_time,
+            ingestion_status="COMMITTED",
         )

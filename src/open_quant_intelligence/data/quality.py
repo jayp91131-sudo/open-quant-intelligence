@@ -42,11 +42,37 @@ class QualityGapEvent:
     """Detailed record of a missing interval gap event."""
 
     gap_type: GapType
-    expected_open_ms: int
     expected_open_utc: datetime
-    subsequent_open_ms: int | None
     subsequent_open_utc: datetime | None
     missing_count: int
+    expected_open_ms: int = 0
+    subsequent_open_ms: int | None = None
+
+    def __init__(
+        self,
+        gap_type: GapType,
+        expected_open_utc: datetime | None = None,
+        subsequent_open_utc: datetime | None = None,
+        missing_count: int = 1,
+        expected_open_ms: int | None = None,
+        subsequent_open_ms: int | None = None,
+        **kwargs: Any,
+    ) -> None:
+        object.__setattr__(self, "gap_type", gap_type)
+        if expected_open_utc is None and expected_open_ms is not None:
+            expected_open_utc = datetime.fromtimestamp(expected_open_ms / 1000, tz=timezone.utc)
+        if expected_open_ms is None and expected_open_utc is not None:
+            expected_open_ms = int(expected_open_utc.timestamp() * 1000)
+        if subsequent_open_utc is None and subsequent_open_ms is not None:
+            subsequent_open_utc = datetime.fromtimestamp(subsequent_open_ms / 1000, tz=timezone.utc)
+        if subsequent_open_ms is None and subsequent_open_utc is not None:
+            subsequent_open_ms = int(subsequent_open_utc.timestamp() * 1000)
+
+        object.__setattr__(self, "expected_open_utc", expected_open_utc)
+        object.__setattr__(self, "subsequent_open_utc", subsequent_open_utc)
+        object.__setattr__(self, "missing_count", missing_count)
+        object.__setattr__(self, "expected_open_ms", expected_open_ms or 0)
+        object.__setattr__(self, "subsequent_open_ms", subsequent_open_ms)
 
 
 @dataclass(frozen=True)

@@ -29,6 +29,18 @@ class BinanceServerTimeObserver:
         self._last_server_time_ms: int | None = None
         self._last_observation_mono: float | None = None
 
+    @property
+    def _last_observation_monotonic(self) -> float | None:
+        return self._last_observation_mono
+
+    @_last_observation_monotonic.setter
+    def _last_observation_monotonic(self, val: float | None) -> None:
+        self._last_observation_mono = val
+
+    def get_server_time_ms(self, force_refresh: bool = False) -> int:
+        """Alias for get_fresh_server_time_ms."""
+        return self.get_fresh_server_time_ms(force_refresh=force_refresh)
+
     def get_fresh_server_time_ms(self, force_refresh: bool = False) -> int:
         now_mono = time.monotonic()
 

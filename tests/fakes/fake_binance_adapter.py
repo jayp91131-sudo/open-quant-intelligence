@@ -89,3 +89,9 @@ class FakeBinanceAdapter(PublicExchangeAdapter):
 
     def get_last_response_headers(self) -> dict[str, str]:
         return dict(self.custom_headers)
+
+    def get_rate_limit_weight_limit(self) -> int:
+        return 1200
+
+    def get_last_used_weight_1m(self) -> int:
+        return 10

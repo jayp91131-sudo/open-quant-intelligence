@@ -104,7 +104,7 @@ def paginate_ohlcv(
         if page_count > max_pages:
             raise PaginationBudgetExceededError(f"Pagination exceeded safety budget of {max_pages} requests.")
 
-        page = adapter.fetch_ohlcv(symbol, timeframe.value, since_ms=current_since_ms, limit=1000)
+        page = adapter.fetch_ohlcv(symbol, timeframe.value, since=current_since_ms, limit=1000)
 
         # 1. Empty page: exchange has no further data
         if not page:
@@ -169,7 +169,7 @@ def paginate_ohlcv(
                     fresh_server_time_ms = clock.get_fresh_server_time_ms(force_refresh=True)
                     if close_ms <= fresh_server_time_ms:
                         # Re-fetch fresh OHLCV from the exact cursor to obtain finalized values
-                        refetched = adapter.fetch_ohlcv(symbol, timeframe.value, since_ms=open_ms, limit=1)
+                        refetched = adapter.fetch_ohlcv(symbol, timeframe.value, since=open_ms, limit=1)
 
                         if not refetched:
                             raise RefetchEmptyError(f"Re-fetch at cursor {open_ms}ms returned empty response.")

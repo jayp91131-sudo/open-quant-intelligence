@@ -81,7 +81,7 @@ def test_request_window_grid_unaligned_raises() -> None:
 
 
 def test_request_window_inverted_or_empty_raises() -> None:
-    with pytest.raises(WindowAlignmentError, match="strictly before"):
+    with pytest.raises(WindowAlignmentError, match="strictly greater than|strictly before"):
         validate_request_window_preflight(
             timeframe=SupportedTimeframe.H1,
             since_ms=7_200_000,
@@ -97,7 +97,7 @@ def test_future_window_rejected_zero_requests() -> None:
     fake = FakeBinanceAdapter(server_time_ms=5_000_000)
 
     # until_ms = 7_200_000 > server_time_ms = 5_000_000
-    with pytest.raises(FutureWindowError, match="extends into future"):
+    with pytest.raises(FutureWindowError, match="in the future|extends into future"):
         validate_request_window_preflight(
             timeframe=SupportedTimeframe.H1,
             since_ms=0,

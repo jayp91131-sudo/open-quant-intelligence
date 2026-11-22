@@ -61,10 +61,10 @@ class DuckDBCatalog:
                     market_type VARCHAR NOT NULL,
                     symbol VARCHAR NOT NULL,
                     timeframe VARCHAR NOT NULL,
-                    requested_since TIMESTAMP WITH TIME ZONE NOT NULL,
-                    requested_until TIMESTAMP WITH TIME ZONE NOT NULL,
-                    actual_first_open TIMESTAMP WITH TIME ZONE,
-                    actual_last_close TIMESTAMP WITH TIME ZONE,
+                    requested_since TIMESTAMP NOT NULL,
+                    requested_until TIMESTAMP NOT NULL,
+                    actual_first_open TIMESTAMP,
+                    actual_last_close TIMESTAMP,
                     expected_records BIGINT NOT NULL,
                     record_count BIGINT NOT NULL,
                     gap_count INTEGER NOT NULL,
@@ -75,7 +75,7 @@ class DuckDBCatalog:
                     file_size_bytes BIGINT,
                     ccxt_version VARCHAR NOT NULL,
                     ingestion_uuid VARCHAR NOT NULL,
-                    ingested_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    ingested_at TIMESTAMP NOT NULL,
                     ingestion_status VARCHAR NOT NULL,
                     quality_status VARCHAR NOT NULL
                 );
@@ -84,15 +84,15 @@ class DuckDBCatalog:
                     gap_id VARCHAR PRIMARY KEY,
                     snapshot_id VARCHAR REFERENCES datasets(snapshot_id),
                     gap_type VARCHAR NOT NULL,
-                    expected_open TIMESTAMP WITH TIME ZONE NOT NULL,
-                    subsequent_open TIMESTAMP WITH TIME ZONE,
+                    expected_open TIMESTAMP NOT NULL,
+                    subsequent_open TIMESTAMP,
                     missing_count BIGINT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS dataset_verification_history (
                     verification_id VARCHAR PRIMARY KEY,
                     snapshot_id VARCHAR REFERENCES datasets(snapshot_id),
-                    verified_at TIMESTAMP WITH TIME ZONE NOT NULL,
+                    verified_at TIMESTAMP NOT NULL,
                     verification_result VARCHAR NOT NULL,
                     computed_file_sha256 VARCHAR,
                     error_message VARCHAR

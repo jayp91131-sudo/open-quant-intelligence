@@ -48,40 +48,49 @@ def write_staging_parquet(
     if not candles:
         return 0
 
-    # Build relational table structure for DuckDB COPY
-    records = []
-    for c in candles:
-        records.append(
-            {
-                "exchange_id": c.exchange_id,
-                "market_type": c.market_type,
-                "symbol": c.symbol,
-                "timeframe": c.timeframe,
-                "open_time": c.open_time,
-                "close_time": c.close_time,
-                "open": c.open,
-                "high": c.high,
-                "low": c.low,
-                "close": c.close,
-                "base_volume": c.base_volume,
-                "quote_volume": c.quote_volume,
-                "trade_count": c.trade_count,
-            }
-        )
-
     con = duckdb.connect(":memory:")
     try:
         # Register in-memory data
         con.execute(
             """
-            CREATE TABLE stage_candles AS
-            SELECT
-                exchange_id, market_type, symbol, timeframe,
-                open_time, close_time,
-                open, high, low, close, base_volume,
-                quote_volume, trade_count
-            FROM (SELECT * FROM records)
+            CREATE TABLE stage_candles (
+                exchange_id VARCHAR,
+                market_type VARCHAR,
+                symbol VARCHAR,
+                timeframe VARCHAR,
+                open_time TIMESTAMP,
+                close_time TIMESTAMP,
+                open DOUBLE,
+                high DOUBLE,
+                low DOUBLE,
+                close DOUBLE,
+                base_volume DOUBLE,
+                quote_volume DOUBLE,
+                trade_count BIGINT
+            )
             """
+        )
+        row_tuples = [
+            (
+                c.exchange_id,
+                c.market_type,
+                c.symbol,
+                c.timeframe,
+                c.open_time,
+                c.close_time,
+                c.open,
+                c.high,
+                c.low,
+                c.close,
+                c.base_volume,
+                c.quote_volume,
+                c.trade_count,
+            )
+            for c in candles
+        ]
+        con.executemany(
+            "INSERT INTO stage_candles VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            row_tuples,
         )
         # Export to Parquet with snappy compression
         escaped_path = str(path).replace("'", "''")
