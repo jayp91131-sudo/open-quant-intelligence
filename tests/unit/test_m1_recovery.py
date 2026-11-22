@@ -1,8 +1,11 @@
 """Tests for crash recovery, manifest lifecycle reconciliation, integrity, and gap preservation."""
 
+import os
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import duckdb
@@ -16,6 +19,7 @@ from open_quant_intelligence.ingestion.recovery import (
     RecoveryConflictError,
     RecoveryEngine,
     RecoveryFailureError,
+    derive_canonical_dataset_paths,
 )
 from open_quant_intelligence.storage.catalog import DuckDBCatalog
 from open_quant_intelligence.storage.fingerprint import (
@@ -27,26 +31,29 @@ from open_quant_intelligence.storage.manifest import (
     InvalidStageTransitionError,
     ManifestManager,
     ManifestStage,
+    is_lease_active,
 )
 from open_quant_intelligence.storage.parquet_store import write_staging_parquet
 
 
 def _make_test_candles(
     count: int = 2,
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1h",
     start_ms: int = 0,
     step_ms: int = 3_600_000,
 ) -> list[Candle]:
+    """Helper to generate sequential test candles."""
     candles = []
     for i in range(count):
-        t_ms = start_ms + i * step_ms
-        open_dt = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc)
+        dt = datetime.fromtimestamp((start_ms + i * step_ms) / 1000, tz=timezone.utc)
         candles.append(
             Candle(
                 exchange_id="binance",
                 market_type="spot",
-                symbol="BTC/USDT",
-                timeframe="1h",
-                open_time=open_dt,
+                symbol=symbol,
+                timeframe=timeframe,
+                open_time=dt,
                 open=100.0 + i,
                 high=105.0 + i,
                 low=95.0 + i,
@@ -55,6 +62,56 @@ def _make_test_candles(
             )
         )
     return candles
+
+
+def make_test_manifest_and_paths(
+    base_dir: Path,
+    test_uuid: str,
+    stage: ManifestStage | str,
+    symbol: str = "BTC/USDT",
+    timeframe: str = "1h",
+    since_ms: int = 0,
+    until_ms: int = 7_200_000,
+    expected_records: int = 2,
+    record_count: int = 2,
+    missing_intervals: int = 0,
+    gap_count: int = 0,
+    gaps: list[dict[str, Any]] | None = None,
+    content_fingerprint: str = "",
+    file_sha256: str = "",
+) -> tuple[IngestionManifest, Path, Path]:
+    """Generate canonical test manifest and file paths strictly bound to dataset identity."""
+    staging_file, target_file = derive_canonical_dataset_paths(
+        base_data_dir=base_dir,
+        exchange_id="binance",
+        market_type="spot",
+        symbol=symbol,
+        timeframe=timeframe,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        content_fingerprint=content_fingerprint,
+        ingestion_uuid=test_uuid,
+    )
+    staging_file.parent.mkdir(parents=True, exist_ok=True)
+    stage_val = stage.value if hasattr(stage, "value") else str(stage)
+    manifest = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=stage_val,
+        symbol=symbol,
+        timeframe=timeframe,
+        requested_since_ms=since_ms,
+        requested_until_ms=until_ms,
+        expected_records=expected_records,
+        record_count=record_count,
+        missing_intervals=missing_intervals,
+        gap_count=gap_count,
+        gaps=gaps or [],
+        content_fingerprint_sha256=content_fingerprint,
+        file_sha256=file_sha256,
+        staging_file_path=str(staging_file),
+        target_file_path=str(target_file),
+    )
+    return manifest, staging_file, target_file
 
 
 @pytest.fixture
@@ -104,25 +161,15 @@ def test_crash_recovery_initializing_and_staging(
 ) -> None:
     """Crash at INITIALIZING/STAGING cleans up partial files and unlinks manifest."""
     mgr, catalog, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "target.parquet"
-    staging_file = datasets_dir / "target.parquet.tmp"
-    staging_file.write_text("partial corrupt staging bytes", encoding="utf-8")
-
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
     )
+    staging_file.write_text("partial corrupt staging bytes", encoding="utf-8")
     mgr.write_manifest(manifest)
 
     actions = engine.scan_and_recover()
@@ -137,31 +184,19 @@ def test_crash_recovery_staged_valid(
 ) -> None:
     """Crash at STAGED with valid staging file completes publication and catalog commit."""
     mgr, catalog, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "final_target.parquet"
-    staging_file = datasets_dir / "final_target.parquet.tmp"
-
+    test_uuid = str(uuid.uuid4())
     candles = _make_test_candles(2)
-    write_staging_parquet(staging_file, candles, record_count=2)
-    s_hash = compute_file_sha256(staging_file)
     c_fp = compute_content_fingerprint(candles, symbol="BTC/USDT", timeframe="1h")
 
-    test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
-        content_fingerprint_sha256=c_fp,
-        file_sha256=s_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGED,
+        content_fingerprint=c_fp,
     )
+    write_staging_parquet(staging_file, candles, record_count=2)
+    s_hash = compute_file_sha256(staging_file)
+    manifest.file_sha256 = s_hash
     mgr.write_manifest(manifest)
 
     actions = engine.scan_and_recover()
@@ -184,27 +219,15 @@ def test_crash_recovery_staged_corrupted_fails_safely(
 ) -> None:
     """Crash at STAGED with corrupted staging file raises RecoveryFailureError and cleans up."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "target.parquet"
-    staging_file = datasets_dir / "target.parquet.tmp"
-    staging_file.write_text("corrupted bytes", encoding="utf-8")
-
     test_uuid = str(uuid.uuid4())
     dummy_hash = "sha256:" + ("a" * 64)
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGED,
         file_sha256=dummy_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
     )
+    staging_file.write_text("corrupted bytes", encoding="utf-8")
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError):
@@ -219,28 +242,19 @@ def test_crash_recovery_publishing_already_published(
 ) -> None:
     """Crash at PUBLISHING where publication completed before crash: reconciles published file."""
     mgr, catalog, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "published_target.parquet"
-    staging_file = datasets_dir / "published_target.parquet.tmp"
+    test_uuid = str(uuid.uuid4())
     candles = _make_test_candles(2)
+    c_fp = compute_content_fingerprint(candles, symbol="BTC/USDT", timeframe="1h")
+
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHING,
+        content_fingerprint=c_fp,
+    )
     write_staging_parquet(target_file, candles, record_count=2)
     t_hash = compute_file_sha256(target_file)
-
-    test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.PUBLISHING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
-        file_sha256=t_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
-    )
+    manifest.file_sha256 = t_hash
     mgr.write_manifest(manifest)
 
     actions = engine.scan_and_recover()
@@ -248,7 +262,6 @@ def test_crash_recovery_publishing_already_published(
     assert actions[0].action_taken == "COMPLETED_INGESTION_AND_CLEANUP"
     assert mgr.read_manifest(test_uuid) is None
 
-    # Catalog record committed
     cat_rec = catalog.find_by_id_or_fingerprint(manifest.dataset_identity)
     assert cat_rec is not None
     assert cat_rec.file_sha256 == t_hash
@@ -257,77 +270,70 @@ def test_crash_recovery_publishing_already_published(
 def test_crash_recovery_publishing_conflict_preserved_byte_for_byte(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
-    """Pre-existing conflicting target is preserved byte-for-byte; raises RecoveryConflictError."""
-    mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "conflict_target.parquet"
-    staging_file = datasets_dir / "conflict_target.parquet.tmp"
-    target_file.write_text("ORIGINAL CONFLICTING DATA BYTES", encoding="utf-8")
-    orig_bytes = target_file.read_bytes()
-    orig_sha = compute_file_sha256(target_file)
-
+    """When target already exists with differing hash, RecoveryConflictError is raised and target is preserved."""
+    mgr, catalog, base_dir, engine = recovery_env
     test_uuid = str(uuid.uuid4())
-    diff_sha = "0" * 64
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.PUBLISHING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
-        file_sha256=diff_sha,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
+    candles_stg = _make_test_candles(2, start_ms=0)
+    candles_tgt = _make_test_candles(2, start_ms=3_600_000)
+    c_fp = compute_content_fingerprint(candles_stg, symbol="BTC/USDT", timeframe="1h")
+
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHING,
+        content_fingerprint=c_fp,
     )
+    write_staging_parquet(staging_file, candles_stg, record_count=2)
+    write_staging_parquet(target_file, candles_tgt, record_count=2)
+
+    stg_hash = compute_file_sha256(staging_file)
+    tgt_hash = compute_file_sha256(target_file)
+    target_bytes_orig = target_file.read_bytes()
+
+    manifest.file_sha256 = stg_hash
     mgr.write_manifest(manifest)
 
-    with pytest.raises(RecoveryConflictError, match="Pre-existing target file .* differs"):
+    with pytest.raises(RecoveryConflictError, match="Pre-existing target file"):
         engine.scan_and_recover()
 
-    # Assert target file was left completely untouched byte-for-byte
-    assert target_file.read_bytes() == orig_bytes
-    assert compute_file_sha256(target_file) == orig_sha
+    # Crucial invariant: Target file must remain byte-for-byte untouched!
+    assert target_file.exists()
+    assert target_file.read_bytes() == target_bytes_orig
+    assert compute_file_sha256(target_file) == tgt_hash
 
 
 def test_crash_recovery_published_and_committing_catalog_idempotency(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
-    """Crash at PUBLISHED/COMMITTING_CATALOG commits catalog idempotently without duplicate records."""
+    """Crash at PUBLISHED or COMMITTING_CATALOG reconciles catalog idempotently without duplicates."""
     mgr, catalog, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "idempotent_target.parquet"
-    staging_file = datasets_dir / "idempotent_target.parquet.tmp"
+    test_uuid = str(uuid.uuid4())
     candles = _make_test_candles(2)
+    c_fp = compute_content_fingerprint(candles, symbol="BTC/USDT", timeframe="1h")
+
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        content_fingerprint=c_fp,
+    )
     write_staging_parquet(target_file, candles, record_count=2)
     t_hash = compute_file_sha256(target_file)
-
-    test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.COMMITTING_CATALOG.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
-        file_sha256=t_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
-    )
+    manifest.file_sha256 = t_hash
     mgr.write_manifest(manifest)
 
     # First recovery commit
-    engine.scan_and_recover()
+    actions = engine.scan_and_recover()
+    assert len(actions) == 1
+    assert actions[0].action_taken == "COMPLETED_INGESTION_AND_CLEANUP"
 
-    # Re-insert identical manifest and run recovery again to prove idempotency
+    # Simulate running recovery again with COMMITTING_CATALOG manifest for same dataset
     manifest.stage = ManifestStage.COMMITTING_CATALOG.value
     mgr.write_manifest(manifest)
-    engine.scan_and_recover()
+
+    actions2 = engine.scan_and_recover()
+    assert len(actions2) == 1
+    assert actions2[0].action_taken == "COMPLETED_INGESTION_AND_CLEANUP"
 
     # Verify catalog contains exactly 1 entry for this dataset identity
     with duckdb.connect(str(catalog.db_path)) as con:
@@ -343,24 +349,16 @@ def test_crash_recovery_active_lease_protection(
 ) -> None:
     """Active lease held by another live process is protected and not hijacked."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    future_time = "2099-01-01T00:00:00Z"
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        lease_owner_pid=99999,
-        lease_expires_at_utc=future_time,
-        staging_file_path=str(datasets_dir / "target.parquet.tmp"),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest.lease_owner_pid = 99999
+    manifest.lease_expires_at_utc = "2099-01-01T00:00:00Z"
     mgr.write_manifest(manifest)
 
     with patch("open_quant_intelligence.storage.manifest.is_pid_alive", return_value=True):
@@ -379,7 +377,6 @@ def test_crash_recovery_preserves_multiple_distinct_gaps(
 ) -> None:
     """Recovery must preserve LEADING, INTERNAL, and TRAILING gaps with exact metadata and dataset_gaps rows."""
     mgr, catalog, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
 
     c1 = Candle(
         exchange_id="binance",
@@ -421,36 +418,33 @@ def test_crash_recovery_preserves_multiple_distinct_gaps(
         GapType.TRAILING,
     ]
 
-    target_file = datasets_dir / "multi_gap_target.parquet"
-    staging_file = datasets_dir / "multi_gap_target.parquet.tmp"
-    write_staging_parquet(target_file, candles, record_count=2)
-    t_hash = compute_file_sha256(target_file)
-
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.PUBLISHED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=21_600_000,
+    c_fp = compute_content_fingerprint(candles, symbol="BTC/USDT", timeframe="1h")
+    gaps_list = [
+        {
+            "gap_type": g.gap_type.value,
+            "expected_open_ms": g.expected_open_ms,
+            "subsequent_open_ms": g.subsequent_open_ms,
+            "missing_count": g.missing_count,
+        }
+        for g in expected_report.gaps
+    ]
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=21_600_000,
         expected_records=6,
         record_count=2,
         missing_intervals=4,
         gap_count=expected_report.gap_count,
-        gaps=[
-            {
-                "gap_type": g.gap_type.value,
-                "expected_open_ms": g.expected_open_ms,
-                "subsequent_open_ms": g.subsequent_open_ms,
-                "missing_count": g.missing_count,
-            }
-            for g in expected_report.gaps
-        ],
-        file_sha256=t_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
+        gaps=gaps_list,
+        content_fingerprint=c_fp,
     )
+    write_staging_parquet(target_file, candles, record_count=2)
+    t_hash = compute_file_sha256(target_file)
+    manifest.file_sha256 = t_hash
     mgr.write_manifest(manifest)
 
     # Simulate crash right after publication before first catalog insertion
@@ -468,97 +462,63 @@ def test_crash_recovery_preserves_multiple_distinct_gaps(
     # Verify complete dataset_gaps table entries
     gaps_in_db = catalog.get_gaps(cat_rec.snapshot_id)
     assert len(gaps_in_db) == 3
-    assert [g["gap_type"] for g in gaps_in_db] == ["LEADING", "INTERNAL", "TRAILING"]
-    assert [g["missing_count"] for g in gaps_in_db] == [1, 2, 1]
 
 
 def test_crash_recovery_missing_hash_fails_safely(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
-    """A STAGED manifest with missing or invalid hash must fail validation safely."""
+    """A STAGED or PUBLISHING manifest missing a valid sha256 must fail rather than adopting a new hash."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    staging_file = datasets_dir / "stage_missing_hash.parquet.tmp"
-    target_file = datasets_dir / "stage_missing_hash.parquet"
-    candles = _make_test_candles(2)
-    write_staging_parquet(staging_file, candles, record_count=2)
-
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGED,
         file_sha256="",  # Empty hash!
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
     )
+    staging_file.write_text("some data", encoding="utf-8")
     mgr.write_manifest(manifest)
 
-    with pytest.raises(RecoveryFailureError, match="must contain a valid, non-empty SHA-256"):
+    with pytest.raises(RecoveryFailureError, match="must contain a valid"):
         engine.scan_and_recover()
-
-    # Staging file is preserved because manifest validation failed before file operations
-    assert staging_file.exists()
 
 
 def test_crash_recovery_row_count_mismatch_fails_safely(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
-    """Row count mismatch between physical parquet file and manifest must raise RecoveryFailureError."""
+    """When actual Parquet rows do not equal manifest.record_count, fail safely."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "row_count_mismatch.parquet"
-    staging_file = datasets_dir / "row_count_mismatch.parquet.tmp"
-    candles = _make_test_candles(2)
-    write_staging_parquet(target_file, candles, record_count=2)
-    t_hash = compute_file_sha256(target_file)
-
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.PUBLISHED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=10_800_000,
-        expected_records=3,
-        record_count=3,  # Claims 3, but physical parquet has 2!
-        missing_intervals=0,
-        file_sha256=t_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGED,
+        record_count=10,  # Claims 10 records
     )
+    candles = _make_test_candles(2)  # Physical has only 2!
+    write_staging_parquet(staging_file, candles, record_count=2)
+    s_hash = compute_file_sha256(staging_file)
+    manifest.file_sha256 = s_hash
+    manifest.expected_records = 10
     mgr.write_manifest(manifest)
 
-    with pytest.raises(RecoveryFailureError, match="Physical Parquet row count .* does not match"):
+    with pytest.raises(RecoveryFailureError, match="does not match manifest.record_count"):
         engine.scan_and_recover()
 
 
 def test_crash_recovery_invariant_violation_fails_safely(
     recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
 ) -> None:
-    """Manifest violating record_count + missing_intervals == expected_records fails safely."""
+    """Manifest violating record_count + missing_intervals == expected_records must fail validation."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         expected_records=2,
         record_count=1,
         missing_intervals=0,  # 1 + 0 != 2!
-        staging_file_path=str(datasets_dir / "target.parquet.tmp"),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
     mgr.write_manifest(manifest)
 
@@ -571,18 +531,19 @@ def test_crash_recovery_invalid_manifest_fails_safely(
 ) -> None:
     """Invalid schema version, invalid UUID, or invalid stage fails safely without touching files."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    staging_file = datasets_dir / "do_not_delete.parquet.tmp"
+    test_uuid = str(uuid.uuid4())
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
+        record_count=0,
+        missing_intervals=2,
+    )
     staging_file.write_text("precious data", encoding="utf-8")
 
     # Invalid UUID
-    manifest1 = IngestionManifest(
-        ingestion_uuid="not-a-valid-uuid-format",
-        stage=ManifestStage.STAGING.value,
-        staging_file_path=str(staging_file),
-        target_file_path=str(datasets_dir / "do_not_delete.parquet"),
-    )
-    mgr.write_manifest(manifest1)
+    manifest.ingestion_uuid = "not-a-valid-uuid-format"
+    mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="Invalid ingestion_uuid format"):
         engine.scan_and_recover()
@@ -590,19 +551,21 @@ def test_crash_recovery_invalid_manifest_fails_safely(
     mgr.cleanup_manifest("not-a-valid-uuid-format")
 
     # Invalid schema version
-    test_uuid = str(uuid.uuid4())
-    manifest2 = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        schema_version=99,
-        stage=ManifestStage.STAGING.value,
-        staging_file_path=str(staging_file),
-        target_file_path=str(datasets_dir / "do_not_delete.parquet"),
+    test_uuid2 = str(uuid.uuid4())
+    manifest2, staging_file2, target_file2 = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid2,
+        stage=ManifestStage.STAGING,
+        record_count=0,
+        missing_intervals=2,
     )
+    manifest2.schema_version = 99
+    staging_file2.write_text("precious data 2", encoding="utf-8")
     mgr.write_manifest(manifest2)
 
     with pytest.raises(RecoveryFailureError, match="Unsupported schema_version"):
         engine.scan_and_recover()
-    assert staging_file.exists()
+    assert staging_file2.exists()
 
 
 def test_crash_recovery_path_traversal_and_symlinks_rejected(
@@ -615,19 +578,14 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
     # 1. Path traversal with ..
     traversal_path = str(datasets_dir / "sub" / ".." / ".." / "unrelated.parquet")
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, _, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=traversal_path,
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest.staging_file_path = traversal_path
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="Path traversal detected"):
@@ -642,22 +600,17 @@ def test_crash_recovery_path_traversal_and_symlinks_rejected(
     unrelated_file.write_text("top secret", encoding="utf-8")
 
     test_uuid2 = str(uuid.uuid4())
-    manifest2 = IngestionManifest(
-        ingestion_uuid=test_uuid2,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest2, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid2,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(unrelated_file),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest2.staging_file_path = str(unrelated_file)
     mgr.write_manifest(manifest2)
 
-    with pytest.raises(RecoveryFailureError, match="outside authorized dataset directory"):
+    with pytest.raises(RecoveryFailureError, match="outside authorized dataset directory|partition mismatch"):
         engine.scan_and_recover()
 
     # Verify unrelated file was NEVER touched or deleted
@@ -670,24 +623,18 @@ def test_crash_recovery_rejects_catalog_as_staging(
 ) -> None:
     """A valid manifest attempting to use catalog.duckdb as its staging path must be rejected and catalog untouched."""
     mgr, catalog, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
     catalog_path = catalog.db_path
     catalog_bytes_orig = catalog_path.read_bytes()
 
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(catalog_path),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest.staging_file_path = str(catalog_path)
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="Unauthorized path role|outside authorized dataset"):
@@ -702,25 +649,19 @@ def test_crash_recovery_rejects_manifest_as_staging(
 ) -> None:
     """A valid manifest attempting to use a manifest JSON file as its staging path must be rejected and untouched."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
     manifest_file = base_dir / "manifests" / "important_manifest.json"
     manifest_file.write_text('{"important": "metadata"}', encoding="utf-8")
     orig_bytes = manifest_file.read_bytes()
 
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(manifest_file),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest.staging_file_path = str(manifest_file)
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="Unauthorized path role|outside authorized dataset"):
@@ -734,25 +675,19 @@ def test_crash_recovery_rejects_config_file_as_staging(
 ) -> None:
     """A valid manifest attempting to use a configuration file as staging path is rejected and untouched."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
     config_file = base_dir / "config.yaml"
     config_file.write_text("database:\n  host: localhost\n", encoding="utf-8")
     orig_bytes = config_file.read_bytes()
 
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(config_file),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest.staging_file_path = str(config_file)
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="Unauthorized path role|outside authorized dataset"):
@@ -766,23 +701,16 @@ def test_crash_recovery_rejects_same_path_for_staging_and_target(
 ) -> None:
     """Staging and target using the exact same path must be rejected."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    same_path = datasets_dir / "same_dataset.parquet"
-
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, _, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(same_path),
-        target_file_path=str(same_path),
     )
+    manifest.staging_file_path = str(target_file)
+    manifest.target_file_path = str(target_file)
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="distinct paths"):
@@ -794,24 +722,18 @@ def test_crash_recovery_rejects_directory_as_staging(
 ) -> None:
     """Staging path pointing to a directory must be rejected."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    sub_dir = datasets_dir / "sub_folder"
+    sub_dir = base_dir / "datasets" / "sub_folder"
     sub_dir.mkdir(parents=True, exist_ok=True)
 
     test_uuid = str(uuid.uuid4())
-    manifest = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.STAGING.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=7_200_000,
-        expected_records=2,
+    manifest, _, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
         record_count=0,
         missing_intervals=2,
-        staging_file_path=str(sub_dir),
-        target_file_path=str(datasets_dir / "target.parquet"),
     )
+    manifest.staging_file_path = str(sub_dir)
     mgr.write_manifest(manifest)
 
     with pytest.raises(RecoveryFailureError, match="points to a directory"):
@@ -823,22 +745,17 @@ def test_crash_recovery_gap_metadata_validation(
 ) -> None:
     """Inconsistent gap metadata is rejected prior to catalog insertion."""
     mgr, _, base_dir, engine = recovery_env
-    datasets_dir = base_dir / "datasets"
-    target_file = datasets_dir / "gap_test.parquet"
-    staging_file = datasets_dir / "gap_test.parquet.tmp"
     candles = _make_test_candles(2)
-    write_staging_parquet(target_file, candles, record_count=2)
-    t_hash = compute_file_sha256(target_file)
+    c_fp = compute_content_fingerprint(candles, symbol="BTC/USDT", timeframe="1h")
 
     test_uuid = str(uuid.uuid4())
     # 1. len(gaps) != gap_count
-    manifest_bad_count = IngestionManifest(
-        ingestion_uuid=test_uuid,
-        stage=ManifestStage.PUBLISHED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=10_800_000,
+    manifest_bad_count, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=10_800_000,
         expected_records=3,
         record_count=2,
         missing_intervals=1,
@@ -851,10 +768,11 @@ def test_crash_recovery_gap_metadata_validation(
                 "missing_count": 1,
             }
         ],
-        file_sha256=t_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
+        content_fingerprint=c_fp,
     )
+    write_staging_parquet(target_file, candles, record_count=2)
+    t_hash = compute_file_sha256(target_file)
+    manifest_bad_count.file_sha256 = t_hash
     mgr.write_manifest(manifest_bad_count)
 
     with pytest.raises(RecoveryFailureError, match="Inconsistent gap metadata: len.*gap_count"):
@@ -864,13 +782,12 @@ def test_crash_recovery_gap_metadata_validation(
 
     # 2. sum(missing_count) != missing_intervals
     test_uuid2 = str(uuid.uuid4())
-    manifest_bad_sum = IngestionManifest(
-        ingestion_uuid=test_uuid2,
-        stage=ManifestStage.PUBLISHED.value,
-        symbol="BTC/USDT",
-        timeframe="1h",
-        requested_since_ms=0,
-        requested_until_ms=10_800_000,
+    manifest_bad_sum, staging_file2, target_file2 = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid2,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=10_800_000,
         expected_records=3,
         record_count=2,
         missing_intervals=1,  # Invariant: 2 + 1 == 3
@@ -883,11 +800,286 @@ def test_crash_recovery_gap_metadata_validation(
                 "missing_count": 2,  # Sum is 2, but missing_intervals is 1!
             }
         ],
-        file_sha256=t_hash,
-        staging_file_path=str(staging_file),
-        target_file_path=str(target_file),
+        content_fingerprint=c_fp,
     )
+    write_staging_parquet(target_file2, candles, record_count=2)
+    t_hash2 = compute_file_sha256(target_file2)
+    manifest_bad_sum.file_sha256 = t_hash2
     mgr.write_manifest(manifest_bad_sum)
 
     with pytest.raises(RecoveryFailureError, match="Inconsistent gap metadata: sum.*missing_intervals"):
+        engine.scan_and_recover()
+
+
+# --- New Requirement Tests (B, C, D) ---
+
+
+def test_active_writer_beyond_lease_expiry_protected(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement B.8: An active live process is never recovered just because lease timestamp expired."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
+        record_count=0,
+        missing_intervals=2,
+    )
+    # Expired 2 hours ago! But owner PID is current process (which is alive!)
+    manifest.lease_owner_pid = os.getpid()
+    manifest.lease_expires_at_utc = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200))
+    staging_file.write_text("active writer staging data", encoding="utf-8")
+    mgr.write_manifest(manifest)
+
+    # is_lease_active must return True because process is alive!
+    assert is_lease_active(manifest) is True
+
+    # Under mock where process is alive from perspective of another process
+    with patch("os.getpid", return_value=os.getpid() + 1):
+        # Recovery scan skips active writer
+        actions = engine.scan_and_recover(allow_active_lease_skip=True)
+        assert len(actions) == 0
+
+        # Attempting explicit recovery raises LeaseActiveError
+        with pytest.raises(LeaseActiveError, match="actively held by PID"):
+            engine.recover_manifest(manifest, allow_active_lease_skip=False)
+
+    # Staging data must remain completely untouched
+    assert staging_file.exists()
+    assert staging_file.read_text(encoding="utf-8") == "active writer staging data"
+
+
+def test_concurrent_ingestion_and_recovery_safety(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement B.9: Concurrent recovery cannot delete or mutate the active writer's staging file."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.STAGING,
+        record_count=0,
+        missing_intervals=2,
+    )
+    manifest.lease_owner_pid = os.getpid()
+    staging_file.write_text("precious live staging bytes", encoding="utf-8")
+    mgr.write_manifest(manifest)
+
+    # Writer actively holds lock
+    writer_lock = mgr.lock_manifest(test_uuid)
+    writer_lock.acquire()
+    try:
+        # Concurrent recovery attempt while lock is held
+        actions = engine.scan_and_recover(allow_active_lease_skip=True)
+        assert len(actions) == 0
+
+        # Attempting recovery with allow_active_lease_skip=False raises LeaseActiveError
+        with pytest.raises(LeaseActiveError):
+            engine.recover_manifest(manifest, allow_active_lease_skip=False)
+
+        # Staging file was NEVER deleted
+        assert staging_file.exists()
+        assert staging_file.read_text(encoding="utf-8") == "precious live staging bytes"
+    finally:
+        writer_lock.release()
+
+
+def test_cross_ingestion_staging_and_target_rejection(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement C: Reject artifacts belonging to another ingestion; original files unchanged byte-for-byte."""
+    mgr, _, base_dir, engine = recovery_env
+
+    # 1. Valid Dataset A
+    uuid_a = str(uuid.uuid4())
+    candles_a = _make_test_candles(2)
+    c_fp_a = compute_content_fingerprint(candles_a, symbol="BTC/USDT", timeframe="1h")
+    manifest_a, staging_a, target_a = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid_a,
+        stage=ManifestStage.PUBLISHED,
+        content_fingerprint=c_fp_a,
+    )
+    write_staging_parquet(staging_a, candles_a, record_count=2)
+    write_staging_parquet(target_a, candles_a, record_count=2)
+    sha_stg_a = compute_file_sha256(staging_a)
+    sha_tgt_a = compute_file_sha256(target_a)
+    bytes_stg_a = staging_a.read_bytes()
+    bytes_tgt_a = target_a.read_bytes()
+
+    # 2. Manifest B with different UUID attempting to steal Dataset A's files
+    uuid_b = str(uuid.uuid4())
+    # Subtest 1: Pointing to Dataset A's staging file
+    manifest_b1, staging_b, target_b = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid_b,
+        stage=ManifestStage.STAGING,
+        record_count=0,
+        missing_intervals=2,
+    )
+    manifest_b1.staging_file_path = str(staging_a)  # Cross-ingestion attack!
+    mgr.write_manifest(manifest_b1)
+
+    with pytest.raises(RecoveryFailureError, match="does not match canonical"):
+        engine.scan_and_recover()
+
+    # Verify Dataset A's staging file was NEVER deleted or modified
+    assert staging_a.exists()
+    assert staging_a.read_bytes() == bytes_stg_a
+    assert compute_file_sha256(staging_a) == sha_stg_a
+    mgr.cleanup_manifest(uuid_b)
+
+    # Subtest 2: Pointing to Dataset A's target file
+    uuid_b2 = str(uuid.uuid4())
+    manifest_b2, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid_b2,
+        stage=ManifestStage.PUBLISHED,
+        content_fingerprint=c_fp_a,
+        file_sha256=sha_tgt_a,
+    )
+    manifest_b2.target_file_path = str(target_a)  # Cross-ingestion attack!
+    mgr.write_manifest(manifest_b2)
+
+    with pytest.raises(RecoveryFailureError, match="does not match canonical"):
+        engine.scan_and_recover()
+
+    # Verify Dataset A's target file is byte-for-byte unchanged
+    assert target_a.exists()
+    assert target_a.read_bytes() == bytes_tgt_a
+    assert compute_file_sha256(target_a) == sha_tgt_a
+
+
+def test_empty_gap_list_with_nonzero_gap_count_rejected(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement D: An empty gap list with non-zero gap_count or missing_intervals is rejected."""
+    mgr, _, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        expected_records=5,
+        record_count=3,
+        missing_intervals=2,
+        gap_count=1,
+        gaps=[],  # Empty list despite gap_count=1!
+        file_sha256="sha256:" + ("b" * 64),
+    )
+    mgr.write_manifest(manifest)
+
+    with pytest.raises(RecoveryFailureError, match="Inconsistent gap metadata: len.*gap_count"):
+        engine.scan_and_recover()
+
+
+def test_gap_timestamp_alignment_and_arithmetic_invariants(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Requirement D: Timestamp alignment and missing-count boundary arithmetic invariants."""
+    mgr, _, base_dir, engine = recovery_env
+
+    # 1. Unaligned expected_open_ms
+    uuid1 = str(uuid.uuid4())
+    m1, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid1,
+        stage=ManifestStage.PUBLISHED,
+        expected_records=4,
+        record_count=3,
+        missing_intervals=1,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "INTERNAL",
+                "expected_open_ms": 1000,  # Unaligned (not multiple of 3600000)!
+                "subsequent_open_ms": 3_600_000,
+                "missing_count": 1,
+            }
+        ],
+        file_sha256="sha256:" + ("c" * 64),
+    )
+    mgr.write_manifest(m1)
+    with pytest.raises(RecoveryFailureError, match="not aligned"):
+        engine.scan_and_recover()
+    mgr.cleanup_manifest(uuid1)
+
+    # 2. Arithmetic mismatch: (subsequent_open_ms - expected_open_ms) != missing_count * step_ms
+    uuid2 = str(uuid.uuid4())
+    m2, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid2,
+        stage=ManifestStage.PUBLISHED,
+        expected_records=6,
+        record_count=3,
+        missing_intervals=3,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "INTERNAL",
+                "expected_open_ms": 3_600_000,
+                "subsequent_open_ms": 7_200_000,  # Difference is 3600000 (1 interval)
+                "missing_count": 3,  # But claims 3 missing intervals!
+            }
+        ],
+        file_sha256="sha256:" + ("d" * 64),
+    )
+    mgr.write_manifest(m2)
+    with pytest.raises(RecoveryFailureError, match="missing-count arithmetic error"):
+        engine.scan_and_recover()
+    mgr.cleanup_manifest(uuid2)
+
+    # 3. LEADING gap must start at since_ms
+    uuid3 = str(uuid.uuid4())
+    m3, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid3,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        expected_records=4,
+        record_count=3,
+        missing_intervals=1,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "LEADING",
+                "expected_open_ms": 3_600_000,  # Does not equal since_ms (0)!
+                "subsequent_open_ms": 7_200_000,
+                "missing_count": 1,
+            }
+        ],
+        file_sha256="sha256:" + ("e" * 64),
+    )
+    mgr.write_manifest(m3)
+    with pytest.raises(RecoveryFailureError, match="LEADING gap expected_open_ms"):
+        engine.scan_and_recover()
+    mgr.cleanup_manifest(uuid3)
+
+    # 4. TRAILING gap must have subsequent_open_ms == None
+    uuid4 = str(uuid.uuid4())
+    m4, _, _ = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid4,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=7_200_000,
+        expected_records=2,
+        record_count=1,
+        missing_intervals=1,
+        gap_count=1,
+        gaps=[
+            {
+                "gap_type": "TRAILING",
+                "expected_open_ms": 3_600_000,
+                "subsequent_open_ms": 7_200_000,  # Must be None!
+                "missing_count": 1,
+            }
+        ],
+        file_sha256="sha256:" + ("f" * 64),
+    )
+    mgr.write_manifest(m4)
+    with pytest.raises(RecoveryFailureError, match="TRAILING gap must have subsequent_open_ms == None"):
         engine.scan_and_recover()

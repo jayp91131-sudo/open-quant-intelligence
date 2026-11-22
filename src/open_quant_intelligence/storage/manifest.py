@@ -117,18 +117,51 @@ def is_pid_alive(pid: int) -> bool:
 
 
 def is_lease_active(manifest: "IngestionManifest") -> bool:
-    """Determine if a manifest's lease is actively held by a live process."""
+    """Determine if a manifest's lease is actively held by a live process.
+
+    A lease timestamp alone must not prove that a process is dead. If the process
+    is actively alive, the lease remains active regardless of timestamp expiry.
+    """
     if not manifest.lease_owner_pid:
         return False
-    if manifest.lease_expires_at_utc:
-        try:
-            exp_time = time.strptime(manifest.lease_expires_at_utc, "%Y-%m-%dT%H:%M:%SZ")
-            now_time = time.gmtime()
-            if time.mktime(now_time) > time.mktime(exp_time):
-                return False
-        except (ValueError, TypeError):
-            pass
     return is_pid_alive(manifest.lease_owner_pid)
+
+
+def _safe_delete_lock_file(path: Path, expected_token: str) -> bool:
+    """Safely delete a lock file only if its token matches expected_token.
+
+    Atomically renames the file to a unique deletion temporary file, verifies
+    the ownership token, and deletes it. If the token does not match, the file
+    is atomically restored and not deleted.
+    """
+    if not path.is_file():
+        return False
+    temp_del = path.with_name(f"{path.name}.del_{uuid.uuid4().hex}")
+    try:
+        os.rename(str(path), str(temp_del))
+    except (FileNotFoundError, PermissionError, OSError):
+        return False
+
+    try:
+        with open(temp_del, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("token") == expected_token:
+            temp_del.unlink(missing_ok=True)
+            return True
+        else:
+            # Token mismatch (stolen or overwritten): restore file
+            try:
+                os.rename(str(temp_del), str(path))
+            except Exception:
+                pass
+            return False
+    except Exception:
+        # Malformed temporary file: do not delete, try to restore
+        try:
+            os.rename(str(temp_del), str(path))
+        except Exception:
+            pass
+        return False
 
 
 class ManifestLock:
@@ -138,7 +171,7 @@ class ManifestLock:
         self.lock_path = manifest_path.with_suffix(".lock")
         self.reclaim_path = manifest_path.with_suffix(".lock_reclaim")
         self.timeout_seconds = timeout_seconds
-        self.lock_token = f"{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
+        self.lock_token = f"lock_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
         self._acquired = False
 
     def acquire(self) -> None:
@@ -170,25 +203,36 @@ class ManifestLock:
             time.sleep(0.05)
 
     def _try_reclaim_stale_lock(self) -> None:
+        reclaim_token = f"reclaim_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
         try:
             reclaim_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
             reclaim_fd = os.open(str(self.reclaim_path), reclaim_flags)
+            reclaim_payload = json.dumps(
+                {
+                    "token": reclaim_token,
+                    "pid": os.getpid(),
+                    "time": time.time(),
+                }
+            ).encode("utf-8")
+            os.write(reclaim_fd, reclaim_payload)
+            os.close(reclaim_fd)
         except FileExistsError:
+            # Another process is holding the reclamation lock: check if it is stale
             try:
                 with open(self.reclaim_path, "r", encoding="utf-8") as rf:
                     rdata = json.load(rf)
+                if not isinstance(rdata, dict):
+                    return
                 rpid = rdata.get("pid", 0)
-                if rpid > 0 and not is_pid_alive(rpid):
-                    self.reclaim_path.unlink(missing_ok=True)
+                rtoken = rdata.get("token", "")
+                if isinstance(rpid, int) and rpid > 0 and isinstance(rtoken, str) and rtoken:
+                    if not is_pid_alive(rpid):
+                        _safe_delete_lock_file(self.reclaim_path, rtoken)
             except Exception:
                 pass
             return
 
         try:
-            reclaim_payload = json.dumps({"pid": os.getpid(), "time": time.time()}).encode("utf-8")
-            os.write(reclaim_fd, reclaim_payload)
-            os.close(reclaim_fd)
-
             if not self.lock_path.exists():
                 return
 
@@ -196,39 +240,28 @@ class ManifestLock:
                 with open(self.lock_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
             except Exception:
-                # Malformed lock file: do not steal if ownership is uncertain
+                # Malformed lock file: conservative, do not delete
                 return
 
+            if not isinstance(data, dict):
+                return
             owner_pid = data.get("pid", 0)
             owner_token = data.get("token", "")
 
-            if not isinstance(owner_pid, int) or owner_pid <= 0 or not owner_token:
+            if not isinstance(owner_pid, int) or owner_pid <= 0 or not isinstance(owner_token, str) or not owner_token:
                 return
 
+            # Check if lock owner PID is dead (conservative: alive/access-denied treated as alive)
             if not is_pid_alive(owner_pid):
-                try:
-                    with open(self.lock_path, "r", encoding="utf-8") as f:
-                        curr = json.load(f)
-                    if curr.get("token") == owner_token:
-                        self.lock_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                _safe_delete_lock_file(self.lock_path, owner_token)
         finally:
-            self.reclaim_path.unlink(missing_ok=True)
+            _safe_delete_lock_file(self.reclaim_path, reclaim_token)
 
     def release(self) -> None:
         if not self._acquired:
             return
-        if not self.lock_path.exists():
-            self._acquired = False
-            return
         try:
-            with open(self.lock_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("token") == self.lock_token:
-                self.lock_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            _safe_delete_lock_file(self.lock_path, self.lock_token)
         finally:
             self._acquired = False
 
@@ -501,10 +534,32 @@ class ManifestManager:
         if path.is_file():
             path.unlink(missing_ok=True)
             synced = sync_directory(self.manifests_dir, durability_mode=self.durability_mode)
+        # Requirement A.8: unlink_manifest must not remove a lock or reclamation file owned by another process
         lock_path = path.with_suffix(".lock")
         if lock_path.is_file():
-            lock_path.unlink(missing_ok=True)
+            try:
+                with open(lock_path, "r", encoding="utf-8") as f:
+                    ldata = json.load(f)
+                if isinstance(ldata, dict):
+                    lpid = ldata.get("pid", 0)
+                    ltoken = ldata.get("token", "")
+                    if isinstance(lpid, int) and lpid > 0 and isinstance(ltoken, str) and ltoken:
+                        if not is_pid_alive(lpid):
+                            _safe_delete_lock_file(lock_path, ltoken)
+            except Exception:
+                pass
+
         reclaim_path = path.with_suffix(".lock_reclaim")
         if reclaim_path.is_file():
-            reclaim_path.unlink(missing_ok=True)
+            try:
+                with open(reclaim_path, "r", encoding="utf-8") as rf:
+                    rdata = json.load(rf)
+                if isinstance(rdata, dict):
+                    rpid = rdata.get("pid", 0)
+                    rtoken = rdata.get("token", "")
+                    if isinstance(rpid, int) and rpid > 0 and isinstance(rtoken, str) and rtoken:
+                        if not is_pid_alive(rpid):
+                            _safe_delete_lock_file(reclaim_path, rtoken)
+            except Exception:
+                pass
         return synced

@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -15,7 +16,7 @@ from open_quant_intelligence.data.quality import (
     analyze_dataset_quality,
 )
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe, timeframe_to_timedelta
 from open_quant_intelligence.storage.catalog import CatalogDatasetRecord, DuckDBCatalog
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
 from open_quant_intelligence.storage.manifest import (
@@ -59,20 +60,257 @@ class RecoveryAction:
     target_file_sha256: str | None = None
 
 
+def derive_canonical_dataset_paths(
+    base_data_dir: Path,
+    exchange_id: str,
+    market_type: str,
+    symbol: str,
+    timeframe: str,
+    since_ms: int,
+    until_ms: int,
+    content_fingerprint: str,
+    ingestion_uuid: str,
+) -> tuple[Path, Path]:
+    """Derive the canonical dataset partition path, staging path, and target path.
+
+    Adheres strictly to OQI partition and naming conventions:
+    - Partition: datasets/exchange={exchange}/market={market}/symbol={clean_symbol}/timeframe={timeframe}
+    - Target: dataset_{since_utc}_{until_utc}_{fp_prefix}_{uuid_prefix}.parquet
+    - Staging: {target_filename}.tmp_{uuid_prefix}
+    """
+    clean_symbol = symbol.replace("/", "_")
+    target_dir = (
+        base_data_dir
+        / "datasets"
+        / f"exchange={exchange_id}"
+        / f"market={market_type}"
+        / f"symbol={clean_symbol}"
+        / f"timeframe={timeframe}"
+    )
+    since_str = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(since_ms / 1000))
+    until_str = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(until_ms / 1000))
+    fp_prefix = content_fingerprint.split(":")[-1][:8] if content_fingerprint else "nofp"
+    uuid_prefix = ingestion_uuid[:8]
+
+    target_name = f"dataset_{since_str}_{until_str}_{fp_prefix}_{uuid_prefix}.parquet"
+    target_file_path = target_dir / target_name
+    staging_file_path = target_dir / f"{target_name}.tmp_{uuid_prefix}"
+    return staging_file_path, target_file_path
+
+
+def derive_canonical_paths_for_manifest(
+    base_data_dir: Path,
+    manifest: IngestionManifest,
+) -> tuple[Path, Path]:
+    """Derive canonical dataset paths directly from an IngestionManifest."""
+    return derive_canonical_dataset_paths(
+        base_data_dir=base_data_dir,
+        exchange_id=manifest.exchange_id,
+        market_type=manifest.market_type,
+        symbol=manifest.symbol,
+        timeframe=manifest.timeframe,
+        since_ms=manifest.requested_since_ms,
+        until_ms=manifest.requested_until_ms,
+        content_fingerprint=manifest.content_fingerprint_sha256,
+        ingestion_uuid=manifest.ingestion_uuid,
+    )
+
+
+def validate_gap_metadata(
+    gaps: list[dict[str, Any]] | list[QualityGapEvent] | tuple[QualityGapEvent, ...],
+    expected_records: int,
+    record_count: int,
+    missing_intervals: int,
+    gap_count: int,
+    since_ms: int,
+    until_ms: int,
+    timeframe: SupportedTimeframe | str,
+) -> None:
+    """Validate full gap metadata invariants according to M1 rules."""
+    tf = SupportedTimeframe(timeframe) if isinstance(timeframe, str) else timeframe
+    step_ms = int(timeframe_to_timedelta(tf).total_seconds() * 1000)
+
+    # 1. missing_intervals == 0 implies gap_count == 0 and no gap events
+    if missing_intervals == 0:
+        if gap_count != 0:
+            raise RecoveryFailureError(
+                f"Gap metadata invariant violation: missing_intervals is 0 but gap_count is {gap_count}."
+            )
+        if gaps and len(gaps) > 0:
+            raise RecoveryFailureError(
+                f"Gap metadata invariant violation: missing_intervals is 0 but {len(gaps)} gap events present."
+            )
+        if record_count != expected_records:
+            raise RecoveryFailureError(
+                f"Gap metadata invariant violation: missing_intervals is 0 but record_count ({record_count}) "
+                f"!= expected_records ({expected_records})."
+            )
+        return
+
+    # 2. missing_intervals > 0 implies gap_count > 0 and len(gaps) == gap_count
+    if gap_count <= 0:
+        raise RecoveryFailureError(
+            f"Inconsistent gap metadata: missing_intervals ({missing_intervals}) > 0 but gap_count is {gap_count}."
+        )
+    if not gaps or len(gaps) != gap_count:
+        actual_len = len(gaps) if gaps else 0
+        raise RecoveryFailureError(f"Inconsistent gap metadata: len(gaps) ({actual_len}) != gap_count ({gap_count}).")
+
+    gap_dicts: list[dict[str, Any]] = []
+    for idx, g in enumerate(gaps):
+        if isinstance(g, QualityGapEvent):
+            gap_dicts.append(
+                {
+                    "gap_type": g.gap_type.value if hasattr(g.gap_type, "value") else str(g.gap_type),
+                    "expected_open_ms": g.expected_open_ms,
+                    "subsequent_open_ms": g.subsequent_open_ms,
+                    "missing_count": g.missing_count,
+                }
+            )
+        elif isinstance(g, dict):
+            gap_dicts.append(g)
+        else:
+            raise RecoveryFailureError(f"Gap at index {idx} must be a dictionary or QualityGapEvent.")
+
+    valid_gap_types = {gt.value for gt in GapType}
+    total_missing = 0
+    prev_boundary_ms = since_ms
+
+    for idx, g in enumerate(gap_dicts):
+        g_type = g.get("gap_type")
+        if g_type not in valid_gap_types:
+            raise RecoveryFailureError(f"Invalid gap_type at index {idx}: {g_type}")
+
+        missing_count = g.get("missing_count")
+        if not isinstance(missing_count, int) or missing_count <= 0:
+            raise RecoveryFailureError(
+                f"missing_count at index {idx} must be a positive integer, found {missing_count}"
+            )
+        total_missing += missing_count
+
+        exp_open = g.get("expected_open_ms")
+        if not isinstance(exp_open, int) or exp_open < 0:
+            raise RecoveryFailureError(f"expected_open_ms at index {idx} must be a non-negative int: {exp_open}")
+
+        # Grid alignment
+        if (exp_open - since_ms) % step_ms != 0:
+            raise RecoveryFailureError(
+                f"Gap at index {idx} expected_open_ms ({exp_open}) is not aligned to {tf.value} grid ({step_ms}ms)."
+            )
+
+        if exp_open < prev_boundary_ms:
+            raise RecoveryFailureError(
+                f"Gap at index {idx} expected_open_ms ({exp_open}) overlaps with "
+                f"previous gap boundary ({prev_boundary_ms})."
+            )
+
+        sub_open = g.get("subsequent_open_ms")
+        if sub_open is not None:
+            if not isinstance(sub_open, int) or sub_open <= exp_open:
+                raise RecoveryFailureError(
+                    f"Gap at index {idx} subsequent_open_ms ({sub_open}) must be strictly greater than "
+                    f"expected_open_ms ({exp_open})."
+                )
+            if (sub_open - since_ms) % step_ms != 0:
+                raise RecoveryFailureError(
+                    f"Gap at index {idx} subsequent_open_ms ({sub_open}) is not aligned to "
+                    f"{tf.value} grid ({step_ms}ms)."
+                )
+
+        # Boundary arithmetic & semantics per GapType
+        if g_type == GapType.FULL_WINDOW.value:
+            if record_count != 0:
+                raise RecoveryFailureError("FULL_WINDOW gap requires record_count == 0.")
+            if exp_open != since_ms:
+                raise RecoveryFailureError(
+                    f"FULL_WINDOW gap expected_open_ms ({exp_open}) must equal since_ms ({since_ms})."
+                )
+            if sub_open is not None:
+                raise RecoveryFailureError(f"FULL_WINDOW gap must have subsequent_open_ms == None, found {sub_open}.")
+            if missing_count != expected_records:
+                raise RecoveryFailureError(
+                    f"FULL_WINDOW gap missing_count ({missing_count}) must equal expected_records ({expected_records})."
+                )
+            if missing_count * step_ms != (until_ms - since_ms):
+                raise RecoveryFailureError("FULL_WINDOW gap boundary arithmetic mismatch.")
+            prev_boundary_ms = until_ms
+
+        elif g_type == GapType.LEADING.value:
+            if exp_open != since_ms:
+                raise RecoveryFailureError(
+                    f"LEADING gap expected_open_ms ({exp_open}) must equal since_ms ({since_ms})."
+                )
+            if sub_open is None:
+                raise RecoveryFailureError("LEADING gap must have non-null subsequent_open_ms.")
+            if (sub_open - exp_open) != missing_count * step_ms:
+                raise RecoveryFailureError(
+                    f"LEADING gap missing-count arithmetic error: (subsequent_open_ms - expected_open_ms) "
+                    f"({sub_open - exp_open}) != missing_count * step_ms ({missing_count * step_ms})."
+                )
+            prev_boundary_ms = sub_open
+
+        elif g_type == GapType.INTERNAL.value:
+            if exp_open <= since_ms:
+                raise RecoveryFailureError(
+                    f"INTERNAL gap expected_open_ms ({exp_open}) must be strictly greater than since_ms ({since_ms})."
+                )
+            if sub_open is None:
+                raise RecoveryFailureError("INTERNAL gap must have non-null subsequent_open_ms.")
+            if (sub_open - exp_open) != missing_count * step_ms:
+                raise RecoveryFailureError(
+                    f"INTERNAL gap missing-count arithmetic error: (subsequent_open_ms - expected_open_ms) "
+                    f"({sub_open - exp_open}) != missing_count * step_ms ({missing_count * step_ms})."
+                )
+            prev_boundary_ms = sub_open
+
+        elif g_type == GapType.TRAILING.value:
+            if exp_open <= since_ms:
+                raise RecoveryFailureError(
+                    f"TRAILING gap expected_open_ms ({exp_open}) must be strictly greater than since_ms ({since_ms})."
+                )
+            if sub_open is not None:
+                raise RecoveryFailureError(f"TRAILING gap must have subsequent_open_ms == None, found {sub_open}.")
+            if (until_ms - exp_open) != missing_count * step_ms:
+                raise RecoveryFailureError(
+                    f"TRAILING gap missing-count arithmetic error: (until_ms - expected_open_ms) "
+                    f"({until_ms - exp_open}) != missing_count * step_ms ({missing_count * step_ms})."
+                )
+            prev_boundary_ms = until_ms
+
+    if total_missing != missing_intervals:
+        raise RecoveryFailureError(
+            f"Inconsistent gap metadata: sum(missing_count) ({total_missing}) != "
+            f"missing_intervals ({missing_intervals})."
+        )
+    if record_count + total_missing != expected_records:
+        raise RecoveryFailureError(
+            f"Coverage invariant violation: record_count ({record_count}) + total_missing ({total_missing}) "
+            f"!= expected_records ({expected_records})."
+        )
+
+
 def validate_dataset_paths(
     staging_path_str: str | None,
     target_path_str: str | None,
     base_data_dir: Path,
+    manifest: IngestionManifest | None = None,
 ) -> tuple[Path | None, Path | None]:
     """Validate that staging and target files strictly obey dataset storage roles.
 
     Rules:
     - Staging and target files must be inside the authorized dataset storage area (base_data_dir / 'datasets').
     - Staging and target files must be distinct sibling paths in the same directory.
-    - Validate expected filename and suffix relationships (target ends with .parquet, staging with .tmp).
+    - Suffix relationships: target ends with .parquet, staging with .tmp or .tmp_<uuid>.
     - Reject paths pointing to catalog.duckdb, manifests, configuration files,
       directories, or arbitrary non-dataset files.
     - Reject path traversal ('..') and symlink escapes pointing outside the dataset directory.
+    - If manifest is provided, bind paths directly to manifest identity:
+      * Staging and target must reside in the expected partition directory derived from
+        exchange, market_type, symbol, and timeframe.
+      * Target filename must match the derived canonical filename (containing window timestamps,
+        content fingerprint prefix, and ingestion UUID prefix).
+      * Staging filename must match the derived canonical staging filename for this exact ingestion UUID.
+      * Reject any artifact belonging to another ingestion or different partition.
     - Returns resolved, validated Path objects.
     - Never deletes or modifies any files on error.
     """
@@ -153,6 +391,53 @@ def validate_dataset_paths(
             raise RecoveryFailureError("Staging path and target path must be distinct paths.")
         if resolved_staging.parent != resolved_target.parent:
             raise RecoveryFailureError("Staging file and target file must be sibling paths in the same directory.")
+
+    # Bind artifact paths to manifest identity if manifest is provided
+    if manifest is not None:
+        expected_staging, expected_target = derive_canonical_paths_for_manifest(base_data_dir, manifest)
+        expected_partition_dir = expected_target.parent.resolve()
+        uuid_prefix = manifest.ingestion_uuid[:8]
+
+        if resolved_target is not None:
+            if resolved_target.parent != expected_partition_dir:
+                raise RecoveryFailureError(
+                    f"Target file partition mismatch: {resolved_target.parent} != expected {expected_partition_dir}"
+                )
+            if manifest.content_fingerprint_sha256:
+                if resolved_target.name != expected_target.name:
+                    raise RecoveryFailureError(
+                        f"Target filename '{resolved_target.name}' does not match canonical name "
+                        f"'{expected_target.name}' bound to manifest {manifest.ingestion_uuid}."
+                    )
+            else:
+                if not resolved_target.name.endswith(f"_{uuid_prefix}.parquet"):
+                    raise RecoveryFailureError(
+                        f"Target filename '{resolved_target.name}' does not match canonical name: "
+                        f"UUID prefix mismatch (expected {uuid_prefix})."
+                    )
+
+        if resolved_staging is not None:
+            if resolved_staging.parent != expected_partition_dir:
+                raise RecoveryFailureError(
+                    f"Staging file partition mismatch: {resolved_staging.parent} != expected {expected_partition_dir}"
+                )
+            if manifest.content_fingerprint_sha256:
+                if resolved_staging.name != expected_staging.name:
+                    raise RecoveryFailureError(
+                        f"Staging filename '{resolved_staging.name}' does not match canonical name "
+                        f"'{expected_staging.name}' bound to manifest {manifest.ingestion_uuid}."
+                    )
+            else:
+                if not (
+                    resolved_staging.name.endswith(f".tmp_{uuid_prefix}")
+                    or f".tmp_{uuid_prefix}" in resolved_staging.name
+                ):
+                    raise RecoveryFailureError(
+                        f"Staging filename '{resolved_staging.name}' does not match canonical name: "
+                        f"UUID prefix mismatch (expected {uuid_prefix})."
+                    )
+
+    if resolved_staging is not None and resolved_target is not None:
         # Suffix relationship
         if not (
             resolved_staging.name.startswith(resolved_target.name)
@@ -225,45 +510,49 @@ def validate_manifest_integrity(
             f"missing_intervals ({manifest.missing_intervals}) != expected_records ({manifest.expected_records})"
         )
 
-    # Gap metadata validation
-    if manifest.gaps:
-        if len(manifest.gaps) != manifest.gap_count:
-            raise RecoveryFailureError(
-                f"Inconsistent gap metadata: len(gaps) ({len(manifest.gaps)}) != gap_count ({manifest.gap_count})"
-            )
-        valid_gap_types = {gt.value for gt in GapType}
-        total_missing = 0
-        for idx, g in enumerate(manifest.gaps):
-            if not isinstance(g, dict):
-                raise RecoveryFailureError(f"Gap at index {idx} must be a dictionary.")
-            g_type = g.get("gap_type")
-            if g_type not in valid_gap_types:
-                raise RecoveryFailureError(f"Invalid gap_type at index {idx}: {g_type}")
-            missing_count = g.get("missing_count")
-            if not isinstance(missing_count, int) or missing_count <= 0:
-                raise RecoveryFailureError(f"missing_count at index {idx} must be a positive int: {missing_count}")
-            total_missing += missing_count
-            exp_open = g.get("expected_open_ms")
-            if not isinstance(exp_open, int) or exp_open < 0:
-                raise RecoveryFailureError(f"expected_open_ms at index {idx} must be a non-negative int: {exp_open}")
-            if g_type in (GapType.LEADING.value, GapType.INTERNAL.value):
-                sub_open = g.get("subsequent_open_ms")
-                if not isinstance(sub_open, int) or sub_open <= exp_open:
-                    raise RecoveryFailureError(
-                        f"subsequent_open_ms at index {idx} must be an int strictly greater than expected_open_ms."
-                    )
-
-        if total_missing != manifest.missing_intervals:
-            raise RecoveryFailureError(
-                f"Inconsistent gap metadata: sum(missing_count) ({total_missing}) != "
-                f"missing_intervals ({manifest.missing_intervals})"
-            )
-
+    # Validate filesystem dataset paths first
     resolved_s, resolved_t = validate_dataset_paths(
         manifest.staging_file_path,
         manifest.target_file_path,
         base_dir,
+        manifest=manifest,
     )
+
+    # Gap metadata validation
+    if manifest.missing_intervals == 0:
+        validate_gap_metadata(
+            gaps=manifest.gaps or (),
+            expected_records=manifest.expected_records,
+            record_count=manifest.record_count,
+            missing_intervals=0,
+            gap_count=manifest.gap_count,
+            since_ms=manifest.requested_since_ms,
+            until_ms=manifest.requested_until_ms,
+            timeframe=manifest.timeframe,
+        )
+    elif manifest.gaps or manifest.gap_count > 0:
+        validate_gap_metadata(
+            gaps=manifest.gaps or (),
+            expected_records=manifest.expected_records,
+            record_count=manifest.record_count,
+            missing_intervals=manifest.missing_intervals,
+            gap_count=manifest.gap_count,
+            since_ms=manifest.requested_since_ms,
+            until_ms=manifest.requested_until_ms,
+            timeframe=manifest.timeframe,
+        )
+    elif manifest.stage in (
+        ManifestStage.INITIALIZING.value,
+        ManifestStage.STAGING.value,
+        ManifestStage.PUBLISHED.value,
+        ManifestStage.COMMITTING_CATALOG.value,
+    ):
+        pass
+    else:
+        raise RecoveryFailureError(
+            f"Missing gap metadata in manifest {manifest.ingestion_uuid}: "
+            f"missing_intervals ({manifest.missing_intervals}) > 0 but gaps list is empty."
+        )
 
     if manifest.stage in (ManifestStage.STAGED.value, ManifestStage.PUBLISHING.value):
         raw_hash = manifest.file_sha256.removeprefix("sha256:")
@@ -547,6 +836,18 @@ class RecoveryEngine:
 
         gap_count = len(gaps) if gaps else manifest.gap_count
         missing_intervals = sum(g.missing_count for g in gaps) if gaps else manifest.missing_intervals
+
+        # Requirement D: Validate complete gap invariants before catalog insertion
+        validate_gap_metadata(
+            gaps=gaps,
+            expected_records=manifest.expected_records,
+            record_count=manifest.record_count,
+            missing_intervals=missing_intervals,
+            gap_count=gap_count,
+            since_ms=manifest.requested_since_ms,
+            until_ms=manifest.requested_until_ms,
+            timeframe=manifest.timeframe,
+        )
 
         quality_status = (
             "EMPTY" if manifest.record_count == 0 else ("GAP_FREE" if missing_intervals == 0 else "GAP_CONTAINING")

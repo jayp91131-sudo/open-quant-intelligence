@@ -19,24 +19,31 @@ from open_quant_intelligence.storage.manifest import (
 
 
 def _worker_acquire_lock(manifest_path: str, timeout: float, out_queue: Any) -> None:
-    """Multiprocess worker for simultaneous lock acquisition."""
+    """Multiprocess worker for simultaneous lock acquisition with timing."""
     try:
         lock = ManifestLock(Path(manifest_path), timeout_seconds=timeout)
         with lock:
-            out_queue.put(("acquired", os.getpid(), time.time()))
-            time.sleep(0.1)
-            out_queue.put(("releasing", os.getpid(), time.time()))
+            start_t = time.time()
+            out_queue.put(("acquired", os.getpid(), start_t))
+            time.sleep(0.15)
+            end_t = time.time()
+            out_queue.put(("releasing", os.getpid(), end_t))
     except Exception as e:
         out_queue.put(("error", os.getpid(), str(e)))
 
 
-def _worker_acquire_stale_reclaim(manifest_path: str, timeout: float, out_queue: Any) -> None:
+def _worker_acquire_stale_reclaim(manifest_path: str, timeout: float, out_queue: Any, barrier: Any = None) -> None:
     """Multiprocess worker for racing stale-lock reclamation."""
     try:
+        if barrier is not None:
+            barrier.wait(timeout=5.0)
         lock = ManifestLock(Path(manifest_path), timeout_seconds=timeout)
         with lock:
-            out_queue.put(("acquired", os.getpid()))
-            time.sleep(0.05)
+            start_t = time.time()
+            out_queue.put(("acquired", os.getpid(), start_t))
+            time.sleep(0.1)
+            end_t = time.time()
+            out_queue.put(("releasing", os.getpid(), end_t))
     except Exception as e:
         out_queue.put(("error", os.getpid(), str(e)))
 
@@ -129,7 +136,7 @@ def test_crash_recovery_all_transitions_idempotent(tmp_path: Path) -> None:
 
 
 def test_multiprocess_simultaneous_lock_acquisition(tmp_path: Path) -> None:
-    """Multiple processes competing for the same lock acquire it mutually exclusively."""
+    """Multiple processes competing for the same lock acquire it mutually exclusively without overlap."""
     manifest_file = tmp_path / "target_manifest.json"
     manifest_file.write_text("{}", encoding="utf-8")
     ctx = multiprocessing.get_context("spawn")
@@ -153,25 +160,42 @@ def test_multiprocess_simultaneous_lock_acquisition(tmp_path: Path) -> None:
     assert len(errors) == 0, f"Errors in multiprocess lock acquisition: {errors}"
 
     acquired_events = [e for e in events if e[0] == "acquired"]
+    releasing_events = [e for e in events if e[0] == "releasing"]
     assert len(acquired_events) == 2
+    assert len(releasing_events) == 2
+
+    # Invariant 1: Critical sections must have ZERO overlap (mutually exclusive)
+    proc1_pid = acquired_events[0][1]
+    proc1_start = acquired_events[0][2]
+    proc1_end = [e[2] for e in releasing_events if e[1] == proc1_pid][0]
+
+    proc2_pid = acquired_events[1][1]
+    proc2_start = acquired_events[1][2]
+    proc2_end = [e[2] for e in releasing_events if e[1] == proc2_pid][0]
+
+    # Exactly one executed before the other
+    non_overlapping = (proc1_end <= proc2_start) or (proc2_end <= proc1_start)
+    assert non_overlapping, (
+        f"Critical sections overlapped! Proc1: [{proc1_start}, {proc1_end}], Proc2: [{proc2_start}, {proc2_end}]"
+    )
 
 
 def test_multiprocess_stale_lock_reclamation(tmp_path: Path) -> None:
-    """Multiple processes racing to reclaim a stale lock file do not race or corrupt."""
+    """Multiple processes synchronized by barrier racing to reclaim stale lock coordinate safely."""
     manifest_file = tmp_path / "stale_target.json"
     manifest_file.write_text("{}", encoding="utf-8")
     lock_file = manifest_file.with_suffix(".lock")
 
-    # Create stale lock file belonging to definitely dead PID
-    # PID 99999999 is dead/non-existent
+    # Create stale lock file belonging to definitely dead PID 99999999
     stale_payload = json.dumps({"token": "stale_token_123", "pid": 99999999, "time": time.time() - 100})
     lock_file.write_text(stale_payload, encoding="utf-8")
 
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
+    barrier = ctx.Barrier(2)
 
-    p1 = ctx.Process(target=_worker_acquire_stale_reclaim, args=(str(manifest_file), 5.0, queue))
-    p2 = ctx.Process(target=_worker_acquire_stale_reclaim, args=(str(manifest_file), 5.0, queue))
+    p1 = ctx.Process(target=_worker_acquire_stale_reclaim, args=(str(manifest_file), 5.0, queue, barrier))
+    p2 = ctx.Process(target=_worker_acquire_stale_reclaim, args=(str(manifest_file), 5.0, queue, barrier))
 
     p1.start()
     p2.start()
@@ -185,7 +209,19 @@ def test_multiprocess_stale_lock_reclamation(tmp_path: Path) -> None:
 
     errors = [r for r in results if r[0] == "error"]
     assert len(errors) == 0, f"Errors during stale lock reclamation: {errors}"
-    assert len([r for r in results if r[0] == "reclaimed" or r[0] == "acquired"]) == 2
+    acquired = [r for r in results if r[0] == "acquired"]
+    releasing = [r for r in results if r[0] == "releasing"]
+    assert len(acquired) == 2
+    assert len(releasing) == 2
+
+    # Invariant 2: Non-overlapping execution across the barrier
+    pid_a, start_a = acquired[0][1], acquired[0][2]
+    end_a = [r[2] for r in releasing if r[1] == pid_a][0]
+    pid_b, start_b = acquired[1][1], acquired[1][2]
+    end_b = [r[2] for r in releasing if r[1] == pid_b][0]
+    assert (end_a <= start_b) or (end_b <= start_a), (
+        f"Reclamation critical sections overlapped! [{start_a}, {end_a}] vs [{start_b}, {end_b}]"
+    )
 
 
 def test_ownership_safe_release(tmp_path: Path) -> None:
@@ -225,3 +261,44 @@ def test_active_process_protection_not_stolen(tmp_path: Path) -> None:
     assert lock1.lock_path.exists()
     lock1.release()
     assert not lock1.lock_path.exists()
+
+
+def test_ownership_safe_lock_cleanup_unlink_manifest(tmp_path: Path) -> None:
+    """unlink_manifest() must not remove a lock or reclamation file owned by an active process."""
+    mgr = ManifestManager(tmp_path / "manifests")
+    test_uuid = "test_cleanup_uuid_123"
+    man_path = mgr.manifest_path_for(test_uuid)
+    man_path.write_text("{}", encoding="utf-8")
+
+    # 1. Active lock held by current process
+    lock = mgr.lock_manifest(test_uuid)
+    lock.acquire()
+    assert lock.lock_path.exists()
+
+    # Also simulate an active reclaim file owned by current PID
+    reclaim_path = man_path.with_suffix(".lock_reclaim")
+    reclaim_path.write_text(
+        json.dumps({"token": "reclaim_tok_1", "pid": os.getpid(), "time": time.time()}),
+        encoding="utf-8",
+    )
+
+    # unlink_manifest called while lock and reclaim are actively owned
+    mgr.unlink_manifest(test_uuid)
+
+    # Manifest json is unlinked, but active lock and active reclaim must NOT be deleted!
+    assert not man_path.exists()
+    assert lock.lock_path.exists()
+    assert reclaim_path.exists()
+
+    # Now release lock normally
+    lock.release()
+    assert not lock.lock_path.exists()
+
+    # Now simulate dead reclaim lock (PID 99999999)
+    reclaim_path.write_text(
+        json.dumps({"token": "reclaim_tok_dead", "pid": 99999999, "time": time.time()}),
+        encoding="utf-8",
+    )
+    # unlink_manifest again should clean up the dead process's reclaim file
+    mgr.unlink_manifest(test_uuid)
+    assert not reclaim_path.exists()
