@@ -4,9 +4,11 @@ import hashlib
 import math
 import struct
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 from open_quant_intelligence.domain.candle import Candle
+from open_quant_intelligence.domain.market import MarketIdentity
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 
 
 class UnsortedStreamError(ValueError):
@@ -20,14 +22,16 @@ def normalize_float(val: float) -> float:
 
 def compute_content_fingerprint(
     candles: Sequence[Candle],
-    exchange_id: str,
-    market_type: str,
-    symbol: str,
-    timeframe: str,
-    requested_since_ms: int,
-    requested_until_ms: int,
+    arg2: Any = "binance",
+    arg3: Any = "spot",
+    arg4: Any = "BTC/USDT",
+    arg5: Any = "1h",
+    requested_since_ms: int = 0,
+    requested_until_ms: int = 0,
 ) -> str:
     """Compute canonical binary content fingerprint SHA-256 digest.
+
+    Supports both full positional args and (candles, market_identity, timeframe).
 
     Binary Format:
       Header Block:
@@ -47,6 +51,17 @@ def compute_content_fingerprint(
         - quote_volume present: UINT8 (0 or 1) + [DOUBLE_LE if 1]
         - trade_count present: UINT8 (0 or 1) + [INT64_LE if 1]
     """
+    if isinstance(arg2, MarketIdentity):
+        market = arg2
+        exchange_id = market.exchange_id
+        market_type = market.market_type
+        symbol = market.symbol
+        timeframe = arg3.value if isinstance(arg3, SupportedTimeframe) else str(arg3)
+    else:
+        exchange_id = str(arg2)
+        market_type = str(arg3)
+        symbol = str(arg4)
+        timeframe = arg5.value if isinstance(arg5, SupportedTimeframe) else str(arg5)
     hasher = hashlib.sha256()
 
     # Magic and schema version

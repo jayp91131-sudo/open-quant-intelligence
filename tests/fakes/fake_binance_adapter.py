@@ -19,19 +19,19 @@ class FakeBinanceAdapter(PublicExchangeAdapter):
         self.symbols_metadata = symbols_metadata or {
             "BTC/USDT": SpotSymbolMetadata(
                 symbol="BTC/USDT",
-                base="BTC",
-                quote="USDT",
-                active=True,
-                spot=True,
-                trading_status="TRADING",
+                status="TRADING",
+                is_spot_trading_allowed=True,
+                permissions=("SPOT",),
+                base_asset="BTC",
+                quote_asset="USDT",
             ),
             "ETH/USDT": SpotSymbolMetadata(
                 symbol="ETH/USDT",
-                base="ETH",
-                quote="USDT",
-                active=True,
-                spot=True,
-                trading_status="TRADING",
+                status="TRADING",
+                is_spot_trading_allowed=True,
+                permissions=("SPOT",),
+                base_asset="ETH",
+                quote_asset="USDT",
             ),
         }
         self.klines_pages = klines_pages or {}

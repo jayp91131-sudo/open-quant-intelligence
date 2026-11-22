@@ -35,6 +35,26 @@ class SpotSymbolMetadata:
     base_asset: str
     quote_asset: str
 
+    @property
+    def base(self) -> str:
+        return self.base_asset
+
+    @property
+    def quote(self) -> str:
+        return self.quote_asset
+
+    @property
+    def active(self) -> bool:
+        return self.status == "TRADING"
+
+    @property
+    def spot(self) -> bool:
+        return self.is_spot_trading_allowed
+
+    @property
+    def trading_status(self) -> str:
+        return self.status
+
 
 RawKlineRow = list[Any]
 

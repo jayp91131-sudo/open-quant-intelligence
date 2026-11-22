@@ -10,8 +10,10 @@ from open_quant_intelligence.storage.fingerprint import compute_content_fingerpr
 
 def _make_candle(price: float, vol: float = 1.0) -> Candle:
     return Candle(
-        market=MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT"),
-        timeframe=SupportedTimeframe.H1,
+        exchange_id="binance",
+        market_type="spot",
+        symbol="BTC/USDT",
+        timeframe="1h",
         open_time=datetime(2026, 1, 1, 0, 0, tzinfo=timezone.utc),
         open=price,
         high=price + 5.0,

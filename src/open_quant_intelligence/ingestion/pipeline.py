@@ -14,7 +14,7 @@ from open_quant_intelligence.data.quality import (
 from open_quant_intelligence.data.validation import validate_candles
 from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.ingestion.adapter import PublicExchangeAdapter
+from open_quant_intelligence.ingestion.adapter import BinanceVisionPublicAdapter, PublicExchangeAdapter
 from open_quant_intelligence.ingestion.clock import BinanceServerTimeObserver
 from open_quant_intelligence.ingestion.pagination import paginate_ohlcv
 from open_quant_intelligence.ingestion.preflight import (
@@ -37,7 +37,24 @@ from open_quant_intelligence.storage.parquet_store import (
 )
 
 
+class GapFailureError(ValueError):
+    """Raised when ingestion contains gap intervals and fail_on_gaps is True."""
+
+
 @dataclass(frozen=True)
+class IngestionRequest:
+    """Request specification for historical data ingestion."""
+
+    symbol: str
+    timeframe: SupportedTimeframe
+    since_ms: int
+    until_ms: int
+    exchange_id: str = "binance"
+    fail_on_gaps: bool = False
+    force: bool = False
+
+
+@dataclass
 class IngestionResult:
     """Summary result returned from an ingestion pipeline execution."""
 
@@ -52,6 +69,23 @@ class IngestionResult:
     file_path: str | None
     file_sha256: str | None
     skipped: bool = False
+    manifest: IngestionManifest | None = None
+    quality_report: DataQualityReport | None = None
+    actual_first_open: datetime | None = None
+    actual_last_close: datetime | None = None
+    ingestion_status: str = "COMMITTED"
+
+    @property
+    def content_fingerprint(self) -> str:
+        return self.content_fingerprint_sha256
+
+    @property
+    def parquet_artifact_path(self) -> str | None:
+        return self.file_path
+
+    @property
+    def parquet_artifact_sha256(self) -> str | None:
+        return self.file_sha256
 
 
 class IngestionPipeline:
@@ -59,16 +93,32 @@ class IngestionPipeline:
 
     def __init__(
         self,
-        adapter: PublicExchangeAdapter,
-        catalog: DuckDBCatalog,
-        manifest_manager: ManifestManager,
-        base_data_dir: Path | str = "data",
+        output_dir: Path | str = "data",
+        adapter: PublicExchangeAdapter | None = None,
+        catalog: DuckDBCatalog | None = None,
+        manifest_manager: ManifestManager | None = None,
+        base_data_dir: Path | str | None = None,
     ) -> None:
-        self.adapter = adapter
-        self.catalog = catalog
-        self.manifest_manager = manifest_manager
-        self.base_data_dir = Path(base_data_dir)
-        self.clock = BinanceServerTimeObserver(adapter)
+        target_dir = Path(base_data_dir if base_data_dir is not None else output_dir)
+        self.base_data_dir = target_dir
+        self.output_dir = target_dir
+        self.adapter = adapter if adapter is not None else BinanceVisionPublicAdapter()
+        self.catalog = catalog if catalog is not None else DuckDBCatalog(target_dir / "catalog.duckdb")
+        self.manifest_manager = (
+            manifest_manager if manifest_manager is not None else ManifestManager(target_dir / "manifests")
+        )
+        self.clock = BinanceServerTimeObserver(self.adapter)
+
+    def ingest(self, request: IngestionRequest) -> IngestionResult:
+        """Execute ingestion pipeline for a structured IngestionRequest."""
+        return self.run(
+            symbol=request.symbol,
+            timeframe=request.timeframe,
+            since_ms=request.since_ms,
+            until_ms=request.until_ms,
+            force=request.force,
+            fail_on_gaps=request.fail_on_gaps,
+        )
 
     def run(
         self,

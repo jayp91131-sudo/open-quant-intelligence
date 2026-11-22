@@ -3,13 +3,21 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Sequence
+from typing import Any, Sequence
 
 from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.ingestion.time_utils import timeframe_to_duration_ms
 
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class QualityStatus(str, Enum):
+    """Quality classification of the dataset."""
+
+    EMPTY = "EMPTY"
+    GAP_FREE = "GAP_FREE"
+    GAP_CONTAINING = "GAP_CONTAINING"
 
 
 class GapType(str, Enum):
@@ -56,6 +64,11 @@ class DataQualityReport:
     quality_status: str  # 'EMPTY', 'GAP_FREE', 'GAP_CONTAINING'
 
     @property
+    def status(self) -> QualityStatus:
+        """Enum representation of quality_status."""
+        return QualityStatus(self.quality_status)
+
+    @property
     def is_gap_free(self) -> bool:
         """True if all expected intervals were observed without gaps."""
         return self.missing_intervals == 0 and self.record_count == self.expected_records
@@ -63,11 +76,13 @@ class DataQualityReport:
 
 def analyze_dataset_quality(
     candles: Sequence[Candle],
-    since_ms: int,
-    until_ms: int,
-    timeframe: SupportedTimeframe,
+    arg2: Any,
+    arg3: Any,
+    arg4: Any | None = None,
 ) -> DataQualityReport:
     """Analyze full requested-window coverage, detecting leading, internal, and trailing gaps.
+
+    Supports both (candles, since_ms, until_ms, timeframe) and (candles, timeframe, since_ms, until_ms).
 
     Args:
         candles: Sequence of validated immutable Candle domain instances sorted chronologically.
@@ -83,6 +98,14 @@ def analyze_dataset_quality(
         UnalignedCandleError: If any candle open timestamp does not align to the timeframe grid.
         InconsistentGapStatisticsError: If record_count + missing_intervals != expected_records.
     """
+    if isinstance(arg2, SupportedTimeframe):
+        timeframe = arg2
+        since_ms = int(arg3)
+        until_ms = int(arg4)
+    else:
+        since_ms = int(arg2)
+        until_ms = int(arg3)
+        timeframe = arg4
     if until_ms <= since_ms:
         raise ValueError(f"until_ms ({until_ms}) must be strictly greater than since_ms ({since_ms})")
 

@@ -7,8 +7,6 @@ import duckdb
 import pytest
 
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.market import MarketIdentity
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
 from open_quant_intelligence.storage.parquet_store import (
     RecoveryConflictError,
@@ -18,14 +16,15 @@ from open_quant_intelligence.storage.parquet_store import (
 
 
 def _make_candles(count: int) -> list[Candle]:
-    market = MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT")
     res: list[Candle] = []
     for i in range(count):
         open_time = datetime.fromtimestamp(i * 3600, tz=timezone.utc)
         res.append(
             Candle(
-                market=market,
-                timeframe=SupportedTimeframe.H1,
+                exchange_id="binance",
+                market_type="spot",
+                symbol="BTC/USDT",
+                timeframe="1h",
                 open_time=open_time,
                 open=100.0 + i,
                 high=105.0 + i,

@@ -4,11 +4,10 @@ import ctypes
 import os
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Any
 
 import duckdb
 
-from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
 
 
@@ -20,19 +19,30 @@ class DatasetPathCollisionError(StorageError, FileExistsError):
     """Raised when the target publication file already exists (no-clobber invariant)."""
 
 
+RecoveryConflictError = DatasetPathCollisionError
+
+
 class StagingRowMismatchError(StorageError):
     """Raised when staging file row count does not match admitted record count."""
 
 
 def write_staging_parquet(
-    candles: Sequence[Candle],
-    staging_path: Path | str,
-) -> int:
+    arg1: Any,
+    arg2: Any,
+    record_count: int | None = None,
+) -> str | int:
     """Write validated candles to a temporary Parquet staging file via DuckDB.
 
+    Accepts both (candles, staging_path) and (staging_path, candles).
     Flushes file to disk with fsync / _commit and verifies row count.
     """
-    path = Path(staging_path)
+    if isinstance(arg1, (str, Path)):
+        path = Path(arg1)
+        candles = arg2
+    else:
+        candles = arg1
+        path = Path(arg2)
+
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if not candles:
@@ -98,7 +108,12 @@ def write_staging_parquet(
             f"Staging Parquet row count ({row_count}) does not match admitted candles count ({len(candles)})."
         )
 
-    return row_count
+    if record_count is not None and row_count != record_count:
+        raise AssertionError(
+            f"Physical Parquet row count ({row_count}) does not match expected record_count ({record_count})."
+        )
+
+    return compute_file_sha256(path)
 
 
 def publish_staging_file_no_clobber(

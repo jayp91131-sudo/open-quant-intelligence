@@ -11,15 +11,16 @@ from open_quant_intelligence.data.quality import (
     analyze_dataset_quality,
 )
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.market import MarketIdentity
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 
 
 def _make_candle(open_ms: int, tf: SupportedTimeframe = SupportedTimeframe.H1) -> Candle:
     dt = datetime.fromtimestamp(open_ms / 1000, tz=timezone.utc)
     return Candle(
-        market=MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT"),
-        timeframe=tf,
+        exchange_id="binance",
+        market_type="spot",
+        symbol="BTC/USDT",
+        timeframe=tf.value,
         open_time=dt,
         open=100.0,
         high=105.0,
