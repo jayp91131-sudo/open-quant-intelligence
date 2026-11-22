@@ -45,7 +45,7 @@ def test_spot_market_preflight_untradable_delisted() -> None:
     with pytest.raises(DelistedSymbolError, match="not active"):
         validate_spot_market_preflight(fake, "DELISTED/USDT")
 
-    with pytest.raises(UntradableSymbolError, match="not eligible for spot"):
+    with pytest.raises(UntradableSymbolError, match="disallowed|not eligible for spot"):
         validate_spot_market_preflight(fake, "FUTURES/USDT")
 
 

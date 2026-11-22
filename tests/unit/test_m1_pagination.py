@@ -164,7 +164,7 @@ def test_incomplete_tail_discard_refetch_validate() -> None:
 def test_refetched_response_structural_failure_cases() -> None:
     """Requirement 2: Covers 4 refetch failures: empty, multiple rows, malformed, mismatched timestamp."""
     # 1. Empty response -> RefetchEmptyError
-    fake1 = FakeBinanceAdapter(server_time_ms=5_000_000)
+    fake1 = FakeBinanceAdapter(server_time_ms=1_000_000)
     fake1.klines_pages = {("BTC/USDT", "1h", 0): [[0, 10.0, 11.0, 9.0, 10.5, 1.0]]}
     fake1.server_time_sequence = [7_201_000]
     # For limit=1, return empty
@@ -185,7 +185,7 @@ def test_refetched_response_structural_failure_cases() -> None:
         )
 
     # 2. Multiple rows -> RefetchRowCountError
-    fake2 = FakeBinanceAdapter(server_time_ms=5_000_000)
+    fake2 = FakeBinanceAdapter(server_time_ms=1_000_000)
     fake2.server_time_sequence = [7_201_000]
     fake2.fetch_ohlcv = lambda s, t="1m", since=None, limit=None: (  # type: ignore
         [[0, 10.0, 11.0, 9.0, 10.5, 1.0], [3_600_000, 10.0, 11.0, 9.0, 10.5, 1.0]]
@@ -206,7 +206,7 @@ def test_refetched_response_structural_failure_cases() -> None:
         )
 
     # 3. Malformed row (<6 fields) -> MalformedKlineError
-    fake3 = FakeBinanceAdapter(server_time_ms=5_000_000)
+    fake3 = FakeBinanceAdapter(server_time_ms=1_000_000)
     fake3.server_time_sequence = [7_201_000]
     fake3.fetch_ohlcv = lambda s, t="1m", since=None, limit=None: (  # type: ignore
         [[0, 10.0, 11.0]] if limit == 1 else [[0, 10.0, 11.0, 9.0, 10.5, 1.0]]
@@ -225,7 +225,7 @@ def test_refetched_response_structural_failure_cases() -> None:
         )
 
     # 4. Mismatched timestamp -> RefetchTimestampMismatchError
-    fake4 = FakeBinanceAdapter(server_time_ms=5_000_000)
+    fake4 = FakeBinanceAdapter(server_time_ms=1_000_000)
     fake4.server_time_sequence = [7_201_000]
     fake4.fetch_ohlcv = lambda s, t="1m", since=None, limit=None: (  # type: ignore
         [[3_600_000, 10.0, 11.0, 9.0, 10.5, 1.0]] if limit == 1 else [[0, 10.0, 11.0, 9.0, 10.5, 1.0]]

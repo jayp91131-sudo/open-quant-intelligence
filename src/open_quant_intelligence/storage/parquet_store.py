@@ -99,7 +99,7 @@ def write_staging_parquet(
         con.close()
 
     # Flush file buffers to physical disk
-    with open(path, "rb") as f:
+    with open(path, "a+b") as f:
         f.flush()
         os.fsync(f.fileno())
 
@@ -142,9 +142,18 @@ def publish_staging_file_no_clobber(
     t_path.parent.mkdir(parents=True, exist_ok=True)
 
     if t_path.exists():
-        raise DatasetPathCollisionError(
-            f"Target file {t_path} already exists. Ingestion never overwrites existing historical datasets."
-        )
+        staging_sha = compute_file_sha256(s_path)
+        target_sha = compute_file_sha256(t_path)
+        if staging_sha == target_sha:
+            try:
+                s_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return target_sha
+        else:
+            raise DatasetPathCollisionError(
+                f"Target file {t_path} already exists with content that differs from staging artifact."
+            )
 
     if sys.platform == "win32":
         MOVEFILE_WRITE_THROUGH = 0x8

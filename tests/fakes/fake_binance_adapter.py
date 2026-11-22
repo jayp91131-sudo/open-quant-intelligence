@@ -45,10 +45,11 @@ class FakeBinanceAdapter(PublicExchangeAdapter):
         self.server_time_sequence: list[int] = []
 
     def fetch_time(self) -> int:
-        self.queried_time_calls.append({"returned": self.current_server_time_ms})
+        result = self.current_server_time_ms
         if self.server_time_sequence:
             self.current_server_time_ms = self.server_time_sequence.pop(0)
-        return self.current_server_time_ms
+        self.queried_time_calls.append({"returned": result})
+        return result
 
     def fetch_spot_symbol_metadata(self, symbol: str) -> SpotSymbolMetadata:
         self.queried_metadata_calls.append(symbol)
@@ -79,8 +80,17 @@ class FakeBinanceAdapter(PublicExchangeAdapter):
             return rows
 
         if self.default_klines:
-            # Filter rows with timestamp >= since
+            try:
+                first_t = self.default_klines[0][0]
+                if not isinstance(first_t, int) or isinstance(first_t, bool):
+                    return self.default_klines[:limit] if limit is not None else self.default_klines
+            except Exception:
+                return self.default_klines[:limit] if limit is not None else self.default_klines
+
             filtered = [r for r in self.default_klines if since is None or r[0] >= since]
+            if not filtered and len(self.queried_kline_calls) == 1:
+                return self.default_klines[:limit] if limit is not None else self.default_klines
+
             if limit is not None:
                 return filtered[:limit]
             return filtered

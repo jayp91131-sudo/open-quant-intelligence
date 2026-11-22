@@ -2,6 +2,7 @@
 
 import math
 import time
+from typing import Any
 
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.ingestion.adapter import PublicExchangeAdapter, RawKlineRow
@@ -80,16 +81,16 @@ def paginate_ohlcv(
     clock: ServerTimeObserver,
     max_tail_retries: int = 3,
     retry_delay_seconds: float = 2.0,
+    max_retries: int | None = None,
+    poll_interval_s: float | None = None,
+    **kwargs: Any,
 ) -> list[RawKlineRow]:
-    """Deterministically paginate historical OHLCV from Binance vision public endpoints.
+    """Deterministically paginate historical OHLCV from Binance vision public endpoints."""
+    if max_retries is not None:
+        max_tail_retries = max_retries
+    if poll_interval_s is not None:
+        retry_delay_seconds = poll_interval_s
 
-    Strict Invariants:
-    1. Rows outside [since_ms, until_ms) are discarded before field validation.
-    2. Malformed timestamps raise MalformedPageError without silent skipping.
-    3. Incomplete tail candles discard initial values, preserve cursor, and re-fetch fresh OHLCV upon finalization.
-    4. Re-fetched row must have exactly 1 row, 6 elements, matching timestamp, and valid OHLCV fields.
-    5. Cursor advances strictly monotonically; regression or zero progress raises an error.
-    """
     step_ms = timeframe_to_duration_ms(timeframe)
     expected_count = (until_ms - since_ms) // step_ms
     max_pages = max(50, ((expected_count + 999) // 1000) * 3)
@@ -116,8 +117,10 @@ def paginate_ohlcv(
             if not isinstance(row, (list, tuple)) or len(row) < 1:
                 raise MalformedPageError(f"Row {i} is not a valid sequence: {row!r}")
             t = row[0]
-            if not isinstance(t, int) or isinstance(t, bool) or t < 0:
-                raise MalformedPageError(f"Row {i} timestamp {t!r} is not a valid integer millisecond timestamp.")
+            if not isinstance(t, int) or isinstance(t, bool):
+                raise MalformedPageError(f"Row {i} timestamp must be an int millisecond timestamp, got {t!r}.")
+            if t < 0:
+                raise MalformedPageError(f"Row {i} has negative timestamp: {t}")
             if page_timestamps and t <= page_timestamps[-1]:
                 raise MalformedPageError(f"Page timestamps not strictly increasing: {page_timestamps[-1]} -> {t}")
             page_timestamps.append(t)
@@ -126,9 +129,10 @@ def paginate_ohlcv(
         max_raw_t = page_timestamps[-1]
 
         # 3. Non-Advancing & Regression Checks
-        if max_raw_t < current_since_ms:
+        if max_raw_t < current_since_ms or (max_raw_t == current_since_ms and current_since_ms in seen_timestamps):
             raise PaginationRegressionError(
-                f"Page regression: max timestamp {max_raw_t}ms is before cursor {current_since_ms}ms"
+                f"Page did not advance cursor: current_since_ms={current_since_ms}, "
+                f"page min={first_raw_t}, max={max_raw_t}"
             )
 
         # 4. Extract In-Range Rows
@@ -194,7 +198,8 @@ def paginate_ohlcv(
 
                 if not finalized:
                     raise IncompleteTailCandleError(
-                        f"Candle at open_time {open_ms}ms remained forming after retries. Aborting ingestion."
+                        f"Candle at open_time {open_ms}ms remained forming and exhausted all retries. "
+                        "Aborting ingestion."
                     )
             else:
                 # Candle is fully closed: validate numeric OHLCV fields and admit

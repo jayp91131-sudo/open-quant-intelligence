@@ -163,10 +163,12 @@ class DuckDBCatalog:
                    OR content_fingerprint_sha256 = ?
                    OR content_fingerprint_sha256 = ('sha256:' || ?)
                    OR ingestion_uuid = ?
+                   OR symbol = ?
+                   OR dataset_identity = ?
                 ORDER BY ingested_at DESC
                 LIMIT 1
                 """,
-                [identifier, identifier, identifier, identifier],
+                [identifier, identifier, identifier, identifier, identifier, identifier],
             ).fetchone()
 
             if not res:

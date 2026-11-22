@@ -22,12 +22,13 @@ def normalize_float(val: float) -> float:
 
 def compute_content_fingerprint(
     candles: Sequence[Candle],
-    arg2: Any = "binance",
-    arg3: Any = "spot",
-    arg4: Any = "BTC/USDT",
-    arg5: Any = "1h",
+    exchange_id: Any = "binance",
+    market_type: Any = "spot",
+    symbol: str = "BTC/USDT",
+    timeframe: Any = "1h",
     requested_since_ms: int = 0,
     requested_until_ms: int = 0,
+    **kwargs: Any,
 ) -> str:
     """Compute canonical binary content fingerprint SHA-256 digest.
 
@@ -51,17 +52,17 @@ def compute_content_fingerprint(
         - quote_volume present: UINT8 (0 or 1) + [DOUBLE_LE if 1]
         - trade_count present: UINT8 (0 or 1) + [INT64_LE if 1]
     """
-    if isinstance(arg2, MarketIdentity):
-        market = arg2
-        exchange_id = market.exchange_id
-        market_type = market.market_type
-        symbol = market.symbol
-        timeframe = arg3.value if isinstance(arg3, SupportedTimeframe) else str(arg3)
+    if isinstance(exchange_id, MarketIdentity):
+        market = exchange_id
+        ex_id = market.exchange_id
+        m_type = market.market_type
+        sym = market.symbol
+        tf = market_type.value if isinstance(market_type, SupportedTimeframe) else str(market_type)
     else:
-        exchange_id = str(arg2)
-        market_type = str(arg3)
-        symbol = str(arg4)
-        timeframe = arg5.value if isinstance(arg5, SupportedTimeframe) else str(arg5)
+        ex_id = str(exchange_id)
+        m_type = str(market_type)
+        sym = str(symbol)
+        tf = timeframe.value if isinstance(timeframe, SupportedTimeframe) else str(timeframe)
     hasher = hashlib.sha256()
 
     # Magic and schema version
@@ -69,7 +70,7 @@ def compute_content_fingerprint(
     hasher.update(struct.pack("<H", 1))
 
     # String identity fields
-    for s_field in [exchange_id, market_type, symbol, timeframe]:
+    for s_field in [ex_id, m_type, sym, tf]:
         b = s_field.encode("utf-8")
         hasher.update(struct.pack("<H", len(b)))
         hasher.update(b)

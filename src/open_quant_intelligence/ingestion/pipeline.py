@@ -337,6 +337,12 @@ class IngestionPipeline:
             timeframe=timeframe,
         )
 
+        if fail_on_gaps and quality_report.missing_intervals > 0:
+            raise GapFailureError(
+                f"Dataset contains {quality_report.missing_intervals} gap intervals "
+                "across requested window and fail_on_gaps is True."
+            )
+
         content_fingerprint = compute_content_fingerprint(
             candles=candles,
             exchange_id=exchange_id,

@@ -6,8 +6,12 @@ from enum import Enum
 from typing import Any, Sequence
 
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.ingestion.time_utils import timeframe_to_duration_ms
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe, timeframe_to_timedelta
+
+
+def _timeframe_to_duration_ms(tf: Any) -> int:
+    return int(timeframe_to_timedelta(tf).total_seconds() * 1000)
+
 
 EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -102,40 +106,32 @@ class DataQualityReport:
 
 def analyze_dataset_quality(
     candles: Sequence[Candle],
-    arg2: Any,
-    arg3: Any,
-    arg4: Any | None = None,
+    since_ms: Any = None,
+    until_ms: Any = None,
+    timeframe: Any = None,
+    *args: Any,
+    **kwargs: Any,
 ) -> DataQualityReport:
     """Analyze full requested-window coverage, detecting leading, internal, and trailing gaps.
 
     Supports both (candles, since_ms, until_ms, timeframe) and (candles, timeframe, since_ms, until_ms).
-
-    Args:
-        candles: Sequence of validated immutable Candle domain instances sorted chronologically.
-        since_ms: Exact inclusive start boundary in integer epoch milliseconds.
-        until_ms: Exact exclusive upper boundary in integer epoch milliseconds.
-        timeframe: Supported candle timeframe enum member.
-
-    Returns:
-        DataQualityReport with comprehensive gap distribution and coverage stats.
-
-    Raises:
-        ValueError: If until_ms <= since_ms or boundaries are not grid-aligned.
-        UnalignedCandleError: If any candle open timestamp does not align to the timeframe grid.
-        InconsistentGapStatisticsError: If record_count + missing_intervals != expected_records.
     """
-    if isinstance(arg2, SupportedTimeframe):
-        timeframe = arg2
-        since_ms = int(arg3)
-        until_ms = int(arg4)
+    if isinstance(since_ms, SupportedTimeframe):
+        resolved_tf = since_ms
+        resolved_since_ms = int(until_ms)
+        resolved_until_ms = int(timeframe)
     else:
-        since_ms = int(arg2)
-        until_ms = int(arg3)
-        timeframe = arg4
+        resolved_since_ms = int(since_ms)
+        resolved_until_ms = int(until_ms)
+        resolved_tf = timeframe
+
+    since_ms = resolved_since_ms
+    until_ms = resolved_until_ms
+    timeframe = resolved_tf
     if until_ms <= since_ms:
         raise ValueError(f"until_ms ({until_ms}) must be strictly greater than since_ms ({since_ms})")
 
-    step_ms = timeframe_to_duration_ms(timeframe)
+    step_ms = _timeframe_to_duration_ms(timeframe)
     if since_ms % step_ms != 0:
         raise ValueError(f"since_ms ({since_ms}) is not grid-aligned to {timeframe.value} ({step_ms}ms)")
     if until_ms % step_ms != 0:
