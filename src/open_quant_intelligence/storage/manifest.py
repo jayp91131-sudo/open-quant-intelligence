@@ -130,7 +130,7 @@ def is_lease_active(manifest: "IngestionManifest") -> bool:
 def _atomic_publish_no_clobber(src: Path, dst: Path) -> bool:
     """Atomically move or link src to dst without clobbering dst if dst exists.
 
-    Returns True if publication succeeded (src was moved/linked to dst, dst did not exist).
+    Returns True if publication succeeded (dst was created/linked from src, dst did not exist).
     Returns False if dst already exists (no-clobber guarantee: dst remains untouched).
     """
     if sys.platform == "win32":
@@ -147,10 +147,93 @@ def _atomic_publish_no_clobber(src: Path, dst: Path) -> bool:
         # if dst exists, then unlink src.
         try:
             os.link(str(src), str(dst))
-            os.unlink(str(src))
-            return True
         except (FileExistsError, OSError):
             return False
+
+        # Publication succeeded: dst is now created and points to the data!
+        # Handle cleanup of temporary src independently so failure here does NOT
+        # invalidate the successful publication.
+        try:
+            os.unlink(str(src))
+        except OSError:
+            pass
+        return True
+
+
+class _ReclaimAdvisoryLock:
+    """OS-level advisory file lock for serializing stale lock reclamation.
+
+    Guarantees kernel-level single-reclaimer mutual exclusion across processes.
+    If a process terminates or crashes, the OS kernel automatically releases
+    the advisory lock, eliminating unsynchronized observation races.
+    """
+
+    def __init__(self, lock_path: Path) -> None:
+        self.path = lock_path
+        self.fd: int | None = None
+
+    def try_acquire(self) -> bool:
+        """Attempt non-blocking acquisition of OS-level advisory lock."""
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT)
+                try:
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b"0")
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    self.fd = fd
+                    return True
+                except (OSError, PermissionError):
+                    os.close(fd)
+                    return False
+            else:
+                import fcntl
+
+                fd = os.open(str(self.path), os.O_RDWR | os.O_CREAT, 0o666)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.fd = fd
+                    return True
+                except (BlockingIOError, OSError):
+                    os.close(fd)
+                    return False
+        except OSError:
+            return False
+
+    def release(self) -> None:
+        """Release OS-level advisory lock."""
+        if self.fd is not None:
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    try:
+                        os.lseek(self.fd, 0, os.SEEK_SET)
+                        msvcrt.locking(self.fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                else:
+                    import fcntl
+
+                    try:
+                        fcntl.flock(self.fd, fcntl.LOCK_UN)
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = None
+
+    def __enter__(self) -> bool:
+        return self.try_acquire()
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.release()
 
 
 def _safe_delete_lock_file(path: Path, expected_token: str | None) -> bool:
@@ -226,6 +309,7 @@ class ManifestLock:
     def __init__(self, manifest_path: Path, timeout_seconds: float = 5.0) -> None:
         self.lock_path = manifest_path.with_suffix(".lock")
         self.reclaim_path = manifest_path.with_suffix(".lock_reclaim")
+        self.meta_lock_path = manifest_path.with_suffix(".reclaim_meta")
         self.timeout_seconds = timeout_seconds
         self.lock_token = f"lock_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
         self._acquired = False
@@ -235,6 +319,7 @@ class ManifestLock:
         while True:
             # Atomic publication: write complete payload to temp file then publish with no-clobber
             tmp_pub = self.lock_path.with_name(f"{self.lock_path.name}.pub_{uuid.uuid4().hex}")
+            published = False
             try:
                 payload = json.dumps(
                     {
@@ -246,11 +331,18 @@ class ManifestLock:
                 with open(tmp_pub, "wb") as f:
                     f.write(payload)
                     f.flush()
-                if _atomic_publish_no_clobber(tmp_pub, self.lock_path):
+                published = _atomic_publish_no_clobber(tmp_pub, self.lock_path)
+                if published:
                     self._acquired = True
                     return
             finally:
-                tmp_pub.unlink(missing_ok=True)
+                if not published:
+                    tmp_pub.unlink(missing_ok=True)
+                else:
+                    try:
+                        tmp_pub.unlink(missing_ok=True)
+                    except OSError:
+                        pass
 
             self._try_reclaim_stale_lock()
 
@@ -261,92 +353,128 @@ class ManifestLock:
             time.sleep(0.05)
 
     def _try_reclaim_stale_lock(self) -> None:
-        reclaim_token = f"reclaim_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
-        tmp_reclaim = self.reclaim_path.with_name(f"{self.reclaim_path.name}.pub_{uuid.uuid4().hex}")
-        reclaim_acquired = False
-        try:
-            r_payload = json.dumps(
-                {
-                    "token": reclaim_token,
-                    "pid": os.getpid(),
-                    "time": time.time(),
-                }
-            ).encode("utf-8")
-            with open(tmp_reclaim, "wb") as rf:
-                rf.write(r_payload)
-                rf.flush()
-            if _atomic_publish_no_clobber(tmp_reclaim, self.reclaim_path):
-                reclaim_acquired = True
-        finally:
-            tmp_reclaim.unlink(missing_ok=True)
-
-        if not reclaim_acquired:
-            # Another process is holding the reclamation lock: check if it is stale or malformed
-            try:
-                if not self.reclaim_path.is_file():
-                    return
-                with open(self.reclaim_path, "r", encoding="utf-8") as rf:
-                    rcontent = rf.read().strip()
-                if not rcontent:
-                    if time.time() - self.reclaim_path.stat().st_mtime >= 0.05:
-                        _safe_delete_lock_file(self.reclaim_path, expected_token=None)
-                    return
-                rdata = json.loads(rcontent)
-                if not isinstance(rdata, dict):
-                    if time.time() - self.reclaim_path.stat().st_mtime >= 0.05:
-                        _safe_delete_lock_file(self.reclaim_path, expected_token=None)
-                    return
-                rpid = rdata.get("pid", 0)
-                rtoken = rdata.get("token", "")
-                if isinstance(rpid, int) and rpid > 0 and isinstance(rtoken, str) and rtoken:
-                    if not is_pid_alive(rpid):
-                        _safe_delete_lock_file(self.reclaim_path, expected_token=rtoken)
-            except Exception:
-                pass
+        guard = _ReclaimAdvisoryLock(self.meta_lock_path)
+        if not guard.try_acquire():
+            # Another process is actively performing reclamation; do not overlap
             return
 
         try:
-            if not self.lock_path.is_file():
+            # 1. Under advisory lock guard, reconcile any existing .lock_reclaim
+            if self.reclaim_path.is_file():
+                try:
+                    with open(self.reclaim_path, "r", encoding="utf-8") as rf:
+                        rcontent = rf.read().strip()
+                except Exception:
+                    rcontent = ""
+
+                if not rcontent:
+                    if time.time() - self.reclaim_path.stat().st_mtime >= 0.05:
+                        _safe_delete_lock_file(self.reclaim_path, expected_token=None)
+                    else:
+                        return
+                else:
+                    try:
+                        rdata = json.loads(rcontent)
+                    except Exception:
+                        rdata = None
+
+                    if not isinstance(rdata, dict):
+                        if time.time() - self.reclaim_path.stat().st_mtime >= 0.05:
+                            _safe_delete_lock_file(self.reclaim_path, expected_token=None)
+                        else:
+                            return
+                    else:
+                        rpid = rdata.get("pid", 0)
+                        rtoken = rdata.get("token", "")
+                        if not isinstance(rpid, int) or rpid <= 0 or not isinstance(rtoken, str) or not rtoken:
+                            if time.time() - self.reclaim_path.stat().st_mtime >= 0.05:
+                                _safe_delete_lock_file(self.reclaim_path, expected_token=None)
+                            else:
+                                return
+                        else:
+                            # Conservative PID liveness check
+                            if not is_pid_alive(rpid):
+                                _safe_delete_lock_file(self.reclaim_path, expected_token=rtoken)
+                            else:
+                                return
+
+            # 2. Acquire .lock_reclaim under advisory lock guard
+            reclaim_token = f"reclaim_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
+            tmp_reclaim = self.reclaim_path.with_name(f"{self.reclaim_path.name}.pub_{uuid.uuid4().hex}")
+            reclaim_published = False
+            try:
+                r_payload = json.dumps(
+                    {
+                        "token": reclaim_token,
+                        "pid": os.getpid(),
+                        "time": time.time(),
+                    }
+                ).encode("utf-8")
+                with open(tmp_reclaim, "wb") as rf:
+                    rf.write(r_payload)
+                    rf.flush()
+                reclaim_published = _atomic_publish_no_clobber(tmp_reclaim, self.reclaim_path)
+            finally:
+                if not reclaim_published:
+                    tmp_reclaim.unlink(missing_ok=True)
+                else:
+                    try:
+                        tmp_reclaim.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+
+            if not reclaim_published:
                 return
 
             try:
-                with open(self.lock_path, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-            except Exception:
-                content = ""
+                if not self.lock_path.is_file():
+                    return
 
-            if not content:
-                # Interrupted lock creation (empty file) or crash before writing
-                if time.time() - self.lock_path.stat().st_mtime >= 0.05:
-                    _safe_delete_lock_file(self.lock_path, expected_token=None)
-                return
+                try:
+                    with open(self.lock_path, "r", encoding="utf-8") as f:
+                        content = f.read().strip()
+                except Exception:
+                    content = ""
 
-            try:
-                data = json.loads(content)
-            except Exception:
-                # Malformed JSON in lock file
-                if time.time() - self.lock_path.stat().st_mtime >= 0.05:
-                    _safe_delete_lock_file(self.lock_path, expected_token=None)
-                return
+                if not content:
+                    # Interrupted lock creation (empty file) or crash before writing
+                    if time.time() - self.lock_path.stat().st_mtime >= 0.05:
+                        _safe_delete_lock_file(self.lock_path, expected_token=None)
+                    return
 
-            if not isinstance(data, dict):
-                if time.time() - self.lock_path.stat().st_mtime >= 0.05:
-                    _safe_delete_lock_file(self.lock_path, expected_token=None)
-                return
+                try:
+                    data = json.loads(content)
+                except Exception:
+                    # Malformed JSON in lock file
+                    if time.time() - self.lock_path.stat().st_mtime >= 0.05:
+                        _safe_delete_lock_file(self.lock_path, expected_token=None)
+                    return
 
-            owner_pid = data.get("pid", 0)
-            owner_token = data.get("token", "")
+                if not isinstance(data, dict):
+                    if time.time() - self.lock_path.stat().st_mtime >= 0.05:
+                        _safe_delete_lock_file(self.lock_path, expected_token=None)
+                    return
 
-            if not isinstance(owner_pid, int) or owner_pid <= 0 or not isinstance(owner_token, str) or not owner_token:
-                if time.time() - self.lock_path.stat().st_mtime >= 0.05:
-                    _safe_delete_lock_file(self.lock_path, expected_token=None)
-                return
+                owner_pid = data.get("pid", 0)
+                owner_token = data.get("token", "")
 
-            # Check if lock owner PID is dead (conservative: alive/access-denied treated as alive)
-            if not is_pid_alive(owner_pid):
-                _safe_delete_lock_file(self.lock_path, expected_token=owner_token)
+                if (
+                    not isinstance(owner_pid, int)
+                    or owner_pid <= 0
+                    or not isinstance(owner_token, str)
+                    or not owner_token
+                ):
+                    if time.time() - self.lock_path.stat().st_mtime >= 0.05:
+                        _safe_delete_lock_file(self.lock_path, expected_token=None)
+                    return
+
+                # Check if lock owner PID is dead (conservative: alive/access-denied treated as alive)
+                if not is_pid_alive(owner_pid):
+                    _safe_delete_lock_file(self.lock_path, expected_token=owner_token)
+            finally:
+                _safe_delete_lock_file(self.reclaim_path, expected_token=reclaim_token)
         finally:
-            _safe_delete_lock_file(self.reclaim_path, expected_token=reclaim_token)
+            guard.release()
 
     @classmethod
     def reclaim_stale_locks(cls, manifest_path: Path) -> None:

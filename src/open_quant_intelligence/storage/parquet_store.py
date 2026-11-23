@@ -54,6 +54,7 @@ def write_staging_parquet(
 
     con = duckdb.connect(":memory:")
     try:
+        con.execute("SET TimeZone = 'UTC'")
         # Register in-memory data
         con.execute(
             """

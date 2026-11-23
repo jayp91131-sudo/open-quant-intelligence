@@ -1,6 +1,7 @@
 """Crash recovery engine for interrupted ingestion jobs and manifest lifecycle reconciliation."""
 
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -60,6 +61,16 @@ class RecoveryAction:
     target_file_sha256: str | None = None
 
 
+SHA256_FINGERPRINT_REGEX = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def is_valid_content_fingerprint(fp: Any) -> bool:
+    """Validate that fp strictly matches the canonical format sha256:[0-9a-f]{64}."""
+    if not isinstance(fp, str):
+        return False
+    return bool(SHA256_FINGERPRINT_REGEX.fullmatch(fp))
+
+
 def derive_canonical_dataset_paths(
     base_data_dir: Path,
     exchange_id: str,
@@ -68,7 +79,7 @@ def derive_canonical_dataset_paths(
     timeframe: str,
     since_ms: int,
     until_ms: int,
-    content_fingerprint: str,
+    content_fingerprint: str | None,
     ingestion_uuid: str,
 ) -> tuple[Path, Path]:
     """Derive the canonical dataset partition path, staging path, and target path.
@@ -89,7 +100,17 @@ def derive_canonical_dataset_paths(
     )
     since_str = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(since_ms / 1000))
     until_str = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(until_ms / 1000))
-    fp_prefix = content_fingerprint.split(":")[-1][:8] if content_fingerprint else "nofp"
+
+    if content_fingerprint:
+        if not is_valid_content_fingerprint(content_fingerprint):
+            raise RecoveryFailureError(
+                f"Malformed content fingerprint '{content_fingerprint}'. "
+                "Expected exact canonical format: sha256:[0-9a-f]{64}"
+            )
+        fp_prefix = content_fingerprint.split(":")[1][:8]
+    else:
+        fp_prefix = "nofp"
+
     uuid_prefix = ingestion_uuid[:8]
 
     target_name = f"dataset_{since_str}_{until_str}_{fp_prefix}_{uuid_prefix}.parquet"
@@ -232,7 +253,7 @@ def validate_gap_metadata(
         if exp_open < prev_boundary_ms:
             raise RecoveryFailureError(
                 f"Gap at index {idx} expected_open_ms ({exp_open}) overlaps with "
-                f"previous gap boundary ({prev_boundary_ms})."
+                f"previous gap or observed candle boundary ({prev_boundary_ms})."
             )
 
         sub_open = g.get("subsequent_open_ms")
@@ -282,7 +303,7 @@ def validate_gap_metadata(
                     f"LEADING gap missing-count arithmetic error: (subsequent_open_ms - expected_open_ms) "
                     f"({sub_open - exp_open}) != missing_count * step_ms ({missing_count * step_ms})."
                 )
-            prev_boundary_ms = sub_open
+            prev_boundary_ms = sub_open + step_ms
 
         elif g_type == GapType.INTERNAL.value:
             if exp_open <= since_ms:
@@ -304,7 +325,7 @@ def validate_gap_metadata(
                     f"INTERNAL gap missing-count arithmetic error: (subsequent_open_ms - expected_open_ms) "
                     f"({sub_open - exp_open}) != missing_count * step_ms ({missing_count * step_ms})."
                 )
-            prev_boundary_ms = sub_open
+            prev_boundary_ms = sub_open + step_ms
 
         elif g_type == GapType.TRAILING.value:
             if exp_open <= since_ms:
@@ -456,11 +477,10 @@ def validate_dataset_paths(
         manifest_stage_val = manifest.stage.value if hasattr(manifest.stage, "value") else str(manifest.stage)
         if manifest_stage_val in artifact_stages:
             fp = manifest.content_fingerprint_sha256
-            clean_fp = fp.split(":")[-1] if (fp and ":" in fp) else (fp or "")
-            if not clean_fp or len(clean_fp) != 64 or clean_fp == "nofp":
+            if not is_valid_content_fingerprint(fp):
                 raise RecoveryFailureError(
-                    f"Stage '{manifest.stage}' requires a valid 64-character hex content_fingerprint_sha256, "
-                    f"found '{fp}'."
+                    f"Stage '{manifest.stage}' requires a valid canonical content_fingerprint_sha256 "
+                    f"(sha256:[0-9a-f]{{64}}), found '{fp}'."
                 )
 
         if resolved_target is not None:
@@ -519,6 +539,120 @@ def _verify_parquet_file(file_path: Path, expected_record_count: int) -> None:
             f"Physical Parquet row count ({actual_count}) does not match "
             f"manifest.record_count ({expected_record_count})."
         )
+
+
+def verify_parquet_gap_consistency(
+    parquet_path: Path,
+    manifest: IngestionManifest,
+) -> list[QualityGapEvent]:
+    """Reconstruct exact gap events from Parquet timestamps and verify against manifest metadata.
+
+    Raises RecoveryFailureError if the physical Parquet dataset contradicts manifest gaps,
+    record_count, missing_intervals, or gap_count.
+    """
+    if not parquet_path.exists() or not parquet_path.is_file():
+        raise RecoveryFailureError(f"Parquet dataset file {parquet_path} does not exist.")
+
+    con = duckdb.connect(":memory:")
+    try:
+        con.execute("SET TimeZone = 'UTC'")
+        escaped_path = str(parquet_path).replace("'", "''")
+        rows = con.execute(f"SELECT open_time FROM read_parquet('{escaped_path}') ORDER BY open_time ASC").fetchall()
+    except Exception as exc:
+        raise RecoveryFailureError(f"Failed to read Parquet dataset at {parquet_path}: {exc}") from exc
+    finally:
+        con.close()
+
+    physical_count = len(rows)
+    if physical_count != manifest.record_count:
+        raise RecoveryFailureError(
+            f"Physical Parquet row count ({physical_count}) does not match "
+            f"manifest.record_count ({manifest.record_count})."
+        )
+
+    recon_candles = [
+        Candle(
+            exchange_id=manifest.exchange_id,
+            market_type=manifest.market_type,
+            symbol=manifest.symbol,
+            timeframe=manifest.timeframe,
+            open_time=r[0].replace(tzinfo=timezone.utc) if r[0].tzinfo is None else r[0],
+            open=1.0,
+            high=1.0,
+            low=1.0,
+            close=1.0,
+            base_volume=1.0,
+        )
+        for r in rows
+    ]
+    report = analyze_dataset_quality(
+        candles=recon_candles,
+        since_ms=manifest.requested_since_ms,
+        until_ms=manifest.requested_until_ms,
+        timeframe=SupportedTimeframe(manifest.timeframe),
+    )
+    recon_gaps = list(report.gaps)
+
+    if report.expected_records != manifest.expected_records:
+        raise RecoveryFailureError(
+            f"Physical dataset expected records ({report.expected_records}) does not match "
+            f"manifest.expected_records ({manifest.expected_records})."
+        )
+
+    if report.missing_intervals != manifest.missing_intervals:
+        raise RecoveryFailureError(
+            f"Manifest missing_intervals ({manifest.missing_intervals}) contradicts "
+            f"physical Parquet dataset ({report.missing_intervals})."
+        )
+
+    if report.gap_count != manifest.gap_count:
+        raise RecoveryFailureError(
+            f"Manifest gap_count ({manifest.gap_count}) contradicts physical Parquet dataset ({report.gap_count})."
+        )
+
+    if manifest.gaps:
+        if len(manifest.gaps) != len(recon_gaps):
+            raise RecoveryFailureError(
+                f"Manifest stored gaps count ({len(manifest.gaps)}) contradicts "
+                f"physical Parquet dataset gap count ({len(recon_gaps)})."
+            )
+        for idx, (mg, rg) in enumerate(zip(manifest.gaps, recon_gaps, strict=True)):
+            mg_type = mg.get("gap_type")
+            if hasattr(mg_type, "value"):
+                mg_type = mg_type.value
+            if mg_type != rg.gap_type.value:
+                raise RecoveryFailureError(
+                    f"Manifest gap at index {idx} type '{mg_type}' contradicts physical gap '{rg.gap_type.value}'."
+                )
+            if mg.get("expected_open_ms") != rg.expected_open_ms:
+                raise RecoveryFailureError(
+                    f"Manifest gap at index {idx} expected_open_ms ({mg.get('expected_open_ms')}) contradicts "
+                    f"physical gap ({rg.expected_open_ms})."
+                )
+            if mg.get("subsequent_open_ms") != rg.subsequent_open_ms:
+                raise RecoveryFailureError(
+                    f"Manifest gap at index {idx} subsequent_open_ms ({mg.get('subsequent_open_ms')}) contradicts "
+                    f"physical gap ({rg.subsequent_open_ms})."
+                )
+            if mg.get("missing_count") != rg.missing_count:
+                raise RecoveryFailureError(
+                    f"Manifest gap at index {idx} missing_count ({mg.get('missing_count')}) contradicts "
+                    f"physical gap ({rg.missing_count})."
+                )
+
+    # Validate reconstructed gap invariants
+    validate_gap_metadata(
+        gaps=recon_gaps,
+        expected_records=manifest.expected_records,
+        record_count=manifest.record_count,
+        missing_intervals=report.missing_intervals,
+        gap_count=report.gap_count,
+        since_ms=manifest.requested_since_ms,
+        until_ms=manifest.requested_until_ms,
+        timeframe=manifest.timeframe,
+    )
+
+    return recon_gaps
 
 
 def validate_manifest_integrity(
@@ -820,6 +954,7 @@ class RecoveryEngine:
         actual_last_close = None
         con = duckdb.connect(":memory:")
         try:
+            con.execute("SET TimeZone = 'UTC'")
             escaped_path = str(target_path).replace("'", "''")
             res = con.execute(f"SELECT min(open_time), max(close_time) FROM read_parquet('{escaped_path}')").fetchone()
             if res and res[0] is not None and res[1] is not None:
@@ -828,74 +963,12 @@ class RecoveryEngine:
         finally:
             con.close()
 
-        # Reconstruct or deserialize complete gap events
-        gaps: list[QualityGapEvent] = []
-        if manifest.gaps:
-            for g in manifest.gaps:
-                gaps.append(
-                    QualityGapEvent(
-                        gap_type=GapType(g["gap_type"]),
-                        expected_open_ms=g.get("expected_open_ms"),
-                        subsequent_open_ms=g.get("subsequent_open_ms"),
-                        missing_count=g["missing_count"],
-                    )
-                )
-        elif manifest.missing_intervals > 0:
-            if manifest.record_count == 0:
-                report = analyze_dataset_quality(
-                    candles=(),
-                    since_ms=manifest.requested_since_ms,
-                    until_ms=manifest.requested_until_ms,
-                    timeframe=SupportedTimeframe(manifest.timeframe),
-                )
-                gaps = list(report.gaps)
-            else:
-                con = duckdb.connect(":memory:")
-                try:
-                    escaped_path = str(target_path).replace("'", "''")
-                    rows = con.execute(
-                        f"SELECT open_time FROM read_parquet('{escaped_path}') ORDER BY open_time ASC"
-                    ).fetchall()
-                finally:
-                    con.close()
-
-                recon_candles = [
-                    Candle(
-                        exchange_id=manifest.exchange_id,
-                        market_type=manifest.market_type,
-                        symbol=manifest.symbol,
-                        timeframe=manifest.timeframe,
-                        open_time=r[0].replace(tzinfo=timezone.utc) if r[0].tzinfo is None else r[0],
-                        open=1.0,
-                        high=1.0,
-                        low=1.0,
-                        close=1.0,
-                        base_volume=1.0,
-                    )
-                    for r in rows
-                ]
-                report = analyze_dataset_quality(
-                    candles=recon_candles,
-                    since_ms=manifest.requested_since_ms,
-                    until_ms=manifest.requested_until_ms,
-                    timeframe=SupportedTimeframe(manifest.timeframe),
-                )
-                gaps = list(report.gaps)
-
-        gap_count = len(gaps) if gaps else manifest.gap_count
-        missing_intervals = sum(g.missing_count for g in gaps) if gaps else manifest.missing_intervals
-
-        # Requirement D: Validate complete gap invariants before catalog insertion
-        validate_gap_metadata(
-            gaps=gaps,
-            expected_records=manifest.expected_records,
-            record_count=manifest.record_count,
-            missing_intervals=missing_intervals,
-            gap_count=gap_count,
-            since_ms=manifest.requested_since_ms,
-            until_ms=manifest.requested_until_ms,
-            timeframe=manifest.timeframe,
-        )
+        # Requirement C: For artifact stages with readable Parquet files, reconstruct expected
+        # gap events from actual Parquet open_time values, compare reconstructed sequence against
+        # manifest stored gaps before catalog insertion, and reject if manifest contradicts physical dataset.
+        gaps = verify_parquet_gap_consistency(target_path, manifest)
+        gap_count = len(gaps)
+        missing_intervals = sum(g.missing_count for g in gaps)
 
         quality_status = (
             "EMPTY" if manifest.record_count == 0 else ("GAP_FREE" if missing_intervals == 0 else "GAP_CONTAINING")

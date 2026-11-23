@@ -3,6 +3,7 @@
 import json
 import multiprocessing
 import os
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -18,6 +19,7 @@ from open_quant_intelligence.storage.manifest import (
     ManifestManager,
     ManifestStage,
     _atomic_publish_no_clobber,
+    _ReclaimAdvisoryLock,
     _safe_delete_lock_file,
 )
 
@@ -473,3 +475,94 @@ def test_unlink_manifest_and_stale_reclaim_multiprocess_race(tmp_path: Path) -> 
     errors = [e for e in events if e[0] == "error"]
     assert len(errors) == 0, f"Multiprocess race resulted in errors: {errors}"
     assert len(events) >= 2
+
+
+def test_stale_reclaim_aba_race_protection(tmp_path: Path) -> None:
+    """Stale reclamation cannot steal or corrupt a newer reclaimer's .lock_reclaim (ABA race safe)."""
+    manifest_file = tmp_path / "aba_target.json"
+    manifest_file.write_text("{}", encoding="utf-8")
+    lock_file = manifest_file.with_suffix(".lock")
+    reclaim_file = manifest_file.with_suffix(".lock_reclaim")
+    meta_lock_file = manifest_file.with_suffix(".reclaim_meta")
+
+    # Step 1: Stale main lock (dead PID)
+    stale_lock_token = "stale_main_token"
+    lock_file.write_text(
+        json.dumps({"token": stale_lock_token, "pid": 99999999, "time": time.time() - 100}),
+        encoding="utf-8",
+    )
+
+    # Step 2: Stale reclaim lock R0 observed by Process B
+    r0_token = "reclaim_r0_dead"
+    reclaim_file.write_text(
+        json.dumps({"token": r0_token, "pid": 99999999, "time": time.time() - 100}),
+        encoding="utf-8",
+    )
+
+    # Process B reads R0 and observes dead PID. Before deleting, Process B pauses.
+    # Meanwhile, cleanup or previous reclaimer deletes R0.
+    _safe_delete_lock_file(reclaim_file, expected_token=r0_token)
+    assert not reclaim_file.exists()
+
+    # Step 3: Process C acquires the OS-level advisory guard and publishes live reclaim lock R1
+    guard_c = _ReclaimAdvisoryLock(meta_lock_file)
+    assert guard_c.try_acquire() is True
+
+    r1_token = f"reclaim_r1_live_{os.getpid()}"
+    tmp_r1 = reclaim_file.with_name(f"{reclaim_file.name}.pub_r1")
+    tmp_r1.write_text(
+        json.dumps({"token": r1_token, "pid": os.getpid(), "time": time.time()}),
+        encoding="utf-8",
+    )
+    assert _atomic_publish_no_clobber(tmp_r1, reclaim_file) is True
+    assert reclaim_file.exists()
+
+    # Step 4: Process B wakes up with its stale observation of R0 and attempts deletion
+    # Calling _safe_delete_lock_file with expected_token=r0_token
+    deleted = _safe_delete_lock_file(reclaim_file, expected_token=r0_token)
+    assert deleted is False, "Process B must not delete Process C's live reclaim lock R1!"
+
+    # Verify Process C's reclaim lock is completely intact
+    assert reclaim_file.exists()
+    content = json.loads(reclaim_file.read_text(encoding="utf-8"))
+    assert content["token"] == r1_token
+
+    # Step 5: Process D attempts stale reclamation while Process C holds advisory guard
+    guard_d = _ReclaimAdvisoryLock(meta_lock_file)
+    assert guard_d.try_acquire() is False, "Process D must not enter stale reclamation while C is active!"
+
+    # Process C cleans up and releases
+    _safe_delete_lock_file(reclaim_file, expected_token=r1_token)
+    guard_c.release()
+
+    # Now Process D can acquire
+    assert guard_d.try_acquire() is True
+    guard_d.release()
+
+
+def test_publish_link_success_source_unlink_error(monkeypatch: Any, tmp_path: Path) -> None:
+    """Hard-link publication succeeds even if unlinking the source file raises OSError."""
+    src = tmp_path / "test_src.tmp"
+    dst = tmp_path / "test_dst.dat"
+    src.write_text("test_content", encoding="utf-8")
+
+    orig_unlink = os.unlink
+
+    def mock_unlink(path: Any, *args: Any, **kwargs: Any) -> None:
+        if str(path) == str(src):
+            raise OSError("Simulated unlink failure on source file")
+        orig_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", mock_unlink)
+
+    if sys.platform != "win32":
+        published = _atomic_publish_no_clobber(src, dst)
+        assert published is True
+        assert dst.exists()
+        assert dst.read_text(encoding="utf-8") == "test_content"
+    else:
+        manifest_file = tmp_path / "unlink_err_manifest.json"
+        manifest_file.write_text("{}", encoding="utf-8")
+        lock = ManifestLock(manifest_file)
+        with lock:
+            assert lock.lock_path.exists()

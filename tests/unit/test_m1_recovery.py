@@ -1,5 +1,6 @@
 """Tests for crash recovery, manifest lifecycle reconciliation, integrity, and gap preservation."""
 
+import json
 import multiprocessing
 import os
 import time
@@ -21,6 +22,8 @@ from open_quant_intelligence.ingestion.recovery import (
     RecoveryEngine,
     RecoveryFailureError,
     derive_canonical_dataset_paths,
+    is_valid_content_fingerprint,
+    validate_gap_metadata,
 )
 from open_quant_intelligence.storage.catalog import DuckDBCatalog
 from open_quant_intelligence.storage.fingerprint import (
@@ -30,6 +33,8 @@ from open_quant_intelligence.storage.fingerprint import (
 from open_quant_intelligence.storage.manifest import (
     IngestionManifest,
     InvalidStageTransitionError,
+    ManifestLock,
+    ManifestLockError,
     ManifestManager,
     ManifestStage,
     is_lease_active,
@@ -90,7 +95,7 @@ def _worker_pipeline_hold_staging(
             write_staging_parquet(staging_path, candles, record_count=2)
             mgr.write_manifest(manifest)
 
-            out_queue.put(("staged", os.getpid(), str(staging_path)))
+            out_queue.put(("staged", os.getpid(), str(staging_path), lock.lock_token))
             ready_event.set()
 
             # Hold the lock and staging file until test process signals release
@@ -120,7 +125,7 @@ def make_test_manifest_and_paths(
     stage_val = stage.value if hasattr(stage, "value") else str(stage)
     if content_fingerprint is None:
         if stage_val in {"STAGED", "PUBLISHING", "PUBLISHED", "COMMITTING_CATALOG", "COMMITTED", "CLEANUP"}:
-            fp = "a" * 64
+            fp = "sha256:" + ("a" * 64)
         else:
             fp = ""
     else:
@@ -1272,7 +1277,7 @@ def test_missing_fingerprint_in_artifact_stages_rejected(
         file_sha256="sha256:" + ("e" * 64),
     )
     mgr.write_manifest(manifest)
-    with pytest.raises(RecoveryFailureError, match="requires a valid 64-character hex content_fingerprint_sha256"):
+    with pytest.raises(RecoveryFailureError, match="Malformed content fingerprint|requires a valid canonical"):
         engine.scan_and_recover()
 
 
@@ -1322,14 +1327,35 @@ def test_cross_process_pipeline_and_recovery_safety(
             worker_events.append(out_queue.get())
         errors = [e for e in worker_events if e[0] == "error"]
         assert len(errors) == 0, f"Worker process error: {errors}"
+        worker_pid = worker_events[0][1]
         staging_path = Path(worker_events[0][2])
+        initial_lock_token = worker_events[0][3]
+
         assert staging_path.exists()
         initial_bytes = staging_path.read_bytes()
         initial_sha = compute_file_sha256(staging_path)
 
+        # Invariant: Active writer's lock token exists and matches
+        lock_file = mgr.manifest_path_for(test_uuid).with_suffix(".lock")
+        assert lock_file.exists()
+        lock_data = json.loads(lock_file.read_text(encoding="utf-8"))
+        assert lock_data["token"] == initial_lock_token
+        assert lock_data["pid"] == worker_pid
+
+        # Invariant: No recovery process can enter the critical section while writer owns lock
+        with pytest.raises(ManifestLockError):
+            with ManifestLock(mgr.manifest_path_for(test_uuid), timeout_seconds=0.1):
+                pass
+
         # Process B (Recovery) scans and recovers
         recovered_actions = engine.scan_and_recover()
         assert len(recovered_actions) == 0
+
+        # Invariant: Active writer's lock token remains unchanged during recovery
+        assert lock_file.exists()
+        lock_data_after = json.loads(lock_file.read_text(encoding="utf-8"))
+        assert lock_data_after["token"] == initial_lock_token
+        assert lock_data_after["pid"] == worker_pid
 
         # Invariant: Active pipeline artifacts must NOT be deleted or modified
         assert staging_path.exists()
@@ -1345,9 +1371,234 @@ def test_cross_process_pipeline_and_recovery_safety(
         # Signal Process A to release its lock and finish
         release_event.set()
         proc.join(timeout=5.0)
+        assert proc.is_alive() is False
+        assert proc.exitcode == 0
 
     # After Process A has terminated/released lock:
     man_after = mgr.read_manifest(test_uuid)
     if man_after is not None:
         # Next recovery behaves correctly without error
         engine.scan_and_recover()
+
+
+def test_sha256_canonical_fingerprint_validation(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Workstream B: Validate exact canonical format sha256:[0-9a-f]{64} and reject malformed/non-hex."""
+    mgr, _, base_dir, engine = recovery_env
+    valid_fp = "sha256:" + ("a" * 64)
+    assert is_valid_content_fingerprint(valid_fp) is True
+
+    # 1. Reject 64 non-hex characters (e.g. 64 'z's)
+    bad_non_hex = "sha256:" + ("z" * 64)
+    assert is_valid_content_fingerprint(bad_non_hex) is False
+    with pytest.raises(RecoveryFailureError, match="Malformed content fingerprint"):
+        derive_canonical_dataset_paths(
+            base_data_dir=base_dir,
+            exchange_id="binance",
+            market_type="spot",
+            symbol="BTC/USDT",
+            timeframe="1h",
+            since_ms=0,
+            until_ms=7_200_000,
+            content_fingerprint=bad_non_hex,
+            ingestion_uuid=str(uuid.uuid4()),
+        )
+
+    # 2. Reject incorrect prefixes or bare hash
+    assert is_valid_content_fingerprint("md5:" + ("a" * 64)) is False
+    assert is_valid_content_fingerprint("sha512:" + ("a" * 64)) is False
+    assert is_valid_content_fingerprint("a" * 64) is False
+    assert is_valid_content_fingerprint(" sha256:" + ("a" * 64)) is False
+    assert is_valid_content_fingerprint("sha256:" + ("A" * 64)) is False  # Must be lowercase hex
+
+    # 3. Artifact stage with non-hex fingerprint rejected by scan_and_recover
+    test_uuid = str(uuid.uuid4())
+    canonical_staging, canonical_target = derive_canonical_dataset_paths(
+        base_data_dir=base_dir,
+        exchange_id="binance",
+        market_type="spot",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        since_ms=0,
+        until_ms=7_200_000,
+        content_fingerprint=valid_fp,
+        ingestion_uuid=test_uuid,
+    )
+    manifest = IngestionManifest(
+        ingestion_uuid=test_uuid,
+        stage=ManifestStage.STAGED.value,
+        symbol="BTC/USDT",
+        timeframe="1h",
+        requested_since_ms=0,
+        requested_until_ms=7_200_000,
+        expected_records=2,
+        record_count=2,
+        missing_intervals=0,
+        gap_count=0,
+        gaps=[],
+        content_fingerprint_sha256=bad_non_hex,  # Injected non-hex
+        file_sha256=valid_fp,
+        staging_file_path=str(canonical_staging),
+        target_file_path=str(canonical_target),
+    )
+    mgr.write_manifest(manifest)
+    with pytest.raises(RecoveryFailureError, match="Malformed content fingerprint|requires a valid canonical"):
+        engine.scan_and_recover()
+
+
+def test_gap_chronology_leading_internal_boundary_collision_rejected() -> None:
+    """Workstream C: Reject next gap starting at previous gap's subsequent_open_ms; accept valid chronology."""
+    since_ms = 0
+    until_ms = 18_000_000  # 5 hours
+
+    # LEADING gap [0, 3_600_000), candle at 3_600_000 occupies [3_600_000, 7_200_000).
+    # Collision: INTERNAL gap incorrectly configured starting at 3_600_000 (same as subsequent_open_ms)
+    colliding_gaps = [
+        {
+            "gap_type": "LEADING",
+            "expected_open_ms": 0,
+            "subsequent_open_ms": 3_600_000,
+            "missing_count": 1,
+        },
+        {
+            "gap_type": "INTERNAL",
+            "expected_open_ms": 3_600_000,  # Collision!
+            "subsequent_open_ms": 7_200_000,
+            "missing_count": 1,
+        },
+    ]
+    with pytest.raises(RecoveryFailureError, match="overlaps with previous gap or observed candle boundary"):
+        validate_gap_metadata(
+            gaps=colliding_gaps,
+            expected_records=5,
+            record_count=3,
+            missing_intervals=2,
+            gap_count=2,
+            since_ms=since_ms,
+            until_ms=until_ms,
+            timeframe="1h",
+        )
+
+    # Valid sequence:
+    # LEADING: [0, 3_600_000) (missing 1)
+    # Candle 1: at 3_600_000 (occupies [3_600_000, 7_200_000))
+    # INTERNAL: [7_200_000, 10_800_000) (missing 1)
+    # Candle 2: at 10_800_000 (occupies [10_800_000, 14_400_000))
+    # TRAILING: [14_400_000, 18_000_000) (missing 1)
+    valid_gaps = [
+        {
+            "gap_type": "LEADING",
+            "expected_open_ms": 0,
+            "subsequent_open_ms": 3_600_000,
+            "missing_count": 1,
+        },
+        {
+            "gap_type": "INTERNAL",
+            "expected_open_ms": 7_200_000,
+            "subsequent_open_ms": 10_800_000,
+            "missing_count": 1,
+        },
+        {
+            "gap_type": "TRAILING",
+            "expected_open_ms": 14_400_000,
+            "subsequent_open_ms": None,
+            "missing_count": 1,
+        },
+    ]
+    # Must succeed without error
+    validate_gap_metadata(
+        gaps=valid_gaps,
+        expected_records=5,
+        record_count=2,
+        missing_intervals=3,
+        gap_count=3,
+        since_ms=since_ms,
+        until_ms=until_ms,
+        timeframe="1h",
+    )
+
+
+def test_manifest_gaps_contradicting_parquet_rejected_before_catalog_insert(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Workstream C: Reconstructed Parquet gap events checked against manifest before catalog insertion."""
+    mgr, catalog, base_dir, engine = recovery_env
+    test_uuid = str(uuid.uuid4())
+
+    # Create physical dataset with 2 consecutive candles at 0 and 3_600_000 (gap-free across [0, 7_200_000))
+    candles = _make_test_candles(count=2, start_ms=0, step_ms=3_600_000)
+    c_fp = compute_content_fingerprint(candles, symbol="BTC/USDT", timeframe="1h")
+
+    # Manifest falsely claims 1 LEADING gap:
+    contradicting_gaps = [
+        {
+            "gap_type": "LEADING",
+            "expected_open_ms": 0,
+            "subsequent_open_ms": 3_600_000,
+            "missing_count": 1,
+        }
+    ]
+    manifest, staging_file, target_file = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=test_uuid,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=10_800_000,
+        expected_records=3,
+        record_count=2,
+        missing_intervals=1,
+        gap_count=1,
+        gaps=contradicting_gaps,
+        content_fingerprint=c_fp,
+    )
+    # Write physical gap-free Parquet
+    write_staging_parquet(target_file, candles, record_count=2)
+    target_sha = compute_file_sha256(target_file)
+    manifest.file_sha256 = target_sha
+    mgr.write_manifest(manifest)
+
+    # scan_and_recover must detect contradiction and reject before catalog commit
+    with pytest.raises(RecoveryFailureError, match="contradicts physical"):
+        engine.scan_and_recover()
+
+    # Verify no record was inserted into catalog
+    assert catalog.find_by_id_or_fingerprint(manifest.dataset_identity) is None
+
+
+def test_full_window_and_zero_gap_parity(
+    recovery_env: tuple[ManifestManager, DuckDBCatalog, Path, RecoveryEngine],
+) -> None:
+    """Workstream C: Verify FULL_WINDOW (legitimate empty) and zero-gap (GAP_FREE) parity."""
+    mgr, catalog, base_dir, engine = recovery_env
+
+    # 1. Zero-gap (GAP_FREE) recovery
+    uuid_gapfree = str(uuid.uuid4())
+    candles_gapfree = _make_test_candles(count=2, start_ms=0, step_ms=3_600_000)
+    fp_gapfree = compute_content_fingerprint(candles_gapfree, symbol="BTC/USDT", timeframe="1h")
+
+    man_gf, stg_gf, tgt_gf = make_test_manifest_and_paths(
+        base_dir=base_dir,
+        test_uuid=uuid_gapfree,
+        stage=ManifestStage.PUBLISHED,
+        since_ms=0,
+        until_ms=7_200_000,
+        expected_records=2,
+        record_count=2,
+        missing_intervals=0,
+        gap_count=0,
+        gaps=[],
+        content_fingerprint=fp_gapfree,
+    )
+    write_staging_parquet(tgt_gf, candles_gapfree, record_count=2)
+    man_gf.file_sha256 = compute_file_sha256(tgt_gf)
+    mgr.write_manifest(man_gf)
+
+    actions = engine.scan_and_recover()
+    assert len(actions) == 1
+    assert actions[0].action_taken == "COMPLETED_INGESTION_AND_CLEANUP"
+    rec_gf = catalog.find_by_id_or_fingerprint(man_gf.dataset_identity)
+    assert rec_gf is not None
+    assert rec_gf.quality_status == "GAP_FREE"
+    assert rec_gf.gap_count == 0
+    assert rec_gf.missing_intervals == 0
