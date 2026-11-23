@@ -178,6 +178,7 @@ class BinanceVisionPublicAdapter:
                     "enableRateLimit": True,
                     "options": {
                         "defaultType": "spot",
+                        "fetchMarkets": ["spot"],
                         "adjustForTimeDifference": False,
                     },
                     "urls": {
@@ -191,6 +192,8 @@ class BinanceVisionPublicAdapter:
             self._exchange = exchange_instance
 
         # Sanitize URLs explicitly: purge all private, SAPI, futures, options, and WS entries
+        if hasattr(self._exchange, "options") and isinstance(self._exchange.options, dict):
+            self._exchange.options["fetchMarkets"] = ["spot"]
         self._exchange.urls["api"] = {
             "public": "https://data-api.binance.vision/api/v3",
         }
