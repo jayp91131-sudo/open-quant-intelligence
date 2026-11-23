@@ -9,6 +9,10 @@ from typing import Any
 import duckdb
 
 from open_quant_intelligence.storage.fingerprint import compute_file_sha256
+from open_quant_intelligence.storage.manifest import (
+    DurabilityMode,
+    sync_directory,
+)
 
 
 class StorageError(Exception):
@@ -50,6 +54,7 @@ def write_staging_parquet(
 
     con = duckdb.connect(":memory:")
     try:
+        con.execute("SET TimeZone = 'UTC'")
         # Register in-memory data
         con.execute(
             """
@@ -128,6 +133,7 @@ def write_staging_parquet(
 def publish_staging_file_no_clobber(
     staging_path: Path | str,
     target_path: Path | str,
+    durability_mode: DurabilityMode | str = DurabilityMode.DEGRADED_ALLOWED,
 ) -> str:
     """Atomically publish staging Parquet file to target path without clobbering.
 
@@ -136,6 +142,7 @@ def publish_staging_file_no_clobber(
 
     Raises:
         DatasetPathCollisionError: If target_path already exists.
+        DurabilityError: If directory sync fails on POSIX and durability_mode is STRICT.
     """
     s_path = Path(staging_path)
     t_path = Path(target_path)
@@ -182,13 +189,6 @@ def publish_staging_file_no_clobber(
         os.unlink(str(s_path))
 
         # Parent directory sync
-        try:
-            dir_fd = os.open(str(t_path.parent), os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+        sync_directory(t_path.parent, durability_mode=durability_mode)
 
     return compute_file_sha256(t_path)
