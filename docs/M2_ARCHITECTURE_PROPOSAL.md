@@ -57,8 +57,8 @@ $$\text{StrategyDecision} = \text{Evaluator}(\text{StrategyOutput}, \text{Verifi
 ### Core Objectives of M2:
 
 1. **Strict Future-Data Isolation:** Separate strategy-visible causal inputs from full-dataset snapshot provenance. Strategy implementations evaluate only historical candle prefixes and causal metadata available at or before candle close $T_{\text{close}}$. Full dataset fingerprints, requested window bounds extending past $T$, and full-window quality reports remain strictly evaluator-owned.
-2. **Distinct Verification Stages:** Separate dataset-level snapshot verification (confirming that supplied candle series matches M1 snapshot metadata, record counts, and checksums) from per-candle strategy evaluation (constructing causal prefixes, deriving prefix data quality, and enforcing gap policy).
-3. **Rigorous Context Consistency:** Define exhaustive consistency validation for evaluator-held `EvaluationContext` (type checks rejecting booleans/floats for timestamps, grid alignment via `timeframe_to_timedelta()`, full-string regex, and authoritative M1 `DataQualityReport` mathematical invariants).
+2. **Distinct Verification Stages:** Separate dataset-level snapshot verification (confirming that supplied candle series matches M1 snapshot metadata, record counts, and canonical content fingerprint) from per-candle strategy evaluation (constructing causal prefixes, deriving prefix data quality, and enforcing gap policy).
+3. **Rigorous Context Consistency:** Define exhaustive consistency validation for evaluator-held `EvaluationContext` (typed `MarketIdentity`, type checks rejecting booleans/floats for timestamps, grid alignment via `timeframe_to_timedelta()`, full-string regex, and authoritative M1 `DataQualityReport` mathematical invariants).
 4. **Explicit, Minimal Strategy Protocol:** Define a formal `Strategy` interface contract with an immutable configuration identity, semantic versioning, declared minimum lookback history, and explicit gap handling policy.
 5. **Deterministic Point-in-Time Evaluation:** Ensure evaluation functions as a pure mathematical transformation of finalized historical candles $[T_{\text{open}}, T_{\text{close}})$. Evaluation is strictly isolated from side effects: zero file I/O, zero network calls, zero database queries, zero system clock access, and zero pseudo-randomness.
 6. **Structured Research Intentions (Signals):** Standardize research signal vocabulary into three unambiguous states: `LONG`, `FLAT`, and `HOLD`. These express directional research intention, completely detached from exchange order execution, position sizing, margin, or leverage.
@@ -78,18 +78,19 @@ Milestone M2 operates strictly as a consumer of M0 domain contracts and M1 datas
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │ M0 — Domain Models & Local Verification                                │
-│   - Candle (Immutable dataclass, frozen=True)                         │
-│   - MarketIdentity (Strict 'spot' market_type)                         │
+│   - Candle (Immutable dataclass, frozen=True: open_time, close_time)   │
+│   - MarketIdentity (exchange_id, market_type='spot', symbol)           │
 │   - SupportedTimeframe (1m, 5m, 15m, 30m, 1h, 4h, 1d)                 │
 │   - Timeframe API: timeframe_to_timedelta()                            │
-│   - Half-Open Intervals: [T_open, T_close) where T_close = T_open + Δ  │
-│   - Validation API: validate_candles()                                │
+│   - Half-Open Intervals: [open_time, close_time)                       │
+│   - Validation API: validate_candles() -> ValidationResult             │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ consumes
 ┌───────────────────────────────────▼────────────────────────────────────┐
 │ M1 — Ingestion, Storage & Catalog Foundation                           │
 │   - Public Binance Vision Ingestion (allowlisted Spot endpoints)       │
 │   - Canonical Parquet Datasets (Snappy compression, immutable)         │
+│   - Canonical Content Fingerprint: compute_content_fingerprint()       │
 │   - DuckDB Snapshot Catalog (CatalogDatasetRecord, dataset_gaps)       │
 │   - Content Fingerprints: sha256:[0-9a-f]{64}                          │
 │   - Quality Analysis: analyze_dataset_quality(), DataQualityReport     │
@@ -100,8 +101,14 @@ Milestone M2 operates strictly as a consumer of M0 domain contracts and M1 datas
                                     │ consumes
 ┌───────────────────────────────────▼────────────────────────────────────┐
 │ M2 — Strategy Interface & Evaluation (THIS PROPOSAL)                   │
-│   - Stage A: Full M1 Snapshot Verification (Precondition)              │
+│   - Stage A: Full M1 Snapshot Verification (Dataset-Level Precondition)│
+│       * Recomputes canonical content fingerprint from supplied candles │
+│       * Verifies record_count, bounds, market identity, and M0 schema  │
 │   - Stage B: Causal Prefix Evaluation per Candle T                     │
+│       * Constructs historical prefix history[:T+1]                     │
+│       * Verifies is_closed for prefix candles                          │
+│       * Derives prefix DataQualityReport over [since, T.close_time)    │
+│       * Enforces strategy gap policy on prefix only                    │
 │   - Strategy Protocol & StrategyConfig (Deeply immutable)              │
 │   - StrategyContext: Causal prefix quality & parameters (No future)    │
 │   - StrategyOutput: Pure causal decision emitted by Strategy           │
@@ -123,9 +130,9 @@ Milestone M2 operates strictly as a consumer of M0 domain contracts and M1 datas
 
 1. **Immutable Domain Models:** `Candle`, `MarketIdentity`, and `SupportedTimeframe` remain frozen. Strategy evaluation accepts `Sequence[Candle]` and cannot alter any candle attribute.
 2. **Half-Open Intervals $[T_{\text{open}}, T_{\text{close}})$:**
-   - $T_{\text{open}}$ is the inclusive start boundary.
-   - $T_{\text{close}} = T_{\text{open}} + \Delta_{\text{timeframe}}$ is the exclusive upper boundary.
-   - A candle finalized at $T_{\text{close}}$ represents all trading activity during $T_{\text{open}} \le t < T_{\text{close}}$.
+   - `open_time` is the inclusive UTC start boundary instant.
+   - `close_time` is the exclusive UTC upper boundary instant (`open_time + timeframe_to_timedelta(timeframe)`).
+   - A candle finalized at `close_time` represents all trading activity during $\text{open\_time} \le t < \text{close\_time}$.
 3. **Strict Chronological Ordering & Uniqueness:** Candle inputs must arrive in strictly ascending order ($T_{\text{open}, i} < T_{\text{open}, i+1}$) without duplicates. Out-of-order candles are rejected with structured errors; auto-sorting is prohibited.
 4. **No Synthetic Data Generation:** Zero forward-filling, zero linear interpolation, and zero hallucinated candles. Missing data intervals are surfaced explicitly via M1 quality metadata.
 5. **Spot-Only Market Support:** All evaluated candles must adhere to `market_type == "spot"`. Short selling, perpetual funding rates, and margin borrows are mathematically excluded from the domain.
@@ -171,25 +178,26 @@ To strictly eliminate **future-data leakage**, M2 separates strategy-visible cau
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Evaluator-Owned: EvaluationContext                                     │
-│   - dataset_identity: str                                              │
-│   - content_fingerprint: str (SHA-256 of entire snapshot)              │
-│   - requested_since_ms, requested_until_ms (Full requested bounds)     │
+│   - market: MarketIdentity (exchange_id, market_type='spot', symbol)   │
 │   - timeframe: SupportedTimeframe                                      │
+│   - requested_since_ms, requested_until_ms (Full requested bounds)     │
+│   - dataset_identity: str (canonical format exchange:type:sym:tf:s:u)  │
+│   - content_fingerprint: str (SHA-256 of entire canonical snapshot)    │
 │   - quality_report: DataQualityReport (Full window quality report)     │
 │   * HELD STRICTLY BY EVALUATOR. NEVER PASSED TO STRATEGY.              │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
            Evaluator derives strictly causal inputs for candle T:
-           1. Causal prefix candles: history = dataset[:T+1]
+           1. Causal prefix candles: history = supplied_candles[:T+1]
            2. Causal prefix quality: analyze_dataset_quality(history, ...)
                                     │
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │ Strategy-Visible: StrategyContext                                      │
-│   - symbol: str                                                        │
+│   - symbol: str (derived from context.market.symbol)                   │
 │   - timeframe: SupportedTimeframe                                      │
 │   - prefix_quality_report: DataQualityReport                           │
-│     (Covering strictly [requested_since_ms, candle_T.close_time_ms))   │
+│     (Covering strictly [requested_since_ms, T.close_time))              │
 │   * CONTAINS ZERO FUTURE DATA, ZERO FUTURE GAPS, ZERO FUTURE HASHES    │
 └────────────────────────────────────────────────────────────────────────┘
 ```
@@ -207,9 +215,9 @@ class StrategyContext:
     """Causal, point-in-time context supplied to strategy evaluation for a specific candle.
     
     Contains strictly causal information available up to the close of the evaluated candle:
-    - symbol: Base/quote symbol being evaluated.
+    - symbol: Canonical symbol string derived from verified market identity.
     - timeframe: SupportedTimeframe of the series.
-    - prefix_quality_report: Authoritative DataQualityReport computed strictly over [since_ms, candle_T.close_time_ms).
+    - prefix_quality_report: Authoritative DataQualityReport computed strictly over [since_ms, candle_T.close_time).
     
     Future data, full dataset bounds, future gap events, and full-snapshot fingerprints
     are strictly excluded to guarantee zero future-data leakage.
@@ -225,6 +233,7 @@ class StrategyContext:
 ```python
 import re
 from dataclasses import dataclass
+from open_quant_intelligence.domain.market import MarketIdentity
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe, timeframe_to_timedelta
 from open_quant_intelligence.data.quality import DataQualityReport
 
@@ -238,15 +247,26 @@ class EvaluationContext:
     This context is strictly held by StrategyEvaluator and NEVER passed to strategy instances.
     """
 
-    dataset_identity: str
-    content_fingerprint: str
+    market: MarketIdentity
+    timeframe: SupportedTimeframe
     requested_since_ms: int
     requested_until_ms: int
-    timeframe: SupportedTimeframe
+    content_fingerprint: str
     quality_report: DataQualityReport
+    dataset_identity: str = ""
 
     def __post_init__(self) -> None:
-        # 1. Exact integer timestamp type validation (reject bool and float)
+        # 1. MarketIdentity validation
+        if not isinstance(self.market, MarketIdentity):
+            raise TypeError(f"market must be an instance of MarketIdentity, got {type(self.market).__name__}")
+        if self.market.market_type != "spot":
+            raise ValueError(f"Only spot markets are supported in OQI V2, got: '{self.market.market_type}'")
+        if not self.market.exchange_id.strip():
+            raise ValueError("market.exchange_id cannot be empty.")
+        if not self.market.symbol.strip():
+            raise ValueError("market.symbol cannot be empty.")
+
+        # 2. Exact integer timestamp type validation (reject bool and float)
         if type(self.requested_since_ms) is not int or type(self.requested_since_ms) is bool:
             raise TypeError(
                 f"requested_since_ms must be exact int, got {type(self.requested_since_ms).__name__}"
@@ -256,13 +276,13 @@ class EvaluationContext:
                 f"requested_until_ms must be exact int, got {type(self.requested_until_ms).__name__}"
             )
 
-        # 2. Runtime type validation for timeframe
+        # 3. Runtime type validation for timeframe
         if not isinstance(self.timeframe, SupportedTimeframe):
             raise TypeError(
                 f"timeframe must be an instance of SupportedTimeframe, got {type(self.timeframe).__name__}"
             )
 
-        # 3. Timeframe-grid-aligned boundaries using timeframe_to_timedelta()
+        # 4. Timeframe-grid-aligned boundaries using timeframe_to_timedelta()
         step_ms = int(timeframe_to_timedelta(self.timeframe).total_seconds() * 1000)
         if self.requested_since_ms % step_ms != 0:
             raise ValueError(
@@ -280,18 +300,27 @@ class EvaluationContext:
                 f"than requested_since_ms ({self.requested_since_ms})."
             )
 
-        # 4. Identity validation
+        # 5. Dataset identity validation & canonical derivation
+        expected_dataset_identity = (
+            f"{self.market.exchange_id}:{self.market.market_type}:{self.market.symbol}:"
+            f"{self.timeframe.value}:{self.requested_since_ms}:{self.requested_until_ms}"
+        )
         if not self.dataset_identity.strip():
-            raise ValueError("dataset_identity cannot be empty.")
+            object.__setattr__(self, "dataset_identity", expected_dataset_identity)
+        elif self.dataset_identity != expected_dataset_identity:
+            raise ValueError(
+                f"Contradictory dataset_identity: provided '{self.dataset_identity}', "
+                f"expected '{expected_dataset_identity}' based on market, timeframe, and bounds."
+            )
 
-        # 5. Full-string regex validation for content fingerprint
+        # 6. Full-string regex validation for content fingerprint
         if not re.fullmatch(r"^sha256:[0-9a-f]{64}$", self.content_fingerprint):
             raise ValueError(
                 f"Invalid content_fingerprint format: '{self.content_fingerprint}'. "
                 "Must match ^sha256:[0-9a-f]{64}$ exactly."
             )
 
-        # 6. Quality report consistency
+        # 7. Quality report consistency
         if not isinstance(self.quality_report, DataQualityReport):
             raise TypeError(
                 f"quality_report must be DataQualityReport, got {type(self.quality_report).__name__}"
@@ -312,7 +341,7 @@ class EvaluationContext:
                 f"context timeframe ({self.timeframe})."
             )
 
-        # 7. Quality report internal mathematical invariants
+        # 8. Quality report internal mathematical invariants
         if self.quality_report.gap_count != len(self.quality_report.gaps):
             raise ValueError(
                 f"Quality report gap_count ({self.quality_report.gap_count}) does not match "
@@ -325,7 +354,7 @@ class EvaluationContext:
         ):
             raise ValueError("Quality report expected_records != record_count + missing_intervals.")
 
-        # 8. Missing count sum invariant
+        # 9. Missing count sum invariant
         total_gap_missing = sum(gap.missing_count for gap in self.quality_report.gaps)
         if self.quality_report.missing_intervals != total_gap_missing:
             raise ValueError(
@@ -674,18 +703,24 @@ class Strategy(Protocol):
 
 ### 4.1 Re-use of M0 and M1 Public APIs
 
-M2 does NOT re-implement data validation, timeframe conversions, or gap detection from scratch. Instead, it directly re-uses existing, audited public foundation APIs:
+M2 does NOT re-implement data validation, timeframe conversions, fingerprinting, or gap detection from scratch. Instead, it directly re-uses existing, audited public foundation APIs:
 
 1. **M0 Timeframe API (`open_quant_intelligence.domain.timeframe.timeframe_to_timedelta`):**
    - The authoritative public function `timeframe_to_timedelta(timeframe)` converts `SupportedTimeframe` to a `timedelta`.
    - Grid duration in milliseconds is derived via `int(timeframe_to_timedelta(timeframe).total_seconds() * 1000)`.
-2. **M0 Validation API (`open_quant_intelligence.data.validation.validate_candles`):**
-   - The authoritative public function `validate_candles(candles, fail_on_gaps=False, expected_timeframe=...)` is invoked to verify that every candle adheres to domain schema rules.
-   - Validates positive prices, finite numbers ($H \ge \max(O, C, L)$, $L \le \min(O, C, H)$), and non-negative volume.
-   - Rejects unparseable or naive timestamps.
-   - Enforces strict ascending chronological order: $T_{\text{open}, i} < T_{\text{open}, i+1}$.
-   - Rejects duplicate timestamps.
-3. **M1 Quality Analysis API (`open_quant_intelligence.data.quality.analyze_dataset_quality`):**
+2. **M0 Candle Domain Model (`open_quant_intelligence.domain.candle.Candle`):**
+   - Authoritative datetime fields are `candle.open_time` and `candle.close_time` (timezone-aware UTC `datetime`).
+   - Millisecond timestamps are derived safely via `int(candle.open_time.timestamp() * 1000)` and `int(candle.close_time.timestamp() * 1000)`.
+   - No non-existent properties (e.g. `open_time_ms`, `close_time_ms`) may be referenced.
+3. **M0 Validation API (`open_quant_intelligence.data.validation.validate_candles`):**
+   - Invokes `result = validate_candles(candles, fail_on_gaps=False, expected_timeframe=timeframe)`.
+   - Returns a `ValidationResult`. If `not result.is_valid`, evaluation fails immediately using `result.errors`.
+   - `fail_on_gaps=False` is preserved because gap policy is evaluated at Stage B over the causal prefix.
+4. **M1 Content Fingerprint API (`open_quant_intelligence.storage.fingerprint.compute_content_fingerprint`):**
+   - Canonical SHA-256 digest `compute_content_fingerprint(candles, exchange_id, market_type, symbol, timeframe, requested_since_ms, requested_until_ms)`.
+   - Recomputes the canonical binary content fingerprint from the exact supplied candle sequence and verified market coordinates.
+   - **Crucial Distinction:** Canonical content fingerprint (`OQICCF` stream digest) is strictly distinguished from physical Parquet file hash (`file_sha256`).
+5. **M1 Quality Analysis API (`open_quant_intelligence.data.quality.analyze_dataset_quality`):**
    - Authoritative function `analyze_dataset_quality(candles, since_ms, until_ms, timeframe)` produces the `DataQualityReport`.
    - The actual `DataQualityReport` attributes are:
      - `requested_since_ms: int`
@@ -699,8 +734,6 @@ M2 does NOT re-implement data validation, timeframe conversions, or gap detectio
      - `quality_status: str`
    - Invariant: `expected_records == record_count + missing_intervals`.
    - Invariant: `missing_intervals == sum(gap.missing_count for gap in gaps)`.
-   - Audits candle grid alignment: $(T_{\text{open}} - T_{\text{since}}) \pmod{\Delta} == 0$. Raises `UnalignedCandleError` if any candle is off-grid.
-   - Classifies gap events into `LEADING`, `INTERNAL`, `TRAILING`, and `FULL_WINDOW` via `QualityGapEvent`.
 
 #### Critical Distinction: Unaligned vs Missing Intervals:
 - **Unaligned Candle Timestamps:** Represents malformed or corrupt data violating the discrete timeframe lattice. **Always invalid**; rejected immediately with `StrategyEvaluationError`.
@@ -710,7 +743,7 @@ M2 does NOT re-implement data validation, timeframe conversions, or gap detectio
 
 ### 4.2 Two Distinct Evaluation Stages: Snapshot Verification vs Causal Prefix Evaluation
 
-The `StrategyEvaluator` sits between dataset storage and the `Strategy.evaluate()` method. It enforces a strict two-stage process:
+The `StrategyEvaluator` sits between dataset storage and the `Strategy.evaluate()` method. It enforces two separate, sequential operations:
 
 ```text
 =============================================================================
@@ -718,33 +751,47 @@ STAGE A: Full M1 Snapshot Verification (Dataset-Level Precondition)
 =============================================================================
 Input: supplied_candles: Sequence[Candle], context: EvaluationContext
    │
-   ├─► Step A1: Verify EvaluationContext
+   ├─► Step A1: Empty Sequence Check
+   │     - Reject empty supplied_candles immediately with EmptyDatasetError
+   │     - Do not access supplied_candles[0] or [-1] on empty input
+   │
+   ├─► Step A2: Comprehensive EvaluationContext Consistency Check
    │     - Exact integer type checks for requested_since_ms, requested_until_ms (reject bool/float)
    │     - SupportedTimeframe runtime type check
    │     - Grid alignment: since_ms and until_ms multiples of timeframe_to_timedelta() step_ms
    │     - Full-string regex on content_fingerprint (^sha256:[0-9a-f]{64}$)
+   │     - MarketIdentity check: exchange_id, symbol non-empty, market_type == "spot"
    │     - Quality report consistency: window, timeframe, and gap_count == len(gaps) invariants
    │     - Invariant: expected_records == record_count + missing_intervals
    │     - Invariant: missing_intervals == sum(gap.missing_count for gap in gaps)
    │
-   ├─► Step A2: Tie Supplied Candles to M1 Snapshot Metadata
+   ├─► Step A3: M0 Validation API Contract Check
+   │     - Execute result = validate_candles(supplied_candles, fail_on_gaps=False, expected_timeframe=context.timeframe)
+   │     - Check result.is_valid: if False, raise StrategyEvaluationError with result.errors details
+   │
+   ├─► Step A4: Tie Supplied Candles to M1 Snapshot Metadata
    │     - Record count check: len(supplied_candles) == context.quality_report.record_count
    │     - Window bounds check:
-   │         supplied_candles[0].open_time_ms >= context.requested_since_ms
-   │         supplied_candles[-1].close_time_ms <= context.requested_until_ms
+   │         supplied_candles[0].open_time >= datetime.fromtimestamp(context.requested_since_ms/1000, UTC)
+   │         supplied_candles[-1].close_time <= datetime.fromtimestamp(context.requested_until_ms/1000, UTC)
    │     - Timeframe homogeneity: all candle.timeframe == context.timeframe
-   │     - Identity homogeneity: all candle.exchange_id == expected, all market_type == "spot"
-   │     - Symbol homogeneity: all candle.symbol == expected_symbol
-   │     - M0 Schema validation: validate_candles(supplied_candles, expected_timeframe=context.timeframe)
+   │     - Identity homogeneity: all candle.exchange_id == context.market.exchange_id, all market_type == "spot"
+   │     - Symbol homogeneity: all candle.symbol == context.market.symbol
    │     - Full Quality Re-check: analyze_dataset_quality(supplied_candles, ...) == context.quality_report
-   │     * If any mismatch: REJECT IMMEDIATELY. Never attach snapshot fingerprint to mismatched data.
+   │
+   ├─► Step A5: Recompute Canonical Content Fingerprint
+   │     - recomputed_fp = compute_content_fingerprint(supplied_candles, context.market.exchange_id,
+   │           context.market.market_type, context.market.symbol, context.timeframe,
+   │           context.requested_since_ms, context.requested_until_ms)
+   │     - Assert recomputed_fp == context.content_fingerprint (raise SnapshotConsistencyError if mismatch)
+   │     * Guarantees verified snapshot fingerprint is never attached to mismatched or tampered data!
    ▼
 Snapshot Verified Successfully!
 
 =============================================================================
-STAGE B: Per-Candle Causal Evaluation (Executed per evaluation candle T)
+STAGE B: Per-Candle Causal Prefix Evaluation (Executed per evaluation candle T)
 =============================================================================
-Input: supplied_candles[:T+1], candle T
+Input: supplied_candles[:T+1], target candle T
    │
    ├─► Step B1: Construct Historical Prefix
    │     - prefix_history = supplied_candles[:T+1]
@@ -752,27 +799,43 @@ Input: supplied_candles[:T+1], candle T
    │     - If len(prefix_history) < minimum_history_candles:
    │         RAISE InsufficientHistoryError (Canonical behavior; no dummy decisions)
    │
-   ├─► Step B2: Derive Causal Prefix Quality Report
+   ├─► Step B2: Verify Prefix Completeness (is_closed)
+   │     - For every candle in prefix_history: assert candle.is_closed == True
+   │     - If any candle is not closed: RAISE IncompleteCandleError
+   │     * Unclosed candles strictly after T are not in prefix_history and do NOT affect T!
+   │
+   ├─► Step B3: Derive Causal Prefix Quality Report
+   │     - prefix_until_ms = int(prefix_history[-1].close_time.timestamp() * 1000)
    │     - prefix_quality = analyze_dataset_quality(
    │           prefix_history,
    │           since_ms=context.requested_since_ms,
-   │           until_ms=int(prefix_history[-1].close_time.timestamp() * 1000),
+   │           until_ms=prefix_until_ms,
    │           timeframe=context.timeframe
    │       )
    │
-   ├─► Step B3: Enforce Strategy Gap Policy on Prefix
+   ├─► Step B4: Enforce Strategy Gap Policy on Prefix Only
    │     - If strategy.gap_policy == STRICT_GAP_FREE:
    │         Reject if prefix_quality.gap_count > 0
    │     - If strategy.gap_policy == REJECT_INTERNAL_GAPS:
    │         Reject if any gap event in prefix_quality.gaps is GapType.INTERNAL
-   │     * Future gaps occurring strictly after T.close_time do NOT affect candle T.
+   │     * Future gaps occurring strictly after T.close_time do NOT affect candle T!
    │
-   ├─► Step B4: Pure Strategy Invocation (Zero Future Data)
-   │     - Construct StrategyContext(symbol, timeframe, prefix_quality)
+   ├─► Step B5: Pure Strategy Invocation (Zero Future Data)
+   │     - Construct StrategyContext(symbol=context.market.symbol, timeframe=context.timeframe, prefix_quality)
    │     - Invoke: output = strategy.evaluate(prefix_history, strategy_context)
-   │     - Validate output: UTC timestamps, causality, valid reason_code, deeply immutable metadata
    │
-   ├─► Step B5: Assemble Final Auditable Decision
+   ├─► Step B6: Validate Emitted StrategyOutput against Strategy & Target Candle
+   │     - Assert output.strategy_id == strategy.strategy_id
+   │     - Assert output.strategy_version == strategy.version
+   │     - Assert output.config_fingerprint == strategy.config.compute_fingerprint()
+   │     - Assert output.symbol == context.market.symbol
+   │     - Assert output.timeframe == context.timeframe
+   │     - Assert output.source_candle_open_time == prefix_history[-1].open_time
+   │     - Assert output.source_candle_close_time == prefix_history[-1].close_time
+   │     - Assert output.decision_time == prefix_history[-1].close_time
+   │     * Reject any mismatch with StrategyOutputMismatchError!
+   │
+   ├─► Step B7: Assemble Final Auditable Decision
    │     - Assemble StrategyDecision.assemble(
    │           output=output,
    │           dataset_identity=context.dataset_identity,
@@ -793,12 +856,16 @@ class StrategyEvaluationError(Exception):
     """Base exception for all strategy evaluation failures."""
 
 
+class EmptyDatasetError(StrategyEvaluationError):
+    """Raised when an empty candle sequence is supplied for evaluation."""
+
+
 class InsufficientHistoryError(StrategyEvaluationError):
     """Raised when available candle history is strictly less than minimum_history_candles."""
 
 
 class IncompleteCandleError(StrategyEvaluationError):
-    """Raised when an unclosed candle (is_closed=False) is supplied to evaluation."""
+    """Raised when an unclosed candle (is_closed=False) is encountered in the evaluated prefix."""
 
 
 class HeterogeneousSeriesError(StrategyEvaluationError):
@@ -814,7 +881,11 @@ class StrategyDataGapError(StrategyEvaluationError):
 
 
 class SnapshotConsistencyError(StrategyEvaluationError):
-    """Raised when supplied candle series fails verification against M1 snapshot metadata."""
+    """Raised when supplied candle series fails verification against M1 snapshot metadata or fingerprint."""
+
+
+class StrategyOutputMismatchError(StrategyEvaluationError):
+    """Raised when an emitted StrategyOutput contradicts the strategy identity, timeframe, or target candle."""
 ```
 
 ---
@@ -913,7 +984,7 @@ M2 explicitly stops at decision generation. The following responsibilities belon
 | Directional research intent (`LONG`/`FLAT`/`HOLD`) | **YES** | Consumes M2 | Strategy logic defines intention. |
 | Reason code & indicator metadata | **YES** | Consumes M2 | Explains why strategy signaled. |
 | Causal prefix data quality | **YES** | Pre-condition | Evaluator verifies prefix series. |
-| Snapshot provenance & audit attachment | **YES** | Post-evaluation | Evaluator attaches M1 fingerprint. |
+| Snapshot provenance & content binding | **YES** | Pre/Post-eval | Evaluator verifies & binds fingerprint. |
 | Portfolio cash & coin balance tracking | **NO** | **YES** | Strategies do not manage accounts. |
 | Position sizing, leverage & margin | **NO** | **YES** | Risk & capital allocation concern. |
 | Order execution modeling (Next-Bar Open fills) | **NO** | **YES** | Simulation engine fill model concern. |
@@ -1000,7 +1071,7 @@ src/open_quant_intelligence/strategy/
 ├── __init__.py          # Public exports: Strategy, StrategyConfig, StrategyContext, StrategyOutput, StrategyDecision, EvaluationContext, ResearchSignal
 ├── contracts.py         # Protocols, StrategyConfig, StrategyContext, EvaluationContext, GapPolicy, exception hierarchy
 ├── signals.py           # ResearchSignal enum, StrategyOutput, StrategyDecision, ReasonCode constants
-├── evaluator.py         # StrategyEvaluator: M0/M1 validation wrapper, prefix quality derivation, causality & lookback enforcement
+├── evaluator.py         # StrategyEvaluator: Stage A snapshot verification, Stage B causal prefix evaluation
 └── baseline.py          # Migrated baseline strategy implementation (BLOCKED ON OWNER INPUT)
 ```
 
@@ -1009,21 +1080,20 @@ src/open_quant_intelligence/strategy/
 1. **`contracts.py`:**
    - Defines `Strategy` protocol via `typing.Protocol`.
    - Defines `StrategyContext` causal context dataclass (strictly causal, zero future info).
-   - Defines `EvaluationContext` full-dataset provenance dataclass with rigorous consistency validation.
+   - Defines `EvaluationContext` full-dataset provenance dataclass with typed `MarketIdentity` and rigorous consistency validation.
    - Defines `StrategyConfig` frozen base class with canonical SHA-256 fingerprinting.
    - Defines `GapPolicy` enum (`STRICT_GAP_FREE`, `REJECT_INTERNAL_GAPS`).
-   - Defines clean exception hierarchy (`StrategyEvaluationError`, `InsufficientHistoryError`, `SnapshotConsistencyError`, etc.).
+   - Defines clean exception hierarchy (`StrategyEvaluationError`, `InsufficientHistoryError`, `SnapshotConsistencyError`, `EmptyDatasetError`, `StrategyOutputMismatchError`).
 2. **`signals.py`:**
    - Defines `ResearchSignal` (`LONG`, `FLAT`, `HOLD`).
    - Defines `StrategyOutput` frozen dataclass for pure strategy calculation results.
-   - Defines `StrategyDecision` frozen dataclass assembling `StrategyOutput` and snapshot provenance.
+   - Defines `StrategyDecision` frozen dataclass assembling `StrategyOutput` and snapshot provenance via `StrategyDecision.assemble()`.
    - Enforces timezone-aware UTC timestamps, deep immutability, and exact scalar metadata types.
    - Defines standard `ReasonCode` constants (`WARMUP_INSUFFICIENT`, `LONG_SIGNAL_GENERATED`, `FLAT_SIGNAL_GENERATED`, `NO_CONDITION_MET`).
 3. **`evaluator.py`:**
    - Defines `StrategyEvaluator`.
-   - Encapsulates Stage A (full snapshot verification against `EvaluationContext`) and Stage B (per-candle prefix derivation and causal evaluation).
+   - Encapsulates Stage A (full snapshot verification, canonical content fingerprint recomputation) and Stage B (per-candle prefix derivation, prefix quality, causal evaluation, and output verification).
    - Enforces M0 `validate_candles()`, `timeframe_to_timedelta()` grid alignment, and lookback (`InsufficientHistoryError`).
-   - Derives prefix quality reports and enforces `GapPolicy` on the historical prefix.
    - Assembles `StrategyDecision` using `StrategyDecision.assemble()`.
 4. **`baseline.py`:**
    - Implements the concrete baseline strategy adhering strictly to `Strategy`.
@@ -1044,35 +1114,37 @@ Reproducibility is a fundamental pillar of quantitative research. Milestone M2 e
 ```text
 ┌────────────────────────────────────────────────────────┐
 │ Evaluator Input Provenance                             │
-│   - M1 Dataset Content Fingerprint: sha256:[0-9a-f]{64}│
+│   - M1 Dataset Canonical Fingerprint: sha256:...       │
 │   - Candle Count & Requested Window Bounds             │
-│   - M1 DataQualityReport                               │
+│   - M1 DataQualityReport & Typed MarketIdentity        │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
-│ Strategy Specification Provenance                      │
-│   - Strategy Identifier (e.g. "baseline-trend")         │
-│   - Semantic Version (e.g. "1.0.0")                    │
-│   - StrategyConfig SHA-256 Fingerprint                 │
+│ Stage A: Snapshot Verification                         │
+│   - Recomputes compute_content_fingerprint()           │
+│   - Asserts exact match with EvaluationContext         │
+│   - Validates M0 schema and dataset consistency        │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
-     [ Pure Function: evaluate(history[:T+1], strategy_context) ]
+┌────────────────────────────────────────────────────────┐
+│ Stage B: Causal Prefix Evaluation                      │
+│   - Extracts prefix history[:T+1]                      │
+│   - Derives causal prefix DataQualityReport            │
+│   - Invokes pure function: evaluate(prefix, context)   │
+└───────────────────────────┬────────────────────────────┘
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │ StrategyOutput (Causal Decision)                       │
-│   - Identical Signal, Reason Code, and Metadata        │
+│   - Validated against strategy and target candle T     │
 └───────────────────────────┬────────────────────────────┘
-                            │
-                            ▼
-       [ Evaluator attaches verified snapshot provenance ]
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
 │ StrategyDecision (Full Audit Record)                   │
-│   - Embedded StrategyOutput + Dataset Provenance       │
+│   - StrategyDecision.assemble(output, provenance)      │
 │   - Floating-Point Indicators Verified Within Tolerance│
 └────────────────────────────────────────────────────────┘
 ```
@@ -1116,31 +1188,32 @@ When implementation is authorized, M2 will deliver a comprehensive, offline, det
    - Verify `StrategyConfig` calculates deterministic SHA-256 fingerprints across immutable configuration instances with scalar and tuple attributes.
    - Verify `StrategyConfig` rejects mutable attributes (`list`, `dict`, `set`) and non-finite floats (`NaN`, `inf`).
    - Verify `EvaluationContext` validation:
+     - Rejection of missing, empty, or non-spot `MarketIdentity`.
      - Rejection of boolean or float timestamp bounds.
      - Rejection of invalid timeframe runtime types.
      - Rejection of off-grid timestamp bounds via `timeframe_to_timedelta()`.
      - Rejection of invalid content fingerprint formats (full-string regex check).
      - Rejection of mismatched or mathematically inconsistent `DataQualityReport` instances (`expected_records != record_count + missing_intervals` or `missing_intervals != sum(gap.missing_count)`).
    - Verify `Strategy` protocol enforcement via `isinstance()` checks.
-2. **Evaluator Pre-Flight & Snapshot Consistency (`test_strategy_evaluator.py`):**
-   - Verification of Stage A (Full Snapshot Verification):
-     - Rejection of candle sequences whose length != `quality_report.record_count`.
-     - Rejection of candle sequences extending outside `[requested_since_ms, requested_until_ms)`.
-     - Rejection of candle sequences with mismatched symbols, timeframes, or non-spot markets.
-     - Rejection of unaligned candle timestamps.
-     - Rejection when `analyze_dataset_quality` re-check does not match `context.quality_report`.
-   - Verification of Stage B (Causal Evaluation):
-     - Rejection of empty candle sequences.
-     - Rejection of sequences shorter than `minimum_history_candles` with canonical `InsufficientHistoryError`.
-     - Rejection of unclosed candles (`is_closed=False`).
-     - Rejection of out-of-order or duplicate timestamps via M0 `validate_candles()`.
-3. **Data Quality & Prefix Gap Policy Enforcement (`test_strategy_gap_policy.py`):**
+2. **Evaluator Stage A: Snapshot Verification (`test_strategy_evaluator_stage_a.py`):**
+   - **Empty Input Rejection:** Supply an empty candle sequence `[]`; assert immediate rejection with `EmptyDatasetError` without attempting indexing.
+   - **OHLCV Value Modification / Content Fingerprint Mismatch:** Supply valid candles where prices or volume are subtly modified without changing timestamps, record count, or quality statistics; assert that recomputed `compute_content_fingerprint()` does not match `EvaluationContext.content_fingerprint` and raises `SnapshotConsistencyError`.
+   - **M0 Validation Failure:** Supply candle sequence that fails `validate_candles()` (e.g. invalid high/low relation); assert rejection with `StrategyEvaluationError` citing the reported validation error issues.
+   - **Record Count Mismatch:** Supply candle sequence with length differing from `quality_report.record_count`; assert rejection with `SnapshotConsistencyError`.
+   - **Window Bounds Mismatch:** Supply candles starting before `requested_since_ms` or ending after `requested_until_ms`; assert rejection with `SnapshotConsistencyError`.
+   - **Identity Mismatch:** Supply candles with mismatched `exchange_id`, `market_type`, or `symbol`; assert rejection with `HeterogeneousSeriesError`.
+3. **Evaluator Stage B: Causal Prefix Evaluation (`test_strategy_evaluator_stage_b.py`):**
+   - **Lookback Requirement:** Supply prefix sequence shorter than `minimum_history_candles`; assert canonical `InsufficientHistoryError`.
+   - **Unclosed Prefix Candle:** Supply prefix containing a candle with `is_closed=False`; assert rejection with `IncompleteCandleError`.
+   - **Unclosed Future Candle Isolation:** Supply full candle sequence where candle strictly after $T$ ($T+1$) has `is_closed=False`; assert that evaluation of candle $T$ succeeds without error.
+   - **Strategy Output Mismatch Verification:** Mock a strategy that emits an output with mismatched `strategy_id`, `version`, `config_fingerprint`, `symbol`, `timeframe`, or timestamps; assert rejection with `StrategyOutputMismatchError`.
+4. **Data Quality & Prefix Gap Policy Enforcement (`test_strategy_gap_policy.py`):**
    - Verify that prefix quality reports are computed strictly over $[T_{\text{since}}, T_{\text{close}, i})$.
    - Behavior under `STRICT_GAP_FREE`: raises `StrategyDataGapError` on any missing interval in the prefix.
    - Behavior under `REJECT_INTERNAL_GAPS`: permits valid history with leading gaps outside the prefix, but strictly rejects internal gaps.
    - Verification that future gaps occurring strictly after $T_{\text{close}, i}$ do NOT trigger gap errors for the evaluation of candle $i$.
    - Verification that no forward-filling or interpolation ever takes place.
-4. **Causality & Prefix-Invariance (`test_strategy_causality.py`):**
+5. **Causality & Prefix-Invariance (`test_strategy_causality.py`):**
    - **Prefix-Invariance Invariant Definition:**
      Given identical historical prefixes through candle $T$ ($C_0, \dots, C_T$), changes to candles strictly after $T$ must not change the strategy-derived decision for $T$.
    - **Scenario 1 (Future Candle Modification):**
@@ -1149,10 +1222,10 @@ When implementation is authorized, M2 will deliver a comprehensive, offline, det
      Create dataset $D_3 = [C_0, \dots, C_T, C_{T+2}]$, introducing a missing interval strictly after $T$. Assert that strategy outputs for candle $T$ remain 100% identical to $D_1$.
    - **Full-Dataset Provenance Verification:**
      Assert that while `dataset_content_fingerprint` on `StrategyDecision` differs between $D_1$, $D_2$, and $D_3$ (reflecting whole-snapshot variation), it has zero influence on the strategy's evaluation at candle $T$.
-5. **Idempotency & Isolation (`test_strategy_determinism.py`):**
+6. **Idempotency & Isolation (`test_strategy_determinism.py`):**
    - Run `evaluate()` 1,000 times consecutively on identical inputs. Prove output decisions, timestamps, reason codes, and indicator floats match perfectly within defined tolerances.
    - Run parallel evaluations across multiple threads/processes. Assert zero cross-contamination.
-6. **Baseline Migration Golden Tests (`test_baseline_parity.py`):**
+7. **Baseline Migration Golden Tests (`test_baseline_parity.py`):**
    - Execute baseline strategy against the owner-provided golden reference dataset.
    - Assert 100% discrete parity and floating-point tolerance conformity across all emitted decisions.
 
@@ -1184,7 +1257,7 @@ To maintain focus and avoid architectural bloat, the following capabilities are 
 | **Silent Gap Corruption** | Medium (Flawed indicator math) | Prefix `DataQualityReport` derived per evaluation; `GapPolicy` strictly enforced; unaligned candles rejected; silent forward-filling prohibited. |
 | **Float Discrepancies Across Platforms** | Low (Minor parity mismatch) | Exact equality on discrete fields; documented relative/absolute tolerances (`rel_tol=1e-9`, `abs_tol=1e-12`) on floating-point metadata. |
 | **Mutable Configuration Tampering** | Medium (Breaks provenance integrity) | `_validate_config_value()` rejects lists, dicts, and mutable containers; permits only exact primitive scalars and immutable tuples; guarantees unalterable fingerprints. |
-| **Snapshot Provenance Mismatch** | Medium (Spurious audit trails) | Stage A snapshot verification guarantees supplied candles match snapshot record count, bounds, and checksums before evaluation. |
+| **Snapshot Provenance Mismatch** | Medium (Spurious audit trails) | Stage A snapshot verification recomputes canonical content fingerprint and guarantees supplied candles match snapshot record count, bounds, and checksums before evaluation. |
 
 ---
 
@@ -1208,7 +1281,7 @@ The following items are presented for review and approval:
 Milestone M2 will be considered complete and ready for merge into `main` when:
 
 1. The `Strategy` protocol, `StrategyConfig`, `StrategyContext`, `StrategyOutput`, `StrategyDecision`, and `EvaluationContext` contracts are implemented under `src/open_quant_intelligence/strategy/`.
-2. The `StrategyEvaluator` is implemented, enforcing Stage A full snapshot verification and Stage B per-candle causal prefix evaluation with M0 `validate_candles()`, `timeframe_to_timedelta()` grid alignment, causal prefix quality reports, gap policies, and point-in-time causality.
+2. The `StrategyEvaluator` is implemented, enforcing Stage A full snapshot verification (including canonical content fingerprint recomputation) and Stage B per-candle causal prefix evaluation with M0 `validate_candles()`, `timeframe_to_timedelta()` grid alignment, causal prefix quality reports, gap policies, and point-in-time causality.
 3. The Project Owner supplies the baseline specification and reference fixtures.
 4. The baseline strategy is implemented and verified against the golden reference test suite with 100% discrete parity and indicator tolerance conformity.
 5. All offline unit tests pass cleanly across Python 3.11 and 3.12 on both Ubuntu and Windows CI runners.
