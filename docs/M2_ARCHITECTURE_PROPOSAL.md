@@ -18,14 +18,14 @@
 2. [Current Architecture & M0/M1 Compatibility](#2-current-architecture--m0m1-compatibility)
 3. [Strategy Interface & Data Contracts](#3-strategy-interface--data-contracts)
    - 3.1 [Research Signal Vocabulary & HOLD Semantics](#31-research-signal-vocabulary--hold-semantics)
-   - 3.2 [Evaluation Context Contract](#32-evaluation-context-contract)
-   - 3.3 [Strategy Decision Contract & Deep Immutability](#33-strategy-decision-contract--deep-immutability)
+   - 3.2 [Strategy Causal Context vs Evaluator Dataset Provenance](#32-strategy-causal-context-vs-evaluator-dataset-provenance)
+   - 3.3 [Strategy Output & Auditable Decision Records](#33-strategy-output--auditable-decision-records)
    - 3.4 [Strategy Configuration & Deterministic Fingerprinting](#34-strategy-configuration--deterministic-fingerprinting)
-   - 3.5 [Gap Policy Specification](#35-gap-policy-specification)
+   - 3.5 [Gap Policy Specification & Prefix Enforcement](#35-gap-policy-specification--prefix-enforcement)
    - 3.6 [The Strategy Protocol](#36-the-strategy-protocol)
 4. [Input Validation & Data-Quality Policy](#4-input-validation--data-quality-policy)
    - 4.1 [Re-use of M0 and M1 Foundations](#41-re-use-of-m0-and-m1-foundations)
-   - 4.2 [Evaluator Pre-Flight Verification Rules](#42-evaluator-pre-flight-verification-rules)
+   - 4.2 [Evaluator Pre-Flight Verification & Context Consistency Rules](#42-evaluator-pre-flight-verification--context-consistency-rules)
    - 4.3 [Structured Error Hierarchy](#43-structured-error-hierarchy)
 5. [Signal Semantics, Causality & Timing Rules](#5-signal-semantics-causality--timing-rules)
    - 5.1 [Point-in-Time Causality & Availability at $T_{\text{close}}$](#51-point-in-time-causality--availability-at-t_textclose)
@@ -51,18 +51,22 @@ Milestone M2 transitions Open Quant Intelligence V2 from a robust, crash-resilie
 
 In quantitative finance, strategies frequently suffer from subtle production-backtest divergence caused by hidden state mutation, lookahead leakage, loose timestamp conventions, unhandled missing data intervals, or implicit coupling to portfolio simulation engines. M2 eliminates these vulnerabilities by enforcing a **pure functional paradigm**:
 
-$$\text{StrategyDecision} = f(\text{Immutable Strategy Config}, \text{Validated Historical Candles}, \text{Immutable Evaluation Context})$$
+$$\text{StrategyOutput} = f(\text{Immutable Strategy Config}, \text{Validated Historical Candles } [C_0, \dots, C_T], \text{Causal Strategy Context})$$
+$$\text{StrategyDecision} = \text{Evaluator}(\text{StrategyOutput}, \text{Verified M1 Snapshot Provenance})$$
 
 ### Core Objectives of M2:
 
-1. **Explicit, Minimal Strategy Protocol:** Define a formal `Strategy` interface contract with an immutable configuration identity, semantic versioning, declared minimum lookback history, and explicit gap handling policy.
-2. **Authoritative Evaluation Context:** Decouple data retrieval from strategy logic by supplying an immutable `EvaluationContext` that contains dataset provenance, content fingerprints, requested analysis window bounds, and M1 `DataQualityReport` metadata.
-3. **Deterministic Point-in-Time Evaluation:** Ensure evaluation functions as a pure mathematical transformation of finalized historical candles $[T_{\text{open}}, T_{\text{close}})$. Evaluation is strictly isolated from side effects: zero file I/O, zero network calls, zero database queries, zero system clock access, and zero pseudo-randomness.
-4. **Structured Research Intentions (Signals):** Standardize research signal vocabulary into three unambiguous states: `LONG`, `FLAT`, and `HOLD`. These express directional research intention, completely detached from exchange order execution, position sizing, margin, or leverage.
-5. **Rigorous Data Quality Re-use:** Enforce that strategies evaluate only fully closed candles (`is_closed=True`) validated against M0 schema invariants (`validate_candles`) and M1 gap detection (`analyze_dataset_quality`). Unaligned candle timestamps are strictly rejected. Data is never silently sorted, interpolated, or forward-filled.
-6. **Canonical Warmup Handling:** Enforce a single canonical behavior for insufficient history: raise `InsufficientHistoryError` whenever available history is less than `strategy.minimum_history_candles`. No dummy or fabricated decisions are emitted without an eligible source candle.
-7. **Baseline Migration with Parity Verification:** Provide a formal golden-test migration methodology for the project's baseline strategy while explicitly documenting the current absence of legacy strategy code as an **unresolved owner-input dependency blocker**.
-8. **Strict Milestone Boundaries:** Confine M2 strictly to decision evaluation. All execution loops, fill assumptions, slippage, commission modeling, portfolio state tracking, and performance metrics are quarantined to Milestone M3.
+1. **Strict Future-Data Isolation:** Separate strategy-visible causal inputs from full-dataset snapshot provenance. Strategy implementations evaluate only historical candle prefixes and causal metadata available at or before candle close $T_{\text{close}}$. Full dataset fingerprints, requested window bounds extending past $T$, and full-window quality reports remain strictly evaluator-owned.
+2. **Explicit, Minimal Strategy Protocol:** Define a formal `Strategy` interface contract with an immutable configuration identity, semantic versioning, declared minimum lookback history, and explicit gap handling policy.
+3. **Rigorous Context Consistency:** Define exhaustive consistency validation for evaluator-held `EvaluationContext` (type checks rejecting booleans/floats for timestamps, grid alignment, full-string regex, and `DataQualityReport` mathematical invariants).
+4. **Deterministic Point-in-Time Evaluation:** Ensure evaluation functions as a pure mathematical transformation of finalized historical candles $[T_{\text{open}}, T_{\text{close}})$. Evaluation is strictly isolated from side effects: zero file I/O, zero network calls, zero database queries, zero system clock access, and zero pseudo-randomness.
+5. **Structured Research Intentions (Signals):** Standardize research signal vocabulary into three unambiguous states: `LONG`, `FLAT`, and `HOLD`. These express directional research intention, completely detached from exchange order execution, position sizing, margin, or leverage.
+6. **Rigorous Data Quality Re-use:** Enforce that strategies evaluate only fully closed candles (`is_closed=True`) validated against M0 schema invariants (`validate_candles`) and M1 gap detection (`analyze_dataset_quality`). Unaligned candle timestamps are strictly rejected. Data is never silently sorted, interpolated, or forward-filled.
+7. **Canonical Warmup Handling:** Enforce a single canonical behavior for insufficient history: raise `InsufficientHistoryError` whenever available history is less than `strategy.minimum_history_candles`. No dummy or fabricated decisions are emitted without an eligible source candle.
+8. **Genuine Configuration Immutability:** Enforce strict type constraints on strategy configurations (primitive scalars and immutable tuples thereof; no lists, dicts, or mutable containers) to guarantee that configuration fingerprints are permanently unalterable.
+9. **Robust Prefix-Invariance Verification:** Formulate lookahead tests that evaluate decisions for candle $T$ under mutations of future candles and introduction of future gaps, verifying that strategy decisions remain 100% identical.
+10. **Baseline Migration with Parity Verification:** Provide a formal golden-test migration methodology for the project's baseline strategy while explicitly documenting the current absence of legacy strategy code as an **unresolved owner-input dependency blocker**.
+11. **Strict Milestone Boundaries:** Confine M2 strictly to decision evaluation. All execution loops, fill assumptions, slippage, commission modeling, portfolio state tracking, and performance metrics are quarantined to Milestone M3.
 
 ---
 
@@ -91,11 +95,12 @@ Milestone M2 operates strictly as a consumer of M0 domain contracts and M1 datas
                                     │ consumes
 ┌───────────────────────────────────▼────────────────────────────────────┐
 │ M2 — Strategy Interface & Evaluation (THIS PROPOSAL)                   │
-│   - Strategy Protocol & StrategyConfig (Immutable, frozen)             │
-│   - EvaluationContext: dataset provenance & M1 DataQualityReport       │
+│   - Strategy Protocol & StrategyConfig (Deeply immutable)              │
+│   - StrategyContext: Causal prefix quality & parameters (No future)    │
+│   - StrategyOutput: Pure causal decision emitted by Strategy           │
+│   - EvaluationContext: Evaluator-only snapshot provenance & validation │
+│   - StrategyDecision: Auditable record assembled by StrategyEvaluator  │
 │   - ResearchSignal: LONG, FLAT, HOLD (Stateless research intent)       │
-│   - StrategyDecision: Point-in-time signal at T_close with reason_code │
-│   - StrategyEvaluator: Strict M0/M1 validation & lookback verification │
 │   - Baseline Strategy Migration: Golden parity test suite              │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │ produces decisions for
@@ -152,11 +157,63 @@ class ResearchSignal(str, Enum):
 
 ---
 
-### 3.2 Evaluation Context Contract
+### 3.2 Strategy Causal Context vs Evaluator Dataset Provenance
 
-To keep database access strictly outside strategy implementations while ensuring complete auditability and data-quality awareness, M2 introduces the immutable `EvaluationContext`.
+To strictly eliminate **future-data leakage**, M2 separates strategy-visible causal parameters from evaluator-owned full snapshot provenance:
 
-The caller (e.g., backtest runner, CLI, or test harness) queries the catalog, validates Parquet snapshot integrity, computes or retrieves the authoritative M1 `DataQualityReport`, and packages them into `EvaluationContext` before invoking evaluation:
+```text
+┌────────────────────────────────────────────────────────────────────────┐
+│ Evaluator-Owned: EvaluationContext                                     │
+│   - dataset_identity: str                                              │
+│   - content_fingerprint: str (SHA-256 of entire snapshot)              │
+│   - requested_since_ms, requested_until_ms (Full requested bounds)     │
+│   - timeframe: SupportedTimeframe                                      │
+│   - quality_report: DataQualityReport (Full window quality report)     │
+│   * HELD STRICTLY BY EVALUATOR. NEVER PASSED TO STRATEGY.              │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+           Evaluator derives strictly causal inputs for candle T:
+           1. Causal prefix candles: history = dataset[:T+1]
+           2. Causal prefix quality: analyze_dataset_quality(history, ...)
+                                    │
+                                    ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│ Strategy-Visible: StrategyContext                                      │
+│   - symbol: str                                                        │
+│   - timeframe: SupportedTimeframe                                      │
+│   - prefix_quality_report: DataQualityReport                           │
+│     (Covering strictly [requested_since_ms, candle_T.close_time_ms))   │
+│   * CONTAINS ZERO FUTURE DATA, ZERO FUTURE GAPS, ZERO FUTURE HASHES    │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Strategy-Visible Causal Context:
+
+```python
+from dataclasses import dataclass
+from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.data.quality import DataQualityReport
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyContext:
+    """Causal, point-in-time context supplied to strategy evaluation for a specific candle.
+    
+    Contains strictly causal information available up to the close of the evaluated candle:
+    - symbol: Base/quote symbol being evaluated.
+    - timeframe: SupportedTimeframe of the series.
+    - prefix_quality_report: Authoritative DataQualityReport computed strictly over [since_ms, candle_T.close_time_ms).
+    
+    Future data, full dataset bounds, future gap events, and full-snapshot fingerprints
+    are strictly excluded to guarantee zero future-data leakage.
+    """
+
+    symbol: str
+    timeframe: SupportedTimeframe
+    prefix_quality_report: DataQualityReport
+```
+
+#### Evaluator-Owned Dataset Provenance:
 
 ```python
 import re
@@ -167,10 +224,11 @@ from open_quant_intelligence.data.quality import DataQualityReport
 
 @dataclass(frozen=True, slots=True)
 class EvaluationContext:
-    """Authoritative dataset provenance and data-quality metadata supplied to strategy evaluation.
+    """Authoritative full-dataset provenance and verification metadata owned by StrategyEvaluator.
     
     Database access remains strictly external to strategies. The caller retrieves data,
     verifies snapshot integrity, computes the M1 DataQualityReport, and constructs this context.
+    This context is strictly held by StrategyEvaluator and NEVER passed to strategy instances.
     """
 
     dataset_identity: str
@@ -181,30 +239,101 @@ class EvaluationContext:
     quality_report: DataQualityReport
 
     def __post_init__(self) -> None:
-        if not re.match(r"^sha256:[0-9a-f]{64}$", self.content_fingerprint):
+        # 1. Exact integer timestamp type validation (reject bool and float)
+        if type(self.requested_since_ms) is not int or type(self.requested_since_ms) is bool:
+            raise TypeError(
+                f"requested_since_ms must be exact int, got {type(self.requested_since_ms).__name__}"
+            )
+        if type(self.requested_until_ms) is not int or type(self.requested_until_ms) is bool:
+            raise TypeError(
+                f"requested_until_ms must be exact int, got {type(self.requested_until_ms).__name__}"
+            )
+
+        # 2. Runtime type validation for timeframe
+        if not isinstance(self.timeframe, SupportedTimeframe):
+            raise TypeError(
+                f"timeframe must be an instance of SupportedTimeframe, got {type(self.timeframe).__name__}"
+            )
+
+        # 3. Timeframe-grid-aligned boundaries
+        step_ms = self.timeframe.duration_ms
+        if self.requested_since_ms % step_ms != 0:
             raise ValueError(
-                f"Invalid content_fingerprint format: '{self.content_fingerprint}'. "
-                "Must match ^sha256:[0-9a-f]{64}$."
+                f"requested_since_ms ({self.requested_since_ms}) is not grid-aligned to "
+                f"{self.timeframe} ({step_ms}ms)."
+            )
+        if self.requested_until_ms % step_ms != 0:
+            raise ValueError(
+                f"requested_until_ms ({self.requested_until_ms}) is not grid-aligned to "
+                f"{self.timeframe} ({step_ms}ms)."
             )
         if self.requested_until_ms <= self.requested_since_ms:
             raise ValueError(
                 f"requested_until_ms ({self.requested_until_ms}) must be strictly greater "
                 f"than requested_since_ms ({self.requested_since_ms})."
             )
+
+        # 4. Identity validation
         if not self.dataset_identity.strip():
             raise ValueError("dataset_identity cannot be empty.")
+
+        # 5. Full-string regex validation for content fingerprint
+        if not re.fullmatch(r"^sha256:[0-9a-f]{64}$", self.content_fingerprint):
+            raise ValueError(
+                f"Invalid content_fingerprint format: '{self.content_fingerprint}'. "
+                "Must match ^sha256:[0-9a-f]{64}$ exactly."
+            )
+
+        # 6. Quality report consistency
+        if not isinstance(self.quality_report, DataQualityReport):
+            raise TypeError(
+                f"quality_report must be DataQualityReport, got {type(self.quality_report).__name__}"
+            )
+        if self.quality_report.since_ms != self.requested_since_ms:
+            raise ValueError(
+                f"Quality report since_ms ({self.quality_report.since_ms}) does not match "
+                f"requested_since_ms ({self.requested_since_ms})."
+            )
+        if self.quality_report.until_ms != self.requested_until_ms:
+            raise ValueError(
+                f"Quality report until_ms ({self.quality_report.until_ms}) does not match "
+                f"requested_until_ms ({self.requested_until_ms})."
+            )
+        if self.quality_report.timeframe != self.timeframe:
+            raise ValueError(
+                f"Quality report timeframe ({self.quality_report.timeframe}) does not match "
+                f"context timeframe ({self.timeframe})."
+            )
+
+        # 7. Quality report internal mathematical invariants
+        if self.quality_report.gap_count != len(self.quality_report.gaps):
+            raise ValueError(
+                f"Quality report gap_count ({self.quality_report.gap_count}) does not match "
+                f"gaps length ({len(self.quality_report.gaps)})."
+            )
+        if self.quality_report.missing_intervals < 0:
+            raise ValueError(f"Quality report missing_intervals cannot be negative: {self.quality_report.missing_intervals}")
+        if self.quality_report.expected_records != (
+            self.quality_report.actual_records + self.quality_report.missing_intervals
+        ):
+            raise ValueError("Quality report expected_records != actual_records + missing_intervals.")
 ```
 
 ---
 
-### 3.3 Strategy Decision Contract & Deep Immutability
+### 3.3 Strategy Output & Auditable Decision Records
 
-Every strategy evaluation produces a single, fully auditable, deeply immutable `StrategyDecision` representing the quantitative conclusion for the latest closed candle:
+To maintain pristine separation between pure strategy calculation and snapshot auditability, M2 defines two distinct records:
+
+1. **`StrategyOutput`:** Emitted directly by `Strategy.evaluate(history, strategy_context)`. It contains the strategy's causal mathematical conclusion.
+2. **`StrategyDecision`:** Assembled by `StrategyEvaluator.evaluate(history, evaluation_context)`. It embeds the `StrategyOutput` and attaches verified snapshot provenance (`dataset_identity`, `dataset_content_fingerprint`).
 
 ```python
+import math
+import re
 import types
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Mapping
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 
@@ -213,29 +342,57 @@ from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 MetadataScalar = int | float | str | bool
 
 
-@dataclass(frozen=True, slots=True)
-class StrategyDecision:
-    """Immutable record of a deterministic strategy evaluation result."""
+def _validate_utc_datetime(dt: datetime, field_name: str) -> None:
+    if not isinstance(dt, datetime):
+        raise TypeError(f"{field_name} must be a datetime instance, got {type(dt).__name__}")
+    if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
+        raise ValueError(
+            f"{field_name} must be a timezone-aware UTC datetime with zero offset, got: {dt!r}"
+        )
 
-    # Identity & Provenance
+
+def _validate_metadata(metadata: Mapping[str, Any]) -> types.MappingProxyType:
+    for k, v in metadata.items():
+        if not isinstance(k, str):
+            raise TypeError(f"Metadata key must be str, got {type(k).__name__}: {k!r}")
+        # Exact allowed scalar types: int (excluding non-bool/int confusion), float, str, bool
+        if type(v) not in (int, float, str, bool):
+            raise TypeError(
+                f"Metadata value for key '{k}' must be primitive scalar (int, float, str, bool), "
+                f"got {type(v).__name__}: {v!r}"
+            )
+        # Finite float check
+        if type(v) is float and (math.isnan(v) or math.isinf(v)):
+            raise ValueError(f"Metadata float value for key '{k}' must be finite, got: {v}")
+    return types.MappingProxyType(dict(metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyOutput:
+    """Pure, causal research output emitted by Strategy.evaluate().
+    
+    Contains strictly the strategy's calculated signal, reason code, and indicator metadata
+    for the latest completed candle.
+    """
+
     strategy_id: str
     strategy_version: str
     config_fingerprint: str
-    dataset_content_fingerprint: str
-
-    # Market & Time Coordinates
     symbol: str
     timeframe: SupportedTimeframe
     source_candle_open_time: datetime
     source_candle_close_time: datetime
     decision_time: datetime
-
-    # Decision Output
     signal: ResearchSignal
     reason_code: str
     metadata: Mapping[str, MetadataScalar]
 
     def __post_init__(self) -> None:
+        # Timezone-aware UTC timestamp validation
+        _validate_utc_datetime(self.source_candle_open_time, "source_candle_open_time")
+        _validate_utc_datetime(self.source_candle_close_time, "source_candle_close_time")
+        _validate_utc_datetime(self.decision_time, "decision_time")
+
         # Strict Point-in-Time Causality Check
         if self.decision_time != self.source_candle_close_time:
             raise ValueError(
@@ -248,25 +405,61 @@ class StrategyDecision:
             raise ValueError("strategy_id cannot be empty.")
         if not self.reason_code.strip():
             raise ValueError("reason_code cannot be empty.")
-        if not re.match(r"^sha256:[0-9a-f]{64}$", self.config_fingerprint):
+        if not re.fullmatch(r"^sha256:[0-9a-f]{64}$", self.config_fingerprint):
             raise ValueError(f"Invalid config_fingerprint format: '{self.config_fingerprint}'.")
-        if not re.match(r"^sha256:[0-9a-f]{64}$", self.dataset_content_fingerprint):
+
+        # Enforce Deep Immutability and wrap in MappingProxyType
+        object.__setattr__(self, "metadata", _validate_metadata(self.metadata))
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyDecision:
+    """Immutable, fully auditable record of a strategy evaluation assembled by StrategyEvaluator.
+    
+    Combines the strategy's causal output with the verified M1 dataset snapshot provenance.
+    """
+
+    # Evaluator-Attached Snapshot Provenance
+    dataset_identity: str
+    dataset_content_fingerprint: str
+
+    # Strategy Output Identity & Coordinates
+    strategy_id: str
+    strategy_version: str
+    config_fingerprint: str
+    symbol: str
+    timeframe: SupportedTimeframe
+    source_candle_open_time: datetime
+    source_candle_close_time: datetime
+    decision_time: datetime
+
+    # Decision Output
+    signal: ResearchSignal
+    reason_code: str
+    metadata: Mapping[str, MetadataScalar]
+
+    def __post_init__(self) -> None:
+        # Validate attached provenance
+        if not self.dataset_identity.strip():
+            raise ValueError("dataset_identity cannot be empty.")
+        if not re.fullmatch(r"^sha256:[0-9a-f]{64}$", self.dataset_content_fingerprint):
             raise ValueError(f"Invalid dataset_content_fingerprint format: '{self.dataset_content_fingerprint}'.")
 
-        # Enforce Deep Immutability and Type Restriction on Metadata
-        for k, v in self.metadata.items():
-            if not isinstance(k, str):
-                raise TypeError(f"Metadata key must be str, got {type(k).__name__}: {k!r}")
-            if not isinstance(v, (int, float, str, bool)) or isinstance(v, bool) and not isinstance(v, bool):
-                raise TypeError(
-                    f"Metadata value for key '{k}' must be primitive scalar (int, float, str, bool), "
-                    f"got {type(v).__name__}: {v!r}"
-                )
-            if isinstance(v, float) and (v != v or v == float("inf") or v == float("-inf")):
-                raise ValueError(f"Metadata float value for key '{k}' must be finite, got: {v}")
+        # Timezone-aware UTC timestamp validation
+        _validate_utc_datetime(self.source_candle_open_time, "source_candle_open_time")
+        _validate_utc_datetime(self.source_candle_close_time, "source_candle_close_time")
+        _validate_utc_datetime(self.decision_time, "decision_time")
 
-        # Wrap in read-only mapping proxy to prevent in-place mutation
-        object.__setattr__(self, "metadata", types.MappingProxyType(dict(self.metadata)))
+        if self.decision_time != self.source_candle_close_time:
+            raise ValueError(
+                f"Causality violation: decision_time ({self.decision_time.isoformat()}) "
+                f"must strictly equal source_candle_close_time ({self.source_candle_close_time.isoformat()})."
+            )
+        if self.source_candle_close_time <= self.source_candle_open_time:
+            raise ValueError("source_candle_close_time must be strictly after source_candle_open_time.")
+
+        # Enforce Deep Immutability
+        object.__setattr__(self, "metadata", _validate_metadata(self.metadata))
 ```
 
 ---
@@ -275,10 +468,11 @@ class StrategyDecision:
 
 Strategy parameters are encapsulated in an immutable configuration model capable of deterministic SHA-256 fingerprinting.
 
-#### Supported Data Types & Validation:
-- Permitted configuration values are strictly limited to primitive JSON scalars: `int`, `float`, `str`, `bool`, and tuples of these scalars.
-- Arbitrary Python objects, callable functions, dictionaries, sets, and nested dataclasses are disallowed to guarantee universal cross-platform serialization.
-- Special floating-point values (`NaN`, positive infinity, negative infinity) are strictly rejected.
+#### Genuine Immutability & Supported Data Types:
+- Permitted configuration values are strictly limited to **exact primitive scalar types** (`int`, `float`, `str`, `bool`) and **immutable tuples of permitted scalar types**.
+- **Mutable objects are strictly rejected:** `list`, `dict`, `set`, and arbitrary objects raise `TypeError`.
+- Non-finite floats (`NaN`, positive infinity, negative infinity) are strictly rejected.
+- Because Python primitive scalars and tuples are deeply immutable, no reference inside `StrategyConfig` can be mutated after instantiation.
 - Fingerprint generation utilizes canonical JSON serialization: UTF-8 encoding, keys sorted lexicographically, and compact delimiters `separators=(',', ':')`.
 
 ```python
@@ -290,25 +484,33 @@ from typing import Any
 
 
 def _validate_config_value(val: Any) -> None:
-    if isinstance(val, (int, str, bool)):
+    # Exact primitive scalar types
+    if type(val) is bool:
         return
-    if isinstance(val, float):
+    if type(val) is int:
+        return
+    if type(val) is str:
+        return
+    if type(val) is float:
         if math.isnan(val) or math.isinf(val):
             raise ValueError(f"Non-finite float value not permitted in configuration: {val}")
         return
-    if isinstance(val, (tuple, list)):
+    # Immutable tuples of permitted scalars
+    if type(val) is tuple:
         for item in val:
             _validate_config_value(item)
         return
+    # All other types (including list, dict, set, custom objects) are rejected
     raise TypeError(
         f"Unsupported configuration value type: {type(val).__name__}. "
-        "Only int, float, str, bool, and tuples thereof are permitted."
+        "Only primitive scalars (int, float, str, bool) and immutable tuples thereof are permitted. "
+        "Lists, dictionaries, sets, and mutable objects are strictly prohibited."
     )
 
 
 @dataclass(frozen=True)
 class StrategyConfig:
-    """Base class for immutable strategy configuration parameters."""
+    """Base class for deeply immutable strategy configuration parameters."""
 
     def __post_init__(self) -> None:
         for k, v in asdict(self).items():
@@ -328,7 +530,7 @@ class StrategyConfig:
 
 ---
 
-### 3.5 Gap Policy Specification
+### 3.5 Gap Policy Specification & Prefix Enforcement
 
 Each strategy must explicitly state its operational policy when confronting missing intervals. In accordance with OQI V2 data invariants, unaligned timestamps are **always invalid** and can never be accepted by any gap policy.
 
@@ -345,17 +547,17 @@ class GapPolicy(str, Enum):
     Missing intervals are NEVER silently patched, forward-filled, or interpolated.
     """
     STRICT_GAP_FREE = "STRICT_GAP_FREE"
-    """Strict initial policy: Reject evaluation if ANY gap event exists in the evaluated window
-    or candle history (gap_count > 0)."""
+    """Strict initial policy: Reject evaluation if ANY gap event exists in the evaluated prefix
+    (gap_count > 0 in the prefix quality report)."""
 
     REJECT_INTERNAL_GAPS = "REJECT_INTERNAL_GAPS"
-    """Reject evaluation if any INTERNAL gap exists between candles in the series.
-    Leading or trailing gaps (where dataset boundaries do not cover the entire requested window)
-    are permitted provided the evaluated history itself is continuous."""
+    """Reject evaluation if any INTERNAL gap exists between candles in the evaluation prefix.
+    Leading gaps (where dataset boundaries do not cover the requested window start)
+    are permitted provided the evaluated prefix itself is continuous."""
 ```
 
-> [!NOTE]
-> The previously contemplated `ALLOW_UNALIGNED_GAP_EXPLICIT` has been permanently removed. M0 and M1 enforce rigid timeframe grid alignment; unaligned candles represent data corruption and cannot be accepted under any quantitative evaluation policy.
+#### Prefix Gap Enforcement Rule:
+Gap policy is enforced **strictly against the historical evaluation prefix** ($[T_{\text{since}}, T_{\text{close}, i})$). The evaluator computes or verifies a prefix `DataQualityReport` covering only the evaluated prefix. Future gaps occurring strictly after $T_{\text{close}, i}$ have zero effect on whether the evaluation at candle $i$ succeeds or fails.
 
 ---
 
@@ -400,15 +602,16 @@ class Strategy(Protocol):
     def evaluate(
         self,
         history: Sequence[Candle],
-        context: EvaluationContext,
-    ) -> StrategyDecision:
-        """Evaluate history ending at history[-1] and return a deterministic StrategyDecision.
+        context: StrategyContext,
+    ) -> StrategyOutput:
+        """Evaluate historical prefix ending at history[-1] and return a deterministic StrategyOutput.
         
         Invariants:
         1. Pure function: No I/O, no network, no database, no system clock, no state mutation.
         2. history is strictly ordered, non-empty, and satisfies len(history) >= minimum_history_candles.
-        3. context supplies valid dataset provenance matching ^sha256:[0-9a-f]{64}$ and M1 quality metadata.
-        4. Decision corresponds strictly to the close boundary of history[-1].
+        3. context contains strictly causal metadata (symbol, timeframe, prefix quality report).
+        4. Strategy has zero access to future candles, future gaps, or full-snapshot fingerprints.
+        5. Output corresponds strictly to the close boundary of history[-1].
         """
         ...
 ```
@@ -439,16 +642,19 @@ M2 does NOT re-implement data validation or gap detection from scratch. Instead,
 
 ---
 
-### 4.2 Evaluator Pre-Flight Verification Rules
+### 4.2 Evaluator Pre-Flight Verification & Context Consistency Rules
 
 The `StrategyEvaluator` sits between dataset storage and the `Strategy.evaluate()` method. Before calling `strategy.evaluate()`, the evaluator performs the following pre-flight checks:
 
 ```text
 Input: Sequence[Candle], EvaluationContext
    │
-   ├─► Check 1: Provenance & Fingerprint Validation
-   │     - Validate context.content_fingerprint matches ^sha256:[0-9a-f]{64}$
-   │     - Validate context.dataset_identity is non-empty
+   ├─► Check 1: Comprehensive EvaluationContext Consistency Check
+   │     - Exact integer type checks for requested_since_ms, requested_until_ms (reject bool/float)
+   │     - SupportedTimeframe runtime type check
+   │     - Grid alignment: since_ms and until_ms must be multiples of duration_ms
+   │     - Full-string regex on content_fingerprint (^sha256:[0-9a-f]{64}$)
+   │     - Quality report consistency: window, timeframe, and gap_count == len(gaps) invariants
    │
    ├─► Check 2: Non-Empty & Closed Status
    │     - len(history) > 0
@@ -470,15 +676,19 @@ Input: Sequence[Candle], EvaluationContext
    ├─► Check 6: Grid Alignment Check
    │     - Confirm zero unaligned candles. Unaligned candles raise StrategyEvaluationError immediately.
    │
-   ├─► Check 7: Gap Policy Enforcement
-   │     - Inspect context.quality_report
+   ├─► Check 7: Prefix Quality Derivation & Gap Policy Enforcement
+   │     - Compute prefix quality report: analyze_dataset_quality(history[:T+1], ...)
    │     - If strategy.gap_policy == STRICT_GAP_FREE:
-   │         Reject if context.quality_report.gap_count > 0
+   │         Reject if prefix quality report has gap_count > 0
    │     - If strategy.gap_policy == REJECT_INTERNAL_GAPS:
-   │         Reject if any gap event has gap_type == GapType.INTERNAL
+   │         Reject if prefix quality report contains any INTERNAL gap
+   │
+   ├─► Check 8: Strategy Evaluation (Zero Future Data)
+   │     - Construct StrategyContext(symbol, timeframe, prefix_quality_report)
+   │     - Invoke output = strategy.evaluate(history[:T+1], strategy_context)
    │
    ▼
-Passes Pre-Flight -> Execute strategy.evaluate(history, context)
+Assembles StrategyDecision(output + context.dataset_identity + context.content_fingerprint)
 ```
 
 ---
@@ -541,7 +751,7 @@ Timeline (1h Timeframe):
                       At exactly 11:00:00Z:             │
                       1. C_0 is finalized               │
                       2. Strategy evaluates C_0         │
-                      3. Emits Decision(T_decision=11:00)
+                      3. Emits Output(T_decision=11:00) │
                               │                         │
                               └────────────────────────►│
                                    Market Activity      │
@@ -549,7 +759,7 @@ Timeline (1h Timeframe):
                                                 At exactly 12:00:00Z:
                                                 1. C_1 is finalized
                                                 2. Strategy evaluates [C_0, C_1]
-                                                3. Emits Decision(T_decision=12:00)
+                                                3. Emits Output(T_decision=12:00)
 ```
 
 ---
@@ -595,7 +805,7 @@ State Transition Diagram (Research Stance Managed by M3 Simulator):
          └───────────┘
 ```
 
-*Prefix Invariance Property:* Strategies must be stateless pure functions. When evaluating a historical series $C_0, \dots, C_T$, the decision produced for $C_T$ must be completely invariant to whether previous evaluation calls were made on earlier sub-slices.
+*Prefix Invariance Property:* Strategies must be stateless pure functions. When evaluating a historical series $C_0, \dots, C_T$, the decision produced for $C_T$ must be completely invariant to whether previous evaluation calls were made on earlier sub-slices or whether future data exists.
 
 ---
 
@@ -607,8 +817,8 @@ M2 explicitly stops at decision generation. The following responsibilities belon
 |---|:---:|:---:|---|
 | Directional research intent (`LONG`/`FLAT`/`HOLD`) | **YES** | Consumes M2 | Strategy logic defines intention. |
 | Reason code & indicator metadata | **YES** | Consumes M2 | Explains why strategy signaled. |
-| Evaluation context & provenance metadata | **YES** | Supplies M2 | Caller verifies M1 Parquet snapshot. |
-| Pre-flight quality & lookback enforcement | **YES** | Pre-condition | Evaluator verifies series validity. |
+| Causal prefix data quality | **YES** | Pre-condition | Evaluator verifies prefix series. |
+| Snapshot provenance & audit attachment | **YES** | Post-evaluation | Evaluator attaches M1 fingerprint. |
 | Portfolio cash & coin balance tracking | **NO** | **YES** | Strategies do not manage accounts. |
 | Position sizing, leverage & margin | **NO** | **YES** | Risk & capital allocation concern. |
 | Order execution modeling (Next-Bar Open fills) | **NO** | **YES** | Simulation engine fill model concern. |
@@ -692,10 +902,10 @@ To ensure clean separation of concerns and maintainability without over-engineer
 
 ```text
 src/open_quant_intelligence/strategy/
-├── __init__.py          # Public exports: Strategy, StrategyConfig, EvaluationContext, StrategyDecision, ResearchSignal
-├── contracts.py         # Protocols, StrategyConfig, EvaluationContext, GapPolicy, exception hierarchy
-├── signals.py           # ResearchSignal enum, StrategyDecision, ReasonCode constants
-├── evaluator.py         # StrategyEvaluator: M0/M1 validation wrapper, causality & lookback enforcement
+├── __init__.py          # Public exports: Strategy, StrategyConfig, StrategyContext, StrategyOutput, StrategyDecision, EvaluationContext, ResearchSignal
+├── contracts.py         # Protocols, StrategyConfig, StrategyContext, EvaluationContext, GapPolicy, exception hierarchy
+├── signals.py           # ResearchSignal enum, StrategyOutput, StrategyDecision, ReasonCode constants
+├── evaluator.py         # StrategyEvaluator: M0/M1 validation wrapper, prefix quality derivation, causality & lookback enforcement
 └── baseline.py          # Migrated baseline strategy implementation (BLOCKED ON OWNER INPUT)
 ```
 
@@ -703,18 +913,22 @@ src/open_quant_intelligence/strategy/
 
 1. **`contracts.py`:**
    - Defines `Strategy` protocol via `typing.Protocol`.
-   - Defines `EvaluationContext` immutable dataclass with fingerprint validation and M1 quality report.
+   - Defines `StrategyContext` causal context dataclass (strictly causal, zero future info).
+   - Defines `EvaluationContext` full-dataset provenance dataclass with rigorous consistency validation.
    - Defines `StrategyConfig` frozen base class with canonical SHA-256 fingerprinting.
    - Defines `GapPolicy` enum (`STRICT_GAP_FREE`, `REJECT_INTERNAL_GAPS`).
    - Defines clean exception hierarchy (`StrategyEvaluationError`, `InsufficientHistoryError`, etc.).
 2. **`signals.py`:**
    - Defines `ResearchSignal` (`LONG`, `FLAT`, `HOLD`).
-   - Defines `StrategyDecision` frozen dataclass with post-init causality checks and deeply immutable `metadata`.
+   - Defines `StrategyOutput` frozen dataclass for pure strategy calculation results.
+   - Defines `StrategyDecision` frozen dataclass for the final auditable evaluation record.
+   - Enforces timezone-aware UTC timestamps, deep immutability, and exact scalar metadata types.
    - Defines standard `ReasonCode` constants (`WARMUP_INSUFFICIENT`, `LONG_SIGNAL_GENERATED`, `FLAT_SIGNAL_GENERATED`, `NO_CONDITION_MET`).
 3. **`evaluator.py`:**
    - Defines `StrategyEvaluator`.
-   - Encapsulates pre-flight verification: checks candle completeness (`is_closed`), homogeneity, chronological sequence (`validate_candles`), lookback (`InsufficientHistoryError`), grid alignment, and gap policy.
-   - Pure orchestrator ensuring strategies never encounter unvetted or corrupt inputs.
+   - Encapsulates pre-flight verification: checks candle completeness (`is_closed`), homogeneity, chronological sequence (`validate_candles`), lookback (`InsufficientHistoryError`), grid alignment, and `EvaluationContext` consistency.
+   - Derives prefix quality reports and enforces `GapPolicy` on the historical prefix.
+   - Attaches snapshot provenance to create `StrategyDecision`.
 4. **`baseline.py`:**
    - Implements the concrete baseline strategy adhering strictly to `Strategy`.
    - Contains zero dependencies outside standard library and OQI domain models.
@@ -733,7 +947,7 @@ Reproducibility is a fundamental pillar of quantitative research. Milestone M2 e
 
 ```text
 ┌────────────────────────────────────────────────────────┐
-│ Input Artifact Provenance                              │
+│ Evaluator Input Provenance                             │
 │   - M1 Dataset Content Fingerprint: sha256:[0-9a-f]{64}│
 │   - Candle Count & Requested Window Bounds             │
 │   - M1 DataQualityReport                               │
@@ -748,12 +962,21 @@ Reproducibility is a fundamental pillar of quantitative research. Milestone M2 e
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
-                [ Pure Function: evaluate() ]
+     [ Pure Function: evaluate(history[:T+1], strategy_context) ]
                             │
                             ▼
 ┌────────────────────────────────────────────────────────┐
-│ Deterministic Output Decision                          │
-│   - Identical Signal, Reason Code, and Provenance      │
+│ StrategyOutput (Causal Decision)                       │
+│   - Identical Signal, Reason Code, and Metadata        │
+└───────────────────────────┬────────────────────────────┘
+                            │
+                            ▼
+       [ Evaluator attaches verified snapshot provenance ]
+                            │
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ StrategyDecision (Full Audit Record)                   │
+│   - StrategyOutput + Dataset Provenance                │
 │   - Floating-Point Indicators Verified Within Tolerance│
 └────────────────────────────────────────────────────────┘
 ```
@@ -767,12 +990,11 @@ Reproducibility is a fundamental pillar of quantitative research. Milestone M2 e
    - `strategy_id` (`str`)
    - `strategy_version` (`str`)
    - `config_fingerprint` (`str`)
-   - `dataset_content_fingerprint` (`str`)
    - `symbol` (`str`)
    - `timeframe` (`SupportedTimeframe`)
-   - `source_candle_open_time` (`datetime`)
-   - `source_candle_close_time` (`datetime`)
-   - `decision_time` (`datetime`)
+   - `source_candle_open_time` (`datetime`, UTC)
+   - `source_candle_close_time` (`datetime`, UTC)
+   - `decision_time` (`datetime`, UTC)
 2. **Floating-Point Tolerances on Metadata:**
    Universal bit-for-bit identity across disparate CPU architectures and compiler optimizations is mathematically unattainable for general transcendental floating-point operations. Numeric indicator values stored in `metadata` are evaluated using documented tolerances:
    $$\text{rel\_tol} = 10^{-9}, \quad \text{abs\_tol} = 10^{-12}$$
@@ -791,10 +1013,17 @@ When implementation is authorized, M2 will deliver a comprehensive, offline, det
 ### 9.1 Unit Test Coverage Areas
 
 1. **Protocol & Contract Enforcement (`test_strategy_contracts.py`):**
-   - Verify `StrategyDecision` is frozen and rejects unequal `decision_time` vs `source_candle_close_time`.
-   - Verify `StrategyDecision` rejects mutable or non-scalar metadata and wraps metadata in `MappingProxyType`.
-   - Verify `StrategyConfig` calculates deterministic SHA-256 fingerprints across Python dictionaries and rejects non-finite floats (`NaN`, `inf`).
-   - Verify `EvaluationContext` validates content fingerprint format (`^sha256:[0-9a-f]{64}$`) and requested bounds.
+   - Verify `StrategyOutput` and `StrategyDecision` are frozen and reject unequal `decision_time` vs `source_candle_close_time`.
+   - Verify `StrategyOutput` and `StrategyDecision` reject naive timestamps (requiring UTC-aware datetimes with zero offset).
+   - Verify `StrategyOutput` and `StrategyDecision` reject mutable or non-scalar metadata, and wrap metadata in `MappingProxyType`.
+   - Verify `StrategyConfig` calculates deterministic SHA-256 fingerprints across immutable configuration instances with scalar and tuple attributes.
+   - Verify `StrategyConfig` rejects mutable attributes (`list`, `dict`, `set`) and non-finite floats (`NaN`, `inf`).
+   - Verify `EvaluationContext` validation:
+     - Rejection of boolean or float timestamp bounds.
+     - Rejection of invalid timeframe runtime types.
+     - Rejection of off-grid timestamp bounds.
+     - Rejection of invalid content fingerprint formats (full-string regex check).
+     - Rejection of mismatched or mathematically inconsistent `DataQualityReport` instances.
    - Verify `Strategy` protocol enforcement via `isinstance()` checks.
 2. **Evaluator Pre-Flight & Safety (`test_strategy_evaluator.py`):**
    - Rejection of empty candle sequences.
@@ -804,13 +1033,21 @@ When implementation is authorized, M2 will deliver a comprehensive, offline, det
    - Rejection of mixed timeframes (e.g., mixing `1h` with `15m`).
    - Rejection of out-of-order or duplicate timestamps via M0 `validate_candles()`.
    - Rejection of unaligned candle timestamps.
-3. **Data Quality & Gap Policy Enforcement (`test_strategy_gap_policy.py`):**
-   - Behavior under `STRICT_GAP_FREE`: raises `StrategyDataGapError` on any missing interval.
-   - Behavior under `REJECT_INTERNAL_GAPS`: permits valid history with leading/trailing gaps outside evaluated sequence, but strictly rejects internal gaps.
+3. **Data Quality & Prefix Gap Policy Enforcement (`test_strategy_gap_policy.py`):**
+   - Verify that prefix quality reports are computed strictly over $[T_{\text{since}}, T_{\text{close}, i})$.
+   - Behavior under `STRICT_GAP_FREE`: raises `StrategyDataGapError` on any missing interval in the prefix.
+   - Behavior under `REJECT_INTERNAL_GAPS`: permits valid history with leading gaps outside the prefix, but strictly rejects internal gaps.
+   - Verification that future gaps occurring strictly after $T_{\text{close}, i}$ do NOT trigger gap errors for the evaluation of candle $i$.
    - Verification that no forward-filling or interpolation ever takes place.
 4. **Causality & Prefix-Invariance (`test_strategy_causality.py`):**
-   - **Prefix-Invariance Test:** For history sequence $C_0, \dots, C_T$ followed by future candles $C_{T+1}, \dots, C_{T+k}$, prove that `evaluate(history[:T+1], context)` produces the exact same decision whether future candles exist, are truncated, or have modified prices.
-   - Prove that decision at $T$ is mathematically independent of all information where $t \ge T_{\text{close}}$.
+   - **Prefix-Invariance Invariant Definition:**
+     Given identical historical prefixes through candle $T$ ($C_0, \dots, C_T$), changes to candles strictly after $T$ must not change the strategy-derived decision for $T$.
+   - **Scenario 1 (Future Candle Modification):**
+     Create dataset $D_1 = [C_0, \dots, C_T, C_{T+1}]$ and dataset $D_2 = [C_0, \dots, C_T, C'_{T+1}]$, where candle $C'_{T+1}$ has modified open/high/low/close prices and volume. Assert that strategy outputs for candle $T$ are 100% identical between $D_1$ and $D_2$ across `signal`, `reason_code`, `strategy_id`, `strategy_version`, `config_fingerprint`, timestamps, and indicator metadata.
+   - **Scenario 2 (Future Gap Introduction):**
+     Create dataset $D_3 = [C_0, \dots, C_T, C_{T+2}]$, introducing a missing interval strictly after $T$. Assert that strategy outputs for candle $T$ remain 100% identical to $D_1$.
+   - **Full-Dataset Provenance Verification:**
+     Assert that while `dataset_content_fingerprint` on `StrategyDecision` differs between $D_1$, $D_2$, and $D_3$ (reflecting whole-snapshot variation), it has zero influence on the strategy's evaluation at candle $T$.
 5. **Idempotency & Isolation (`test_strategy_determinism.py`):**
    - Run `evaluate()` 1,000 times consecutively on identical inputs. Prove output decisions, timestamps, reason codes, and indicator floats match perfectly within defined tolerances.
    - Run parallel evaluations across multiple threads/processes. Assert zero cross-contamination.
@@ -842,9 +1079,10 @@ To maintain focus and avoid architectural bloat, the following capabilities are 
 | Risk | Impact | Mitigation Strategy |
 |---|---|---|
 | **Lack of Legacy Baseline Specification** | High (Blocks M2 completion) | Documented clearly as an unresolved owner dependency. Implementation cannot start until owner supplies reference specification and golden fixtures. |
-| **Lookahead Bias Leakage** | High (Invalidates research results) | Mathematically locked causality: `decision_time == source_candle_close_time`. Pre-flight evaluator enforces strict sequential timestamps and prefix invariance. |
-| **Silent Gap Corruption** | Medium (Flawed indicator math) | M1 `DataQualityReport` reused; `GapPolicy` strictly enforced; unaligned candles rejected; silent forward-filling prohibited. |
+| **Lookahead Bias & Future Data Leakage** | High (Invalidates research results) | Strategies receive only causal historical prefixes and `StrategyContext`. Snapshot provenance and future-window reports are evaluator-owned. Mathematically locked causality: `decision_time == source_candle_close_time`. Prefix-invariance tests with modified future candles and future gaps. |
+| **Silent Gap Corruption** | Medium (Flawed indicator math) | Prefix `DataQualityReport` derived per evaluation; `GapPolicy` strictly enforced; unaligned candles rejected; silent forward-filling prohibited. |
 | **Float Discrepancies Across Platforms** | Low (Minor parity mismatch) | Exact equality on discrete fields; documented relative/absolute tolerances (`rel_tol=1e-9`, `abs_tol=1e-12`) on floating-point metadata. |
+| **Mutable Configuration Tampering** | Medium (Breaks provenance integrity) | `_validate_config_value()` rejects lists, dicts, and mutable containers; permits only exact primitive scalars and immutable tuples; guarantees unalterable fingerprints. |
 
 ---
 
@@ -861,16 +1099,14 @@ The following items are presented for review and approval:
    - *Question:* Should M3 introduce an optimized vectorized evaluation method (`evaluate_series()`) that computes rolling indicators over NumPy arrays for fast backtesting?
    - *Recommendation:* Keep `Strategy.evaluate(history, context)` as the single canonical single-candle contract in M2. Batch vectorization should be explored in M3 as an optimization, verified for 100% parity against the M2 point-in-time evaluator.
 
-*(Note: Previous Open Decision 3 regarding warmup behavior has been resolved: canonical behavior is established as raising `InsufficientHistoryError`.)*
-
 ---
 
 ## 12. M2 Completion Criteria
 
 Milestone M2 will be considered complete and ready for merge into `main` when:
 
-1. The `Strategy` protocol, `StrategyConfig`, `EvaluationContext`, `ResearchSignal`, and `StrategyDecision` contracts are implemented under `src/open_quant_intelligence/strategy/`.
-2. The `StrategyEvaluator` is implemented, enforcing M0 `validate_candles()`, M1 quality reports, gap policies, and point-in-time causality.
+1. The `Strategy` protocol, `StrategyConfig`, `StrategyContext`, `StrategyOutput`, `StrategyDecision`, and `EvaluationContext` contracts are implemented under `src/open_quant_intelligence/strategy/`.
+2. The `StrategyEvaluator` is implemented, enforcing M0 `validate_candles()`, causal prefix quality reports, gap policies, context consistency, and point-in-time causality.
 3. The Project Owner supplies the baseline specification and reference fixtures.
 4. The baseline strategy is implemented and verified against the golden reference test suite with 100% discrete parity and indicator tolerance conformity.
 5. All offline unit tests pass cleanly across Python 3.11 and 3.12 on both Ubuntu and Windows CI runners.
