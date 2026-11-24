@@ -18,11 +18,12 @@
 2. [Current Architecture & M0/M1 Compatibility](#2-current-architecture--m0m1-compatibility)
 3. [Strategy Interface & Data Contracts](#3-strategy-interface--data-contracts)
    - 3.1 [Research Signal Vocabulary & HOLD Semantics](#31-research-signal-vocabulary--hold-semantics)
-   - 3.2 [Strategy Causal Context vs Evaluator Dataset Provenance](#32-strategy-causal-context-vs-evaluator-dataset-provenance)
-   - 3.3 [Strategy Output & Auditable Decision Records](#33-strategy-output--auditable-decision-records)
-   - 3.4 [Strategy Configuration & Deterministic Fingerprinting](#34-strategy-configuration--deterministic-fingerprinting)
-   - 3.5 [Gap Policy Specification & Prefix Enforcement](#35-gap-policy-specification--prefix-enforcement)
-   - 3.6 [The Strategy Protocol](#36-the-strategy-protocol)
+   - 3.2 [Strategy Candle Contract & Ingestion Isolation](#32-strategy-candle-contract--ingestion-isolation)
+   - 3.3 [Strategy Causal Context vs Evaluator Dataset Provenance](#33-strategy-causal-context-vs-evaluator-dataset-provenance)
+   - 3.4 [Strategy Output & Auditable Decision Records](#34-strategy-output--auditable-decision-records)
+   - 3.5 [Strategy Configuration & Deterministic Fingerprinting](#35-strategy-configuration--deterministic-fingerprinting)
+   - 3.6 [Gap Policy Specification & Prefix Enforcement](#36-gap-policy-specification--prefix-enforcement)
+   - 3.7 [The Strategy Protocol](#37-the-strategy-protocol)
 4. [Input Validation & Data-Quality Policy](#4-input-validation--data-quality-policy)
    - 4.1 [Re-use of M0 and M1 Public APIs](#41-re-use-of-m0-and-m1-public-apis)
    - 4.2 [Two Distinct Evaluation Stages: Snapshot Verification vs Causal Prefix Evaluation](#42-two-distinct-evaluation-stages-snapshot-verification-vs-causal-prefix-evaluation)
@@ -51,23 +52,24 @@ Milestone M2 transitions Open Quant Intelligence V2 from a robust, crash-resilie
 
 In quantitative finance, strategies frequently suffer from subtle production-backtest divergence caused by hidden state mutation, lookahead leakage, loose timestamp conventions, unhandled missing data intervals, or implicit coupling to portfolio simulation engines. M2 eliminates these vulnerabilities by enforcing a **pure functional paradigm**:
 
-$$\text{StrategyOutput} = f(\text{Immutable Strategy Config}, \text{Validated Historical Candles } [C_0, \dots, C_T], \text{Causal Strategy Context})$$
+$$\text{StrategyOutput} = f(\text{Immutable Strategy Config}, \text{Canonical Strategy Candles } [SC_0, \dots, SC_T], \text{Causal Strategy Context})$$
 $$\text{StrategyDecision} = \text{Evaluator}(\text{StrategyOutput}, \text{Verified M1 Snapshot Provenance})$$
 
 ### Core Objectives of M2:
 
 1. **Strict Future-Data Isolation:** Separate strategy-visible causal inputs from full-dataset snapshot provenance. Strategy implementations evaluate only historical candle prefixes and causal metadata available at or before candle close $T_{\text{close}}$. Full dataset fingerprints, requested window bounds extending past $T$, and full-window quality reports remain strictly evaluator-owned.
-2. **Distinct Verification Stages:** Separate dataset-level snapshot verification (confirming that supplied candle series matches M1 snapshot metadata, record counts, and canonical content fingerprint) from per-candle strategy evaluation (constructing causal prefixes, deriving prefix data quality, and enforcing gap policy).
-3. **Rigorous Context Consistency:** Define exhaustive consistency validation for evaluator-held `EvaluationContext` (typed `MarketIdentity`, type checks rejecting booleans/floats for timestamps, grid alignment via `timeframe_to_timedelta()`, full-string regex, and authoritative M1 `DataQualityReport` mathematical invariants).
-4. **Explicit, Minimal Strategy Protocol:** Define a formal `Strategy` interface contract with an immutable configuration identity, semantic versioning, declared minimum lookback history, and explicit gap handling policy.
-5. **Deterministic Point-in-Time Evaluation:** Ensure evaluation functions as a pure mathematical transformation of finalized historical candles $[T_{\text{open}}, T_{\text{close}})$. Evaluation is strictly isolated from side effects: zero file I/O, zero network calls, zero database queries, zero system clock access, and zero pseudo-randomness.
-6. **Structured Research Intentions (Signals):** Standardize research signal vocabulary into three unambiguous states: `LONG`, `FLAT`, and `HOLD`. These express directional research intention, completely detached from exchange order execution, position sizing, margin, or leverage.
-7. **Rigorous Data Quality Re-use:** Enforce that strategies evaluate only fully closed candles (`is_closed=True`) validated against M0 schema invariants (`validate_candles`) and M1 gap detection (`analyze_dataset_quality`). Unaligned candle timestamps are strictly rejected. Data is never silently sorted, interpolated, or forward-filled.
-8. **Canonical Warmup Handling:** Enforce a single canonical behavior for insufficient history: raise `InsufficientHistoryError` whenever available history is less than `strategy.minimum_history_candles`. No dummy or fabricated decisions are emitted without an eligible source candle.
-9. **Genuine Configuration Immutability:** Enforce strict type constraints on strategy configurations (primitive scalars and immutable tuples thereof; no lists, dicts, or mutable containers) to guarantee that configuration fingerprints are permanently unalterable.
-10. **Robust Prefix-Invariance Verification:** Formulate lookahead tests that evaluate decisions for candle $T$ under mutations of future candles and introduction of future gaps, verifying that strategy decisions remain 100% identical.
-11. **Baseline Migration with Parity Verification:** Provide a formal golden-test migration methodology for the project's baseline strategy while explicitly documenting the current absence of legacy strategy code as an **unresolved owner-input dependency blocker**.
-12. **Strict Milestone Boundaries:** Confine M2 strictly to decision evaluation. All execution loops, fill assumptions, slippage, commission modeling, portfolio state tracking, and performance metrics are quarantined to Milestone M3.
+2. **Canonical Market Data Projection:** Define an immutable `StrategyCandle` view containing only canonical fingerprinted market data fields (`open_time`, `close_time`, `open`, `high`, `low`, `close`, `base_volume`, `quote_volume`, `trade_count`). Ingestion-only metadata (`source`, `fetched_at`) is strictly excluded from strategy inputs, guaranteeing that strategies can never couple to ingestion infrastructure or artifact provenance.
+3. **Distinct Verification Stages:** Separate dataset-level snapshot verification (confirming that supplied candle series matches M1 snapshot metadata, record counts, and canonical content fingerprint) from per-candle strategy evaluation (constructing causal prefixes, deriving prefix data quality, and enforcing gap policy).
+4. **Rigorous Context Consistency:** Define exhaustive consistency validation for evaluator-held `EvaluationContext` (typed `MarketIdentity`, type checks rejecting booleans/floats for timestamps, grid alignment via `timeframe_to_timedelta()`, full-string regex, and authoritative M1 `DataQualityReport` mathematical invariants).
+5. **Explicit, Minimal Strategy Protocol:** Define a formal `Strategy` interface contract with an immutable configuration identity, semantic versioning, declared minimum lookback history, and explicit gap handling policy.
+6. **Deterministic Point-in-Time Evaluation:** Ensure evaluation functions as a pure mathematical transformation of finalized historical candles $[T_{\text{open}}, T_{\text{close}})$. Evaluation is strictly isolated from side effects: zero file I/O, zero network calls, zero database queries, zero system clock access, and zero pseudo-randomness.
+7. **Structured Research Intentions (Signals):** Standardize research signal vocabulary into three unambiguous states: `LONG`, `FLAT`, and `HOLD`. These express directional research intention, completely detached from exchange order execution, position sizing, margin, or leverage.
+8. **Rigorous Data Quality Re-use:** Enforce that strategies evaluate only fully closed candles (`is_closed=True`) validated against M0 schema invariants (`validate_candles`) and M1 gap detection (`analyze_dataset_quality`). Unaligned candle timestamps are strictly rejected. Data is never silently sorted, interpolated, or forward-filled.
+9. **Canonical Warmup Handling:** Enforce a single canonical behavior for insufficient history: raise `InsufficientHistoryError` whenever available history is less than `strategy.minimum_history_candles`. No dummy or fabricated decisions are emitted without an eligible source candle.
+10. **Genuine Configuration Immutability:** Enforce strict type constraints on strategy configurations (primitive scalars and immutable tuples thereof; no lists, dicts, or mutable containers) to guarantee that configuration fingerprints are permanently unalterable.
+11. **Robust Prefix-Invariance Verification:** Formulate lookahead tests that evaluate decisions for candle $T$ under mutations of future candles and introduction of future gaps, verifying that strategy decisions remain 100% identical.
+12. **Baseline Migration with Parity Verification:** Provide a formal golden-test migration methodology for the project's baseline strategy while explicitly documenting the current absence of legacy strategy code as an **unresolved owner-input dependency blocker**.
+13. **Strict Milestone Boundaries:** Confine M2 strictly to decision evaluation. All execution loops, fill assumptions, slippage, commission modeling, portfolio state tracking, and performance metrics are quarantined to Milestone M3.
 
 ---
 
@@ -107,8 +109,10 @@ Milestone M2 operates strictly as a consumer of M0 domain contracts and M1 datas
 │   - Stage B: Causal Prefix Evaluation per Candle T                     │
 │       * Constructs historical prefix history[:T+1]                     │
 │       * Verifies is_closed for prefix candles                          │
+│       * Projects prefix to StrategyCandle (canonical market data only) │
 │       * Derives prefix DataQualityReport over [since, T.close_time)    │
 │       * Enforces strategy gap policy on prefix only                    │
+│   - StrategyCandle: Canonical market view (excludes source/fetched_at) │
 │   - Strategy Protocol & StrategyConfig (Deeply immutable)              │
 │   - StrategyContext: Causal prefix quality & parameters (No future)    │
 │   - StrategyOutput: Pure causal decision emitted by Strategy           │
@@ -128,7 +132,7 @@ Milestone M2 operates strictly as a consumer of M0 domain contracts and M1 datas
 
 ### Preserved System Invariants
 
-1. **Immutable Domain Models:** `Candle`, `MarketIdentity`, and `SupportedTimeframe` remain frozen. Strategy evaluation accepts `Sequence[Candle]` and cannot alter any candle attribute.
+1. **Immutable Domain Models:** `Candle`, `MarketIdentity`, and `SupportedTimeframe` remain frozen. Strategy evaluation operates strictly on `Sequence[StrategyCandle]` projected from verified M0 `Candle` objects and cannot alter any candle attribute.
 2. **Half-Open Intervals $[T_{\text{open}}, T_{\text{close}})$:**
    - `open_time` is the inclusive UTC start boundary instant.
    - `close_time` is the exclusive UTC upper boundary instant (`open_time + timeframe_to_timedelta(timeframe)`).
@@ -171,7 +175,94 @@ class ResearchSignal(str, Enum):
 
 ---
 
-### 3.2 Strategy Causal Context vs Evaluator Dataset Provenance
+### 3.2 Strategy Candle Contract & Ingestion Isolation
+
+In Open Quant Intelligence V2, M1's `compute_content_fingerprint()` hashes only the canonical market-data payload: `open_time`, `close_time`, `open`, `high`, `low`, `close`, `base_volume`, `quote_volume`, and `trade_count`. Ingestion metadata fields on M0 `Candle` (`source`, `fetched_at`) and incomplete status (`is_closed`) are **not** part of the content fingerprint.
+
+Allowing strategy implementations to access raw `Candle` objects would permit strategies to couple to ingestion-only metadata, potentially causing decisions to diverge across datasets with identical market content (e.g., historical Vision data vs live CCXT data, or different ingestion timestamps).
+
+To enforce strict separation between research evaluation and ingestion mechanics, M2 defines `StrategyCandle`:
+
+```python
+import math
+from dataclasses import dataclass
+from datetime import datetime
+from open_quant_intelligence.domain.candle import Candle
+
+
+@dataclass(frozen=True, slots=True)
+class StrategyCandle:
+    """Immutable, canonical market data view of a finalized candle for strategy evaluation.
+
+    Contains strictly the canonical fingerprinted market data fields:
+    - open_time: UTC-aware inclusive start boundary.
+    - close_time: UTC-aware exclusive close boundary.
+    - open: Finite, strictly positive open price.
+    - high: Finite, strictly positive high price.
+    - low: Finite, strictly positive low price.
+    - close: Finite, strictly positive close price.
+    - base_volume: Finite, non-negative base asset volume.
+    - quote_volume: Finite, non-negative quote asset volume (or None).
+    - trade_count: Non-negative integer trade count (or None).
+
+    Ingestion-only metadata (source, fetched_at) and series coordinates (exchange_id,
+    market_type, symbol, timeframe) are strictly excluded from strategy candle inputs.
+    Series coordinates reside authoritatively in StrategyContext.
+    """
+
+    open_time: datetime
+    close_time: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    base_volume: float
+    quote_volume: float | None = None
+    trade_count: int | None = None
+
+    def __post_init__(self) -> None:
+        _validate_utc_datetime(self.open_time, "open_time")
+        _validate_utc_datetime(self.close_time, "close_time")
+        if self.close_time <= self.open_time:
+            raise ValueError("close_time must be strictly after open_time.")
+        for name, val in (("open", self.open), ("high", self.high), ("low", self.low), ("close", self.close)):
+            if not isinstance(val, (int, float)) or isinstance(val, bool) or math.isnan(val) or math.isinf(val) or val <= 0:
+                raise ValueError(f"Price field '{name}' must be finite, strictly positive number, got: {val}")
+        if not isinstance(self.base_volume, (int, float)) or isinstance(self.base_volume, bool) or math.isnan(self.base_volume) or math.isinf(self.base_volume) or self.base_volume < 0:
+            raise ValueError(f"base_volume must be finite, non-negative number, got: {self.base_volume}")
+        if self.quote_volume is not None:
+            if not isinstance(self.quote_volume, (int, float)) or isinstance(self.quote_volume, bool) or math.isnan(self.quote_volume) or math.isinf(self.quote_volume) or self.quote_volume < 0:
+                raise ValueError(f"quote_volume must be finite, non-negative number, got: {self.quote_volume}")
+        if self.trade_count is not None:
+            if type(self.trade_count) is not int or self.trade_count < 0:
+                raise ValueError(f"trade_count must be non-negative int, got: {self.trade_count}")
+
+    @classmethod
+    def from_candle(cls, candle: Candle) -> "StrategyCandle":
+        """Project an M0 Candle into an immutable StrategyCandle view.
+
+        The candle MUST have is_closed == True prior to projection.
+        """
+        if not candle.is_closed:
+            raise IncompleteCandleError(
+                f"Cannot project unclosed candle (open_time={candle.open_time.isoformat()}) into StrategyCandle."
+            )
+        return cls(
+            open_time=candle.open_time,
+            close_time=candle.close_time,
+            open=candle.open,
+            high=candle.high,
+            low=candle.low,
+            close=candle.close,
+            base_volume=candle.base_volume,
+            quote_volume=candle.quote_volume,
+            trade_count=candle.trade_count,
+        )
+```
+
+---
+
+### 3.3 Strategy Causal Context vs Evaluator Dataset Provenance
 
 To strictly eliminate **future-data leakage**, M2 separates strategy-visible causal parameters from evaluator-owned full snapshot provenance:
 
@@ -383,7 +474,7 @@ class EvaluationContext:
 
 ---
 
-### 3.3 Strategy Output & Auditable Decision Records
+### 3.4 Strategy Output & Auditable Decision Records
 
 To maintain pristine separation between pure strategy calculation and snapshot auditability, M2 defines two distinct records:
 
@@ -563,7 +654,7 @@ class StrategyDecision:
 
 ---
 
-### 3.4 Strategy Configuration & Deterministic Fingerprinting
+### 3.5 Strategy Configuration & Deterministic Fingerprinting
 
 Strategy parameters are encapsulated in an immutable configuration model capable of deterministic SHA-256 fingerprinting.
 
@@ -629,7 +720,7 @@ class StrategyConfig:
 
 ---
 
-### 3.5 Gap Policy Specification & Prefix Enforcement
+### 3.6 Gap Policy Specification & Prefix Enforcement
 
 Each strategy must explicitly state its operational policy when confronting missing intervals. In accordance with OQI V2 data invariants, unaligned timestamps are **always invalid** and can never be accepted by any gap policy.
 
@@ -660,7 +751,7 @@ Gap policy is enforced **strictly against the historical evaluation prefix** ($[
 
 ---
 
-### 3.6 The Strategy Protocol
+### 3.7 The Strategy Protocol
 
 The core strategy contract is defined as a Python `Protocol`:
 
@@ -700,7 +791,7 @@ class Strategy(Protocol):
 
     def evaluate(
         self,
-        history: Sequence[Candle],
+        history: Sequence[StrategyCandle],
         context: StrategyContext,
     ) -> StrategyOutput:
         """Evaluate historical prefix ending at history[-1] and return a deterministic StrategyOutput.
@@ -708,6 +799,7 @@ class Strategy(Protocol):
         Invariants:
         1. Pure function: No I/O, no network, no database, no system clock, no state mutation.
         2. history is strictly ordered, non-empty, and satisfies len(history) >= minimum_history_candles.
+        3. history contains only StrategyCandle views (canonical market data; zero ingestion metadata).
         3. context contains strictly causal metadata (symbol, timeframe, prefix quality report).
         4. Strategy has zero access to future candles, future gaps, or full-snapshot fingerprints.
         5. Output corresponds strictly to the close boundary of history[-1].
@@ -849,11 +941,15 @@ Input: supplied_candles[:T+1], target candle T
    │         Reject if any gap event in prefix_quality.gaps is GapType.INTERNAL
    │     * Future gaps occurring strictly after T.close_time do NOT affect candle T!
    │
-   ├─► Step B5: Pure Strategy Invocation (Zero Future Data)
-   │     - Construct StrategyContext(symbol=context.market.symbol, timeframe=context.timeframe, prefix_quality_report=prefix_quality)
-   │     - Invoke: output = strategy.evaluate(prefix_history, strategy_context)
+   ├─► Step B5: Project M0 Candle Prefix into Strategy-Facing Views
+   │     - strategy_candles = tuple(StrategyCandle.from_candle(c) for c in prefix_history)
+   │     * Strips source, fetched_at, and ingestion metadata; passes only canonical market data.
    │
-   ├─► Step B6: Validate Emitted StrategyOutput against Strategy & Target Candle
+   ├─► Step B6: Pure Strategy Invocation (Zero Future Data, Zero Ingestion Metadata)
+   │     - Construct StrategyContext(symbol=context.market.symbol, timeframe=context.timeframe, prefix_quality_report=prefix_quality)
+   │     - Invoke: output = strategy.evaluate(strategy_candles, strategy_context)
+   │
+   ├─► Step B7: Validate Emitted StrategyOutput against Strategy & Target Candle
    │     - Assert output.strategy_id == strategy.strategy_id
    │     - Assert output.strategy_version == strategy.version
    │     - Assert output.config_fingerprint == strategy.config.compute_fingerprint()
@@ -864,7 +960,7 @@ Input: supplied_candles[:T+1], target candle T
    │     - Assert output.decision_time == prefix_history[-1].close_time
    │     * Reject any mismatch with StrategyOutputMismatchError!
    │
-   ├─► Step B7: Assemble Final Auditable Decision
+   ├─► Step B8: Assemble Final Auditable Decision
    │     - Assemble StrategyDecision.assemble(
    │           output=output,
    │           dataset_identity=context.dataset_identity,
@@ -1097,8 +1193,8 @@ To ensure clean separation of concerns and maintainability without over-engineer
 
 ```text
 src/open_quant_intelligence/strategy/
-├── __init__.py          # Public exports: Strategy, StrategyConfig, StrategyContext, StrategyOutput, StrategyDecision, EvaluationContext, ResearchSignal
-├── contracts.py         # Protocols, StrategyConfig, StrategyContext, EvaluationContext, GapPolicy, exception hierarchy
+├── __init__.py          # Public exports: Strategy, StrategyConfig, StrategyCandle, StrategyContext, StrategyOutput, StrategyDecision, EvaluationContext, ResearchSignal
+├── contracts.py         # Protocols, StrategyConfig, StrategyCandle, StrategyContext, EvaluationContext, GapPolicy, exception hierarchy
 ├── signals.py           # ResearchSignal enum, StrategyOutput, StrategyDecision, ReasonCode constants
 ├── evaluator.py         # StrategyEvaluator: Stage A snapshot verification, Stage B causal prefix evaluation
 └── baseline.py          # Migrated baseline strategy implementation (BLOCKED ON OWNER INPUT)
@@ -1107,7 +1203,8 @@ src/open_quant_intelligence/strategy/
 ### Module Responsibilities:
 
 1. **`contracts.py`:**
-   - Defines `Strategy` protocol via `typing.Protocol`.
+   - Defines `Strategy` protocol via `typing.Protocol` accepting `Sequence[StrategyCandle]`.
+   - Defines `StrategyCandle` immutable canonical market data view (excludes `source`, `fetched_at`).
    - Defines `StrategyContext` causal context dataclass (strictly causal, zero future info).
    - Defines `EvaluationContext` full-dataset provenance dataclass with typed `MarketIdentity` and rigorous consistency validation.
    - Defines `StrategyConfig` frozen base class with canonical SHA-256 fingerprinting.
@@ -1161,7 +1258,8 @@ Reproducibility is a fundamental pillar of quantitative research. Milestone M2 e
 │ Stage B: Causal Prefix Evaluation                      │
 │   - Extracts prefix history[:T+1]                      │
 │   - Derives causal prefix DataQualityReport            │
-│   - Invokes pure function: evaluate(prefix, context)   │
+│   - Projects prefix to StrategyCandle views            │
+│   - Invokes pure function: evaluate(candles, context)  │
 └───────────────────────────┬────────────────────────────┘
                             │
                             ▼
@@ -1236,6 +1334,9 @@ When implementation is authorized, M2 will deliver a comprehensive, offline, det
    - **Unclosed Prefix Candle:** Supply prefix containing a candle with `is_closed=False`; assert rejection with `IncompleteCandleError`.
    - **Unclosed Future Candle Isolation:** Supply full candle sequence where candle strictly after $T$ ($T+1$) has `is_closed=False`; assert that evaluation of candle $T$ succeeds without error.
    - **Strategy Output Mismatch Verification:** Mock a strategy that emits an output with mismatched `strategy_id`, `version`, `config_fingerprint`, `symbol`, `timeframe`, or timestamps; assert rejection with `StrategyOutputMismatchError`.
+   - **Ingestion Metadata Isolation Test:** Verify that `StrategyCandle` objects supplied to `strategy.evaluate()` do not possess `source` or `fetched_at` attributes (`hasattr(c, "source") is False`, `hasattr(c, "fetched_at") is False`).
+   - **Canonical Market Data Equivalence Test:** Construct two M0 `Candle` sequences with identical OHLCV, timestamps, quote volume, and trade count, but differing `source` (e.g. "binance_vision" vs "ccxt") and differing `fetched_at` timestamps. Assert that both sequences project to 100% identical `StrategyCandle` tuples and produce 100% identical `StrategyOutput` decisions.
+   - **Unclosed Projection Rejection Test:** Assert that attempting `StrategyCandle.from_candle(candle)` where `candle.is_closed=False` raises `IncompleteCandleError`.
 4. **Data Quality & Prefix Gap Policy Enforcement (`test_strategy_gap_policy.py`):**
    - Verify that prefix quality reports are computed strictly over $[T_{\text{since}}, T_{\text{close}, i})$.
    - Behavior under `STRICT_GAP_FREE`: raises `StrategyDataGapError` on any missing interval in the prefix.
@@ -1309,7 +1410,7 @@ The following items are presented for review and approval:
 
 Milestone M2 will be considered complete and ready for merge into `main` when:
 
-1. The `Strategy` protocol, `StrategyConfig`, `StrategyContext`, `StrategyOutput`, `StrategyDecision`, and `EvaluationContext` contracts are implemented under `src/open_quant_intelligence/strategy/`.
+1. The `Strategy` protocol, `StrategyConfig`, `StrategyCandle`, `StrategyContext`, `StrategyOutput`, `StrategyDecision`, and `EvaluationContext` contracts are implemented under `src/open_quant_intelligence/strategy/`.
 2. The `StrategyEvaluator` is implemented, enforcing Stage A full snapshot verification (including canonical content fingerprint recomputation) and Stage B per-candle causal prefix evaluation with M0 `validate_candles()`, `timeframe_to_timedelta()` grid alignment, causal prefix quality reports, gap policies, and point-in-time causality.
 3. The Project Owner supplies the baseline specification and reference fixtures.
 4. The baseline strategy is implemented and verified against the golden reference test suite with 100% discrete parity and indicator tolerance conformity.
