@@ -242,9 +242,27 @@ from open_quant_intelligence.data.quality import DataQualityReport
 class EvaluationContext:
     """Authoritative full-dataset provenance and verification metadata owned by StrategyEvaluator.
     
-    Database access remains strictly external to strategies. The caller retrieves data,
-    verifies snapshot integrity, computes the M1 DataQualityReport, and constructs this context.
-    This context is strictly held by StrategyEvaluator and NEVER passed to strategy instances.
+    Provenance Source:
+    `content_fingerprint` MUST originate from the selected committed M1 snapshot record
+    (`CatalogDatasetRecord.content_fingerprint_sha256`) in the DuckDB snapshot catalog.
+    The caller (e.g. backtest runner, CLI, or test harness) selects the authoritative committed
+    snapshot and uses its recorded `dataset_identity`, `content_fingerprint_sha256`, market coordinates,
+    timeframe, requested bounds (`requested_since`, `requested_until`), and record metadata to
+    construct this context.
+    
+    Independent Verification Guarantee:
+    Stage A independently recomputes the canonical content fingerprint from the supplied candles
+    and compares it against this catalog-sourced `content_fingerprint`. The reference fingerprint
+    MUST NOT be calculated from the same supplied candle sequence and treated as independent provenance.
+    
+    Hash Distinction:
+    The canonical content fingerprint (`OQICCF` stream digest) is strictly distinguished from the
+    physical Parquet `file_sha256`. The content fingerprint hashes the normalized candle stream
+    and metadata header, ensuring storage-independent provenance, whereas `file_sha256` represents
+    the raw on-disk bytes of a specific Parquet file.
+    
+    Database access remains strictly external to strategies. This context is strictly held by
+    StrategyEvaluator and NEVER passed to strategy instances.
     """
 
     market: MarketIdentity
@@ -779,12 +797,23 @@ Input: supplied_candles: Sequence[Candle], context: EvaluationContext
    │     - Symbol homogeneity: all candle.symbol == context.market.symbol
    │     - Full Quality Re-check: analyze_dataset_quality(supplied_candles, ...) == context.quality_report
    │
-   ├─► Step A5: Recompute Canonical Content Fingerprint
-   │     - recomputed_fp = compute_content_fingerprint(supplied_candles, context.market.exchange_id,
-   │           context.market.market_type, context.market.symbol, context.timeframe,
-   │           context.requested_since_ms, context.requested_until_ms)
-   │     - Assert recomputed_fp == context.content_fingerprint (raise SnapshotConsistencyError if mismatch)
-   │     * Guarantees verified snapshot fingerprint is never attached to mismatched or tampered data!
+   ├─► Step A5: Independent Recomputation of Canonical Content Fingerprint
+   │     - Reference fingerprint (context.content_fingerprint) originates authoritatively from
+   │       the selected committed M1 snapshot (CatalogDatasetRecord.content_fingerprint_sha256).
+   │     - Stage A independently recomputes:
+   │         recomputed_fp = compute_content_fingerprint(
+   │             candles=supplied_candles,
+   │             exchange_id=context.market.exchange_id,
+   │             market_type=context.market.market_type,
+   │             symbol=context.market.symbol,
+   │             timeframe=context.timeframe,
+   │             requested_since_ms=context.requested_since_ms,
+   │             requested_until_ms=context.requested_until_ms,
+   │         )
+   │     - Assert recomputed_fp == context.content_fingerprint (raise SnapshotConsistencyError if mismatch).
+   │     * Crucial: Reference fingerprint is NEVER calculated from the supplied candle sequence;
+   │       it must originate from the authoritative catalog record to guarantee independent provenance!
+   │     * Canonical content fingerprint (OQICCF stream digest) is strictly distinguished from Parquet file_sha256.
    ▼
 Snapshot Verified Successfully!
 
@@ -821,7 +850,7 @@ Input: supplied_candles[:T+1], target candle T
    │     * Future gaps occurring strictly after T.close_time do NOT affect candle T!
    │
    ├─► Step B5: Pure Strategy Invocation (Zero Future Data)
-   │     - Construct StrategyContext(symbol=context.market.symbol, timeframe=context.timeframe, prefix_quality)
+   │     - Construct StrategyContext(symbol=context.market.symbol, timeframe=context.timeframe, prefix_quality_report=prefix_quality)
    │     - Invoke: output = strategy.evaluate(prefix_history, strategy_context)
    │
    ├─► Step B6: Validate Emitted StrategyOutput against Strategy & Target Candle
