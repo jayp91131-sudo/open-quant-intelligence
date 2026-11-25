@@ -1205,6 +1205,21 @@ src/open_quant_intelligence/strategy/
 └── baseline.py          # Migrated baseline strategy implementation (BLOCKED ON OWNER INPUT)
 ```
 
+### Contract Dependency & Import Architecture:
+
+To guarantee zero circular import cycles between `contracts.py` and `signals.py`, the dependency hierarchy is strictly unidirectional at runtime:
+
+```text
+contracts.py
+    ├── _validate_utc_datetime
+    ├── StrategyCandle
+    ├── StrategyContext
+    └── Strategy (StrategyOutput imported only for type checking)
+
+signals.py
+    └── imports _validate_utc_datetime from contracts.py
+```
+
 ### Module Responsibilities:
 
 1. **`contracts.py`:**
