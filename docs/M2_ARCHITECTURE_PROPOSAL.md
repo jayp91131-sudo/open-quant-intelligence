@@ -181,13 +181,23 @@ In Open Quant Intelligence V2, M1's `compute_content_fingerprint()` hashes only 
 
 Allowing strategy implementations to access raw `Candle` objects would permit strategies to couple to ingestion-only metadata, potentially causing decisions to diverge across datasets with identical market content (e.g., historical Vision data vs live CCXT data, or different ingestion timestamps).
 
-To enforce strict separation between research evaluation and ingestion mechanics, M2 defines `StrategyCandle`:
+To enforce strict separation between research evaluation and ingestion mechanics, M2 defines `_validate_utc_datetime` (shared validation helper) and `StrategyCandle` in `open_quant_intelligence.strategy.contracts`:
 
 ```python
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from open_quant_intelligence.domain.candle import Candle
+
+
+def _validate_utc_datetime(dt: datetime, field_name: str) -> None:
+    """Validate that a datetime is a timezone-aware UTC datetime with zero offset."""
+    if not isinstance(dt, datetime):
+        raise TypeError(f"{field_name} must be a datetime instance, got {type(dt).__name__}")
+    if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
+        raise ValueError(
+            f"{field_name} must be a timezone-aware UTC datetime with zero offset, got: {dt!r}"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,9 +215,10 @@ class StrategyCandle:
     - quote_volume: Finite, non-negative quote asset volume (or None).
     - trade_count: Non-negative integer trade count (or None).
 
-    Ingestion-only metadata (source, fetched_at) and series coordinates (exchange_id,
-    market_type, symbol, timeframe) are strictly excluded from strategy candle inputs.
-    Series coordinates reside authoritatively in StrategyContext.
+    Ingestion-only metadata (source, fetched_at) and dataset coordinates (exchange_id,
+    market_type) are strictly excluded from strategy candle inputs.
+    Dataset coordinates remain evaluator-owned in EvaluationContext; only the market
+    fields declared in StrategyContext (symbol, timeframe) are strategy-visible.
     """
 
     open_time: datetime
@@ -486,22 +497,14 @@ import math
 import re
 import types
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Mapping
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.strategy.contracts import _validate_utc_datetime
 
 
 # Permitted primitive scalar types for decision metadata
 MetadataScalar = int | float | str | bool
-
-
-def _validate_utc_datetime(dt: datetime, field_name: str) -> None:
-    if not isinstance(dt, datetime):
-        raise TypeError(f"{field_name} must be a datetime instance, got {type(dt).__name__}")
-    if dt.tzinfo is None or dt.utcoffset() != timezone.utc.utcoffset(dt):
-        raise ValueError(
-            f"{field_name} must be a timezone-aware UTC datetime with zero offset, got: {dt!r}"
-        )
 
 
 def _validate_metadata(metadata: Mapping[str, Any]) -> types.MappingProxyType:
@@ -753,11 +756,13 @@ Gap policy is enforced **strictly against the historical evaluation prefix** ($[
 
 ### 3.7 The Strategy Protocol
 
-The core strategy contract is defined as a Python `Protocol`:
+The core strategy contract is defined as a Python `Protocol` in `contracts.py`. Note that `StrategyOutput` is imported under `TYPE_CHECKING` so that `signals.py` importing `_validate_utc_datetime` from `contracts.py` causes zero circular imports at runtime:
 
 ```python
-from typing import Protocol, Sequence, runtime_checkable
-from open_quant_intelligence.domain.candle import Candle
+from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
+
+if TYPE_CHECKING:
+    from open_quant_intelligence.strategy.signals import StrategyOutput
 
 
 @runtime_checkable
@@ -793,7 +798,7 @@ class Strategy(Protocol):
         self,
         history: Sequence[StrategyCandle],
         context: StrategyContext,
-    ) -> StrategyOutput:
+    ) -> "StrategyOutput":
         """Evaluate historical prefix ending at history[-1] and return a deterministic StrategyOutput.
         
         Invariants:
@@ -1203,7 +1208,8 @@ src/open_quant_intelligence/strategy/
 ### Module Responsibilities:
 
 1. **`contracts.py`:**
-   - Defines `Strategy` protocol via `typing.Protocol` accepting `Sequence[StrategyCandle]`.
+   - Defines `_validate_utc_datetime` shared UTC datetime validation helper before `StrategyCandle`.
+   - Defines `Strategy` protocol via `typing.Protocol` accepting `Sequence[StrategyCandle]` (uses `TYPE_CHECKING` for `StrategyOutput` return type annotation to prevent circular import with `signals.py`).
    - Defines `StrategyCandle` immutable canonical market data view (excludes `source`, `fetched_at`).
    - Defines `StrategyContext` causal context dataclass (strictly causal, zero future info).
    - Defines `EvaluationContext` full-dataset provenance dataclass with typed `MarketIdentity` and rigorous consistency validation.
@@ -1211,6 +1217,7 @@ src/open_quant_intelligence/strategy/
    - Defines `GapPolicy` enum (`STRICT_GAP_FREE`, `REJECT_INTERNAL_GAPS`).
    - Defines clean exception hierarchy (`StrategyEvaluationError`, `InsufficientHistoryError`, `SnapshotConsistencyError`, `EmptyDatasetError`, `StrategyOutputMismatchError`).
 2. **`signals.py`:**
+   - Imports `_validate_utc_datetime` shared helper from `contracts.py`.
    - Defines `ResearchSignal` (`LONG`, `FLAT`, `HOLD`).
    - Defines `StrategyOutput` frozen dataclass for pure strategy calculation results.
    - Defines `StrategyDecision` frozen dataclass assembling `StrategyOutput` and snapshot provenance via `StrategyDecision.assemble()`.
