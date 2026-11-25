@@ -7,13 +7,20 @@ import pytest
 
 from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.strategy.contracts import SnapshotConsistencyError
+from open_quant_intelligence.strategy.contracts import (
+    GapPolicy,
+    SnapshotConsistencyError,
+    StrategyCandle,
+    StrategyConfig,
+    StrategyContext,
+)
 from open_quant_intelligence.strategy.evaluator import StrategyEvaluator
 from open_quant_intelligence.strategy.signals import (
     ReasonCode,
     ResearchSignal,
     StrategyDecision,
     StrategyOutput,
+    ValidatedStrategyOutput,
 )
 from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
@@ -131,7 +138,52 @@ def test_strategy_output_immutability() -> None:
 
 
 def test_strategy_decision_assemble_and_delegation(tmp_path: Path) -> None:
-    out = _make_valid_output()
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class _Cfg(StrategyConfig):
+        pass
+
+    class _Strat:
+        def __init__(self) -> None:
+            self._cfg = _Cfg()
+
+        @property
+        def strategy_id(self) -> str:
+            return "trend_follow"
+
+        @property
+        def version(self) -> str:
+            return "1.0.0"
+
+        @property
+        def config(self) -> StrategyConfig:
+            return self._cfg
+
+        @property
+        def minimum_history_candles(self) -> int:
+            return 1
+
+        @property
+        def gap_policy(self) -> GapPolicy:
+            return GapPolicy.STRICT_GAP_FREE
+
+        def evaluate(self, history: tuple[StrategyCandle, ...], context: StrategyContext) -> StrategyOutput:
+            target = history[-1]
+            return StrategyOutput(
+                strategy_id=self.strategy_id,
+                strategy_version=self.version,
+                config_fingerprint=self.config.compute_fingerprint(),
+                symbol=context.symbol,
+                timeframe=context.timeframe,
+                source_candle_open_time=target.open_time,
+                source_candle_close_time=target.close_time,
+                decision_time=target.close_time,
+                signal=ResearchSignal.LONG,
+                reason_code=ReasonCode.LONG_SIGNAL_GENERATED,
+                metadata={"fast_ma": 50100.0},
+            )
+
     c = Candle(
         exchange_id="binance",
         market_type="spot",
@@ -147,19 +199,14 @@ def test_strategy_decision_assemble_and_delegation(tmp_path: Path) -> None:
         is_closed=True,
     )
     _, record, ctx = commit_and_build_context(tmp_path, [c])
-    verified_snapshot = StrategyEvaluator.verify_snapshot([c], ctx)
-
-    decision = StrategyDecision.assemble(
-        output=out,
-        verified_snapshot=verified_snapshot,
-    )
+    decision = StrategyEvaluator.evaluate_at([c], target_index=0, context=ctx, strategy=_Strat())
 
     assert decision.dataset_identity == record.dataset_identity
     assert decision.dataset_content_fingerprint == record.content_fingerprint_sha256
     assert decision.snapshot_id == record.snapshot_id
-    assert decision.output == out
 
-    # Delegating properties
+    # Delegating properties match embedded output
+    out = decision.output
     assert decision.strategy_id == out.strategy_id
     assert decision.strategy_version == out.strategy_version
     assert decision.config_fingerprint == out.config_fingerprint
@@ -172,12 +219,19 @@ def test_strategy_decision_assemble_and_delegation(tmp_path: Path) -> None:
     assert decision.reason_code == out.reason_code
     assert decision.metadata == out.metadata
 
+    # StrategyDecision is immutable
+    with pytest.raises(AttributeError):
+        decision.snapshot_id = "tampered"  # type: ignore
 
-def test_strategy_decision_rejections() -> None:
+
+def test_strategy_decision_rejections(tmp_path: Path) -> None:
     out = _make_valid_output()
     fp = "sha256:" + "b" * 64
 
-    # Direct instantiation without VerifiedSnapshot is rejected
+    # Public arbitrary-output StrategyDecision.assemble() path is removed
+    assert not hasattr(StrategyDecision, "assemble")
+
+    # Direct instantiation without evaluator validation is rejected
     with pytest.raises(SnapshotConsistencyError, match="cannot be constructed directly"):
         StrategyDecision(
             dataset_identity="binance:spot:BTC/USDT:1h:0:3600000",
@@ -186,6 +240,26 @@ def test_strategy_decision_rejections() -> None:
             output=out,
         )
 
-    # StrategyDecision.assemble() rejects unverified / non-VerifiedSnapshot objects
-    with pytest.raises(SnapshotConsistencyError, match="requires a VerifiedSnapshot"):
-        StrategyDecision.assemble(output=out, verified_snapshot="not-verified")  # type: ignore
+    # Direct ValidatedStrategyOutput construction is rejected
+    c = Candle(
+        exchange_id="binance",
+        market_type="spot",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        open_time=_make_utc_dt(10, 0),
+        close_time=_make_utc_dt(11, 0),
+        open=50000.0,
+        high=50500.0,
+        low=49500.0,
+        close=50200.0,
+        base_volume=10.0,
+        is_closed=True,
+    )
+    _, _, ctx = commit_and_build_context(tmp_path, [c])
+    verified_snapshot = StrategyEvaluator.verify_snapshot([c], ctx)
+    with pytest.raises(SnapshotConsistencyError, match="cannot be constructed directly"):
+        ValidatedStrategyOutput(verified_snapshot=verified_snapshot, target_index=0, output=out)
+
+    # _assemble_verified rejects unverified objects
+    with pytest.raises(SnapshotConsistencyError, match="requires a ValidatedStrategyOutput"):
+        StrategyDecision._assemble_verified("not-validated")  # type: ignore

@@ -476,10 +476,15 @@ class EvaluationContext:
 
 @dataclass(frozen=True, slots=True)
 class VerifiedSnapshot:
-    """Immutable verification proof issued exclusively by StrategyEvaluator.verify_snapshot()."""
+    """Verified snapshot container issued by StrategyEvaluator.verify_snapshot().
+
+    Owns the immutable tuple of M0 Candle objects verified by Stage A alongside
+    the catalog-backed EvaluationContext, using a module-internal construction guard
+    so Stage B only consumes the exact verified candle sequence.
+    """
 
     context: EvaluationContext
-    candle_count: int
+    candles: tuple[Candle, ...]
     _token: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
@@ -490,15 +495,22 @@ class VerifiedSnapshot:
             )
         if not isinstance(self.context, EvaluationContext):
             raise TypeError(f"context must be EvaluationContext, got {type(self.context).__name__}")
-        if type(self.candle_count) is not int or self.candle_count <= 0:
-            raise ValueError(f"candle_count must be positive int, got {self.candle_count}")
+        if not isinstance(self.candles, tuple) or not self.candles:
+            raise ValueError("candles must be a non-empty tuple of Candle objects.")
+        if not all(isinstance(c, Candle) for c in self.candles):
+            raise TypeError("All elements of VerifiedSnapshot.candles must be Candle instances.")
+
+    @property
+    def candle_count(self) -> int:
+        """Number of verified candles held by this snapshot."""
+        return len(self.candles)
 
 
-def _issue_verified_snapshot(context: EvaluationContext, candle_count: int) -> VerifiedSnapshot:
+def _issue_verified_snapshot(context: EvaluationContext, candles: Sequence[Candle]) -> VerifiedSnapshot:
     """Internal factory for StrategyEvaluator to issue a VerifiedSnapshot."""
     return VerifiedSnapshot(
         context=context,
-        candle_count=candle_count,
+        candles=tuple(candles),
         _token=_VERIFIED_SNAPSHOT_TOKEN,
     )
 

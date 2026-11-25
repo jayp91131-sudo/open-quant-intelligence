@@ -19,10 +19,12 @@ from open_quant_intelligence.domain.timeframe import SupportedTimeframe
 from open_quant_intelligence.strategy.contracts import (
     _VERIFIED_SNAPSHOT_TOKEN,
     SnapshotConsistencyError,
+    StrategyOutputMismatchError,
     VerifiedSnapshot,
     _validate_utc_datetime,
 )
 
+_VALIDATED_OUTPUT_TOKEN = object()
 _VERIFIED_DECISION_TOKEN = object()
 
 # -----------------------------------------------------------------------------
@@ -136,6 +138,77 @@ class StrategyOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class ValidatedStrategyOutput:
+    """Evaluator-validated StrategyOutput bound to a specific VerifiedSnapshot and target candle.
+
+    Uses a module-internal construction guard so it can only be issued after
+    Stage A snapshot verification and Stage B output validation.
+    """
+
+    verified_snapshot: VerifiedSnapshot
+    target_index: int
+    output: StrategyOutput
+    _token: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._token is not _VALIDATED_OUTPUT_TOKEN:
+            raise SnapshotConsistencyError(
+                "ValidatedStrategyOutput cannot be constructed directly; "
+                "it must be produced by StrategyEvaluator after output validation."
+            )
+        if not isinstance(self.verified_snapshot, VerifiedSnapshot) or (
+            self.verified_snapshot._token is not _VERIFIED_SNAPSHOT_TOKEN
+        ):
+            raise SnapshotConsistencyError("ValidatedStrategyOutput requires a VerifiedSnapshot.")
+        if not isinstance(self.output, StrategyOutput):
+            raise TypeError(f"output must be StrategyOutput, got {type(self.output).__name__}")
+        if type(self.target_index) is not int or not (0 <= self.target_index < len(self.verified_snapshot.candles)):
+            raise IndexError(
+                f"target_index ({self.target_index}) out of range [0, {len(self.verified_snapshot.candles)})."
+            )
+
+        target_candle = self.verified_snapshot.candles[self.target_index]
+        ctx = self.verified_snapshot.context
+        if self.output.symbol != ctx.market.symbol:
+            raise StrategyOutputMismatchError(
+                f"StrategyOutput symbol '{self.output.symbol}' does not match '{ctx.market.symbol}'."
+            )
+        if self.output.timeframe != ctx.timeframe:
+            raise StrategyOutputMismatchError(
+                f"StrategyOutput timeframe '{self.output.timeframe.value}' does not match '{ctx.timeframe.value}'."
+            )
+        if self.output.source_candle_open_time != target_candle.open_time:
+            raise StrategyOutputMismatchError(
+                f"StrategyOutput source_candle_open_time ({self.output.source_candle_open_time.isoformat()}) "
+                f"does not match target candle open_time ({target_candle.open_time.isoformat()})."
+            )
+        if self.output.source_candle_close_time != target_candle.close_time:
+            raise StrategyOutputMismatchError(
+                f"StrategyOutput source_candle_close_time ({self.output.source_candle_close_time.isoformat()}) "
+                f"does not match target candle close_time ({target_candle.close_time.isoformat()})."
+            )
+        if self.output.decision_time != target_candle.close_time:
+            raise StrategyOutputMismatchError(
+                f"StrategyOutput decision_time ({self.output.decision_time.isoformat()}) "
+                f"does not match target candle close_time ({target_candle.close_time.isoformat()})."
+            )
+
+
+def _issue_validated_output(
+    verified_snapshot: VerifiedSnapshot,
+    target_index: int,
+    output: StrategyOutput,
+) -> ValidatedStrategyOutput:
+    """Internal factory for StrategyEvaluator to bind validated output to a VerifiedSnapshot."""
+    return ValidatedStrategyOutput(
+        verified_snapshot=verified_snapshot,
+        target_index=target_index,
+        output=output,
+        _token=_VALIDATED_OUTPUT_TOKEN,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class StrategyDecision:
     """Immutable, fully auditable record of a strategy evaluation assembled by StrategyEvaluator.
 
@@ -156,7 +229,7 @@ class StrategyDecision:
         if self._decision_token is not _VERIFIED_DECISION_TOKEN:
             raise SnapshotConsistencyError(
                 "StrategyDecision cannot be constructed directly; "
-                "it must be assembled with a VerifiedSnapshot via StrategyDecision.assemble()."
+                "it must be assembled by StrategyEvaluator from a ValidatedStrategyOutput."
             )
         if not isinstance(self.output, StrategyOutput):
             raise TypeError(f"output must be an instance of StrategyOutput, got {type(self.output).__name__}")
@@ -168,24 +241,18 @@ class StrategyDecision:
             raise ValueError(f"Invalid dataset_content_fingerprint format: '{self.dataset_content_fingerprint}'.")
 
     @classmethod
-    def assemble(
-        cls,
-        output: StrategyOutput,
-        verified_snapshot: VerifiedSnapshot,
-    ) -> StrategyDecision:
-        """Assemble an auditable decision record from verified output and Stage A verified snapshot."""
-        if (
-            not isinstance(verified_snapshot, VerifiedSnapshot)
-            or verified_snapshot._token is not _VERIFIED_SNAPSHOT_TOKEN
+    def _assemble_verified(cls, validated_output: ValidatedStrategyOutput) -> StrategyDecision:
+        """Internal assembly path requiring an evaluator-validated ValidatedStrategyOutput."""
+        if not isinstance(validated_output, ValidatedStrategyOutput) or (
+            validated_output._token is not _VALIDATED_OUTPUT_TOKEN
         ):
-            raise SnapshotConsistencyError(
-                "StrategyDecision.assemble() requires a VerifiedSnapshot issued by StrategyEvaluator.verify_snapshot()."
-            )
+            raise SnapshotConsistencyError("StrategyDecision._assemble_verified() requires a ValidatedStrategyOutput.")
+        ctx = validated_output.verified_snapshot.context
         return cls(
-            dataset_identity=verified_snapshot.context.dataset_identity,
-            dataset_content_fingerprint=verified_snapshot.context.content_fingerprint,
-            snapshot_id=verified_snapshot.context.snapshot_id,
-            output=output,
+            dataset_identity=ctx.dataset_identity,
+            dataset_content_fingerprint=ctx.content_fingerprint,
+            snapshot_id=ctx.snapshot_id,
+            output=validated_output.output,
             _decision_token=_VERIFIED_DECISION_TOKEN,
         )
 

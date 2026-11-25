@@ -416,9 +416,9 @@ def test_evaluation_context_validation(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Invalid content_fingerprint format"):
         EvaluationContext.from_catalog_record(bad_fp_record, report)
 
-    # Direct VerifiedSnapshot forgery is rejected
+    # Direct VerifiedSnapshot construction is rejected
     with pytest.raises(SnapshotConsistencyError, match="cannot be constructed directly"):
-        VerifiedSnapshot(context=ctx, candle_count=2)
+        VerifiedSnapshot(context=ctx, candles=tuple(candles))
 
 
 # -----------------------------------------------------------------------------

@@ -257,4 +257,97 @@ def test_stage_b_cannot_bypass_stage_a_regression(tmp_path: Path) -> None:
 
     # Direct _evaluate_at_verified with unverified object also fails
     with pytest.raises(SnapshotConsistencyError, match="requires a VerifiedSnapshot"):
-        StrategyEvaluator._evaluate_at_verified(candles, target_index=2, verified_snapshot=ctx, strategy=spy)  # type: ignore
+        StrategyEvaluator._evaluate_at_verified(target_index=2, verified_snapshot=ctx, strategy=spy)  # type: ignore
+
+
+def test_verified_snapshot_bound_to_exact_dataset_a_not_b(tmp_path: Path) -> None:
+    """Regression test: VerifiedSnapshot for dataset A cannot evaluate different same-length dataset B."""
+    dataset_a = _make_series(3)
+    _, record_a, ctx_a = commit_and_build_context(tmp_path / "a", dataset_a)
+
+    # Dataset B: identical count, market identity, timeframe, and timestamps, but different OHLCV values
+    dataset_b = [
+        Candle(
+            exchange_id=c.exchange_id,
+            market_type=c.market_type,
+            symbol=c.symbol,
+            timeframe=c.timeframe,
+            open_time=c.open_time,
+            close_time=c.close_time,
+            open=c.open + 1000.0,
+            high=c.high + 1000.0,
+            low=c.low + 1000.0,
+            close=c.close + 1000.0,
+            base_volume=c.base_volume + 5.0,
+            is_closed=True,
+        )
+        for c in dataset_a
+    ]
+
+    @dataclass(frozen=True)
+    class _Cfg(StrategyConfig):
+        pass
+
+    class _RecordingStrategy:
+        def __init__(self) -> None:
+            self._cfg = _Cfg()
+            self.seen_closes: list[float] = []
+
+        @property
+        def strategy_id(self) -> str:
+            return "recorder"
+
+        @property
+        def version(self) -> str:
+            return "1.0.0"
+
+        @property
+        def config(self) -> StrategyConfig:
+            return self._cfg
+
+        @property
+        def minimum_history_candles(self) -> int:
+            return 2
+
+        @property
+        def gap_policy(self) -> GapPolicy:
+            return GapPolicy.STRICT_GAP_FREE
+
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            self.seen_closes = [sc.close for sc in history]
+            target = history[-1]
+            return StrategyOutput(
+                strategy_id=self.strategy_id,
+                strategy_version=self.version,
+                config_fingerprint=self.config.compute_fingerprint(),
+                symbol=context.symbol,
+                timeframe=context.timeframe,
+                source_candle_open_time=target.open_time,
+                source_candle_close_time=target.close_time,
+                decision_time=target.close_time,
+                signal=ResearchSignal.LONG,
+                reason_code=ReasonCode.LONG_SIGNAL_GENERATED,
+                metadata={"close": target.close},
+            )
+
+    strat = _RecordingStrategy()
+
+    # 1. Verify dataset A -> VerifiedSnapshot owns dataset A's exact candles
+    verified_a = StrategyEvaluator.verify_snapshot(dataset_a, ctx_a)
+    assert verified_a.candles == tuple(dataset_a)
+
+    # 2. Supplying dataset B against ctx_a fails Stage A (cannot evaluate B with A's provenance)
+    with pytest.raises(SnapshotConsistencyError, match="Recomputed content fingerprint"):
+        StrategyEvaluator.evaluate_at(dataset_b, target_index=2, context=ctx_a, strategy=strat)
+
+    # 3. _evaluate_at_verified consumes only verified_a.candles (dataset A), never dataset B
+    decision = StrategyEvaluator._evaluate_at_verified(target_index=2, verified_snapshot=verified_a, strategy=strat)
+    assert strat.seen_closes == [c.close for c in dataset_a]
+    assert decision.dataset_content_fingerprint == record_a.content_fingerprint_sha256
+    assert decision.snapshot_id == record_a.snapshot_id
+
+    # 4. Normal evaluate_at and evaluate_series still work on dataset A
+    single_dec = StrategyEvaluator.evaluate_at(dataset_a, target_index=2, context=ctx_a, strategy=strat)
+    series_decs = StrategyEvaluator.evaluate_series(dataset_a, context=ctx_a, strategy=strat)
+    assert single_dec == decision
+    assert len(series_decs) == 2

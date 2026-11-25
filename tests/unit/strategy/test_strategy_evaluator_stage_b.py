@@ -221,6 +221,54 @@ def test_stage_b_strategy_output_mismatch_rejections(tmp_path: Path) -> None:
     with pytest.raises(StrategyOutputMismatchError, match="timeframe '4h' does not match"):
         StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadTfStrategy())
 
+    # Strategy that returns mismatched strategy_version
+    class BadVersionStrategy(DummyStrategy):
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            out = super().evaluate(history, context)
+            object.__setattr__(out, "strategy_version", "9.9.9")
+            return out
+
+    with pytest.raises(StrategyOutputMismatchError, match="strategy_version '9.9.9' does not match"):
+        StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadVersionStrategy())
+
+    # Strategy that returns mismatched config_fingerprint
+    class BadConfigFpStrategy(DummyStrategy):
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            out = super().evaluate(history, context)
+            object.__setattr__(out, "config_fingerprint", "sha256:" + "0" * 64)
+            return out
+
+    with pytest.raises(StrategyOutputMismatchError, match="config_fingerprint .* does not match"):
+        StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadConfigFpStrategy())
+
+    # Strategy that returns mismatched source_candle_open_time / close_time / decision_time
+    class BadOpenTimeStrategy(DummyStrategy):
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            out = super().evaluate(history, context)
+            object.__setattr__(out, "source_candle_open_time", history[0].open_time)
+            return out
+
+    with pytest.raises(StrategyOutputMismatchError, match="source_candle_open_time .* does not match"):
+        StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadOpenTimeStrategy())
+
+    class BadCloseTimeStrategy(DummyStrategy):
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            out = super().evaluate(history, context)
+            object.__setattr__(out, "source_candle_close_time", history[0].close_time)
+            return out
+
+    with pytest.raises(StrategyOutputMismatchError, match="source_candle_close_time .* does not match"):
+        StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadCloseTimeStrategy())
+
+    class BadDecisionTimeStrategy(DummyStrategy):
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            out = super().evaluate(history, context)
+            object.__setattr__(out, "decision_time", history[0].close_time)
+            return out
+
+    with pytest.raises(StrategyOutputMismatchError, match="decision_time .* does not match"):
+        StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadDecisionTimeStrategy())
+
 
 def test_stage_b_ingestion_metadata_isolation(tmp_path: Path) -> None:
     candles = _make_series(3)

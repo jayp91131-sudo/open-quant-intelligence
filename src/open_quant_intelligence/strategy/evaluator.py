@@ -16,6 +16,7 @@ from open_quant_intelligence.data.validation import validate_candles
 from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.storage.fingerprint import compute_content_fingerprint
 from open_quant_intelligence.strategy.contracts import (
+    _VERIFIED_SNAPSHOT_TOKEN,
     EmptyDatasetError,
     EvaluationContext,
     GapPolicy,
@@ -32,7 +33,11 @@ from open_quant_intelligence.strategy.contracts import (
     VerifiedSnapshot,
     _issue_verified_snapshot,
 )
-from open_quant_intelligence.strategy.signals import StrategyDecision, StrategyOutput
+from open_quant_intelligence.strategy.signals import (
+    StrategyDecision,
+    StrategyOutput,
+    _issue_validated_output,
+)
 
 
 class StrategyEvaluator:
@@ -166,33 +171,31 @@ class StrategyEvaluator:
 
         return _issue_verified_snapshot(
             context=context,
-            candle_count=len(supplied_candles),
+            candles=supplied_candles,
         )
 
     @classmethod
     def _evaluate_at_verified(
         cls,
-        supplied_candles: Sequence[Candle],
         target_index: int,
         verified_snapshot: VerifiedSnapshot,
         strategy: Strategy,
     ) -> StrategyDecision:
-        """Internal Stage B evaluator requiring a VerifiedSnapshot from Stage A."""
-        if not isinstance(verified_snapshot, VerifiedSnapshot):
+        """Internal Stage B evaluator consuming only the candles held by VerifiedSnapshot."""
+        if (
+            not isinstance(verified_snapshot, VerifiedSnapshot)
+            or verified_snapshot._token is not _VERIFIED_SNAPSHOT_TOKEN
+        ):
             raise SnapshotConsistencyError(
                 "Stage B evaluation requires a VerifiedSnapshot from StrategyEvaluator.verify_snapshot()."
             )
-        if len(supplied_candles) != verified_snapshot.candle_count:
-            raise SnapshotConsistencyError(
-                f"Supplied candle count ({len(supplied_candles)}) does not match "
-                f"verified snapshot count ({verified_snapshot.candle_count})."
-            )
+        candles = verified_snapshot.candles
         context = verified_snapshot.context
-        if not (0 <= target_index < len(supplied_candles)):
-            raise IndexError(f"target_index ({target_index}) out of range [0, {len(supplied_candles)}).")
+        if not (0 <= target_index < len(candles)):
+            raise IndexError(f"target_index ({target_index}) out of range [0, {len(candles)}).")
 
         # Step B1: Construct Historical Prefix & Lookback Check
-        prefix_history = supplied_candles[: target_index + 1]
+        prefix_history = candles[: target_index + 1]
         if len(prefix_history) < strategy.minimum_history_candles:
             raise InsufficientHistoryError(
                 f"Available history count ({len(prefix_history)}) is strictly less than "
@@ -295,11 +298,13 @@ class StrategyEvaluator:
                 f"does not match target candle close_time ({target_candle.close_time.isoformat()})."
             )
 
-        # Step B8: Assemble Final Auditable Decision
-        return StrategyDecision.assemble(
-            output=output,
+        # Step B8: Bind Validated Output & Assemble Final Auditable Decision
+        validated_output = _issue_validated_output(
             verified_snapshot=verified_snapshot,
+            target_index=target_index,
+            output=output,
         )
+        return StrategyDecision._assemble_verified(validated_output)
 
     @classmethod
     def evaluate_at(
@@ -312,7 +317,6 @@ class StrategyEvaluator:
         """Verify full snapshot via Stage A, then evaluate causal prefix at target_index."""
         verified_snapshot = cls.verify_snapshot(supplied_candles, context)
         return cls._evaluate_at_verified(
-            supplied_candles=supplied_candles,
             target_index=target_index,
             verified_snapshot=verified_snapshot,
             strategy=strategy,
@@ -344,16 +348,15 @@ class StrategyEvaluator:
 
         if start_index is None:
             first_eligible_index = strategy.minimum_history_candles - 1
-            if first_eligible_index >= len(supplied_candles):
+            if first_eligible_index >= len(verified_snapshot.candles):
                 return []
             start_idx = first_eligible_index
         else:
             start_idx = start_index
 
         decisions: list[StrategyDecision] = []
-        for i in range(start_idx, len(supplied_candles)):
+        for i in range(start_idx, len(verified_snapshot.candles)):
             decision = cls._evaluate_at_verified(
-                supplied_candles=supplied_candles,
                 target_index=i,
                 verified_snapshot=verified_snapshot,
                 strategy=strategy,
