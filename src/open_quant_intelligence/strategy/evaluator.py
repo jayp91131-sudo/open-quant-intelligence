@@ -29,6 +29,8 @@ from open_quant_intelligence.strategy.contracts import (
     StrategyDataGapError,
     StrategyEvaluationError,
     StrategyOutputMismatchError,
+    VerifiedSnapshot,
+    _issue_verified_snapshot,
 )
 from open_quant_intelligence.strategy.signals import StrategyDecision, StrategyOutput
 
@@ -41,7 +43,7 @@ class StrategyEvaluator:
         cls,
         supplied_candles: Sequence[Candle],
         context: EvaluationContext,
-    ) -> None:
+    ) -> VerifiedSnapshot:
         """Stage A: Verify supplied candles against authoritative catalog provenance.
 
         Invariants:
@@ -162,27 +164,30 @@ class StrategyEvaluator:
                 f"authoritative catalog snapshot fingerprint '{context.content_fingerprint}'."
             )
 
+        return _issue_verified_snapshot(
+            context=context,
+            candle_count=len(supplied_candles),
+        )
+
     @classmethod
-    def evaluate_at(
+    def _evaluate_at_verified(
         cls,
         supplied_candles: Sequence[Candle],
         target_index: int,
-        context: EvaluationContext,
+        verified_snapshot: VerifiedSnapshot,
         strategy: Strategy,
     ) -> StrategyDecision:
-        """Stage B: Evaluate a causal historical prefix ending at supplied_candles[target_index].
-
-        Invariants:
-        1. Extract prefix history [:target_index + 1].
-        2. Assert len(prefix_history) >= strategy.minimum_history_candles (raise InsufficientHistoryError).
-        3. Assert all prefix candles have is_closed == True (raise IncompleteCandleError).
-        4. Derive causal prefix DataQualityReport covering [requested_since_ms, target_candle.close_time).
-        5. Enforce strategy.gap_policy on prefix quality only.
-        6. Project prefix candles into immutable StrategyCandle views (stripping ingestion metadata).
-        7. Construct causal StrategyContext and evaluate strategy.
-        8. Validate emitted StrategyOutput against strategy identity, config, and target candle.
-        9. Assemble and return StrategyDecision with authoritative snapshot provenance.
-        """
+        """Internal Stage B evaluator requiring a VerifiedSnapshot from Stage A."""
+        if not isinstance(verified_snapshot, VerifiedSnapshot):
+            raise SnapshotConsistencyError(
+                "Stage B evaluation requires a VerifiedSnapshot from StrategyEvaluator.verify_snapshot()."
+            )
+        if len(supplied_candles) != verified_snapshot.candle_count:
+            raise SnapshotConsistencyError(
+                f"Supplied candle count ({len(supplied_candles)}) does not match "
+                f"verified snapshot count ({verified_snapshot.candle_count})."
+            )
+        context = verified_snapshot.context
         if not (0 <= target_index < len(supplied_candles)):
             raise IndexError(f"target_index ({target_index}) out of range [0, {len(supplied_candles)}).")
 
@@ -293,8 +298,24 @@ class StrategyEvaluator:
         # Step B8: Assemble Final Auditable Decision
         return StrategyDecision.assemble(
             output=output,
-            dataset_identity=context.dataset_identity,
-            dataset_content_fingerprint=context.content_fingerprint,
+            verified_snapshot=verified_snapshot,
+        )
+
+    @classmethod
+    def evaluate_at(
+        cls,
+        supplied_candles: Sequence[Candle],
+        target_index: int,
+        context: EvaluationContext,
+        strategy: Strategy,
+    ) -> StrategyDecision:
+        """Verify full snapshot via Stage A, then evaluate causal prefix at target_index."""
+        verified_snapshot = cls.verify_snapshot(supplied_candles, context)
+        return cls._evaluate_at_verified(
+            supplied_candles=supplied_candles,
+            target_index=target_index,
+            verified_snapshot=verified_snapshot,
+            strategy=strategy,
         )
 
     @classmethod
@@ -305,11 +326,11 @@ class StrategyEvaluator:
         strategy: Strategy,
         start_index: int | None = None,
     ) -> list[StrategyDecision]:
-        """Verify snapshot and evaluate strategy across all eligible candles in the series.
+        """Verify snapshot once via Stage A, then evaluate strategy across all eligible candles.
 
         Args:
             supplied_candles: Sequence of original M0 Candle instances.
-            context: Verified full EvaluationContext provenance.
+            context: Authoritative catalog-backed EvaluationContext provenance.
             strategy: Strategy instance adhering to Strategy protocol.
             start_index: Optional starting index. If None, defaults to
                          strategy.minimum_history_candles - 1 (evaluating all eligible candles).
@@ -319,7 +340,7 @@ class StrategyEvaluator:
         Returns:
             List of auditable StrategyDecision records.
         """
-        cls.verify_snapshot(supplied_candles, context)
+        verified_snapshot = cls.verify_snapshot(supplied_candles, context)
 
         if start_index is None:
             first_eligible_index = strategy.minimum_history_candles - 1
@@ -331,19 +352,19 @@ class StrategyEvaluator:
 
         decisions: list[StrategyDecision] = []
         for i in range(start_idx, len(supplied_candles)):
-            decision = cls.evaluate_at(
+            decision = cls._evaluate_at_verified(
                 supplied_candles=supplied_candles,
                 target_index=i,
-                context=context,
+                verified_snapshot=verified_snapshot,
                 strategy=strategy,
             )
             decisions.append(decision)
         return decisions
 
     # Instance method aliases for flexibility
-    def verify(self, supplied_candles: Sequence[Candle], context: EvaluationContext) -> None:
+    def verify(self, supplied_candles: Sequence[Candle], context: EvaluationContext) -> VerifiedSnapshot:
         """Instance alias for verify_snapshot."""
-        self.verify_snapshot(supplied_candles, context)
+        return self.verify_snapshot(supplied_candles, context)
 
     def evaluate(
         self,

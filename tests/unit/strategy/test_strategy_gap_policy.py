@@ -2,17 +2,13 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
 import pytest
 
-from open_quant_intelligence.data.quality import analyze_dataset_quality
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.market import MarketIdentity
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.storage.fingerprint import compute_content_fingerprint
 from open_quant_intelligence.strategy.contracts import (
-    EvaluationContext,
     GapPolicy,
     StrategyCandle,
     StrategyConfig,
@@ -25,6 +21,7 @@ from open_quant_intelligence.strategy.signals import (
     ResearchSignal,
     StrategyOutput,
 )
+from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
 
 def _make_utc_dt(hour: int = 10, minute: int = 0) -> datetime:
@@ -97,31 +94,17 @@ def _make_candle(open_hour: int) -> Candle:
     )
 
 
-def test_strict_gap_free_policy_rejects_leading_and_internal_gaps() -> None:
+def test_strict_gap_free_policy_rejects_leading_and_internal_gaps(tmp_path: Path) -> None:
     # Candles at hours: 11, 12 (requested_since is hour 10 -> Leading gap of 1h)
     c1 = _make_candle(11)
     c2 = _make_candle(12)
     candles = [c1, c2]
 
-    since_ms = int(_make_utc_dt(10, 0).timestamp() * 1000)
-    until_ms = int(_make_utc_dt(13, 0).timestamp() * 1000)
-    report = analyze_dataset_quality(candles, since_ms=since_ms, until_ms=until_ms, timeframe=SupportedTimeframe.H1)
-    fp = compute_content_fingerprint(
-        candles=candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-    )
-    ctx = EvaluationContext(
-        market=MarketIdentity("binance", "spot", "BTC/USDT"),
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-        content_fingerprint=fp,
-        quality_report=report,
+    _, _, ctx = commit_and_build_context(
+        tmp_path,
+        candles,
+        since_dt=_make_utc_dt(10, 0),
+        until_dt=_make_utc_dt(13, 0),
     )
 
     strat = GapTestStrategy(gap_policy=GapPolicy.STRICT_GAP_FREE)
@@ -131,31 +114,17 @@ def test_strict_gap_free_policy_rejects_leading_and_internal_gaps() -> None:
         StrategyEvaluator.evaluate_at(candles, target_index=1, context=ctx, strategy=strat)
 
 
-def test_reject_internal_gaps_permits_leading_gap_but_rejects_internal_gap() -> None:
+def test_reject_internal_gaps_permits_leading_gap_but_rejects_internal_gap(tmp_path: Path) -> None:
     # Case A: Leading gap (hour 10 missing, candles at hours 11, 12)
     c1 = _make_candle(11)
     c2 = _make_candle(12)
     candles = [c1, c2]
 
-    since_ms = int(_make_utc_dt(10, 0).timestamp() * 1000)
-    until_ms = int(_make_utc_dt(13, 0).timestamp() * 1000)
-    report = analyze_dataset_quality(candles, since_ms=since_ms, until_ms=until_ms, timeframe=SupportedTimeframe.H1)
-    fp = compute_content_fingerprint(
-        candles=candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-    )
-    ctx = EvaluationContext(
-        market=MarketIdentity("binance", "spot", "BTC/USDT"),
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-        content_fingerprint=fp,
-        quality_report=report,
+    _, _, ctx = commit_and_build_context(
+        tmp_path / "leading",
+        candles,
+        since_dt=_make_utc_dt(10, 0),
+        until_dt=_make_utc_dt(13, 0),
     )
 
     strat = GapTestStrategy(gap_policy=GapPolicy.REJECT_INTERNAL_GAPS)
@@ -168,59 +137,29 @@ def test_reject_internal_gaps_permits_leading_gap_but_rejects_internal_gap() -> 
     c_gap2 = _make_candle(12)  # Missing hour 11
     gap_candles = [c_gap1, c_gap2]
 
-    gap_since_ms = int(_make_utc_dt(10, 0).timestamp() * 1000)
-    gap_until_ms = int(_make_utc_dt(13, 0).timestamp() * 1000)
-    gap_report = analyze_dataset_quality(
-        gap_candles, since_ms=gap_since_ms, until_ms=gap_until_ms, timeframe=SupportedTimeframe.H1
-    )
-    gap_fp = compute_content_fingerprint(
-        candles=gap_candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=gap_since_ms,
-        requested_until_ms=gap_until_ms,
-    )
-    gap_ctx = EvaluationContext(
-        market=MarketIdentity("binance", "spot", "BTC/USDT"),
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=gap_since_ms,
-        requested_until_ms=gap_until_ms,
-        content_fingerprint=gap_fp,
-        quality_report=gap_report,
+    _, _, gap_ctx = commit_and_build_context(
+        tmp_path / "internal",
+        gap_candles,
+        since_dt=_make_utc_dt(10, 0),
+        until_dt=_make_utc_dt(13, 0),
     )
 
     with pytest.raises(StrategyDataGapError, match="policy REJECT_INTERNAL_GAPS violated"):
         StrategyEvaluator.evaluate_at(gap_candles, target_index=1, context=gap_ctx, strategy=strat)
 
 
-def test_future_gap_does_not_affect_causal_evaluation() -> None:
+def test_future_gap_does_not_affect_causal_evaluation(tmp_path: Path) -> None:
     # Candles at hours 10, 11 (contiguous prefix), and hour 14 (missing hours 12, 13 in future)
     c1 = _make_candle(10)
     c2 = _make_candle(11)
     c3 = _make_candle(14)
     candles = [c1, c2, c3]
 
-    since_ms = int(_make_utc_dt(10, 0).timestamp() * 1000)
-    until_ms = int(_make_utc_dt(15, 0).timestamp() * 1000)
-    report = analyze_dataset_quality(candles, since_ms=since_ms, until_ms=until_ms, timeframe=SupportedTimeframe.H1)
-    fp = compute_content_fingerprint(
-        candles=candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-    )
-    ctx = EvaluationContext(
-        market=MarketIdentity("binance", "spot", "BTC/USDT"),
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-        content_fingerprint=fp,
-        quality_report=report,
+    _, _, ctx = commit_and_build_context(
+        tmp_path,
+        candles,
+        since_dt=_make_utc_dt(10, 0),
+        until_dt=_make_utc_dt(15, 0),
     )
 
     strat = GapTestStrategy(gap_policy=GapPolicy.STRICT_GAP_FREE)

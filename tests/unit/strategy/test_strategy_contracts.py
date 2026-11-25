@@ -2,15 +2,15 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
-from open_quant_intelligence.data.quality import (
-    DataQualityReport,
-)
+from open_quant_intelligence.data.quality import DataQualityReport
 from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.domain.market import MarketIdentity
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.storage.catalog import CatalogDatasetRecord
 from open_quant_intelligence.strategy.contracts import (
     EmptyDatasetError,
     EvaluationContext,
@@ -26,9 +26,11 @@ from open_quant_intelligence.strategy.contracts import (
     StrategyDataGapError,
     StrategyEvaluationError,
     StrategyOutputMismatchError,
+    VerifiedSnapshot,
     _validate_utc_datetime,
 )
 from open_quant_intelligence.strategy.signals import StrategyOutput
+from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
 # -----------------------------------------------------------------------------
 # Helpers
@@ -304,107 +306,119 @@ def test_strategy_context_validation() -> None:
 # -----------------------------------------------------------------------------
 
 
-def test_evaluation_context_validation() -> None:
+def test_evaluation_context_validation(tmp_path: Path) -> None:
+    c1 = _make_valid_m0_candle(_make_utc_dt(10, 0), _make_utc_dt(11, 0))
+    c2 = _make_valid_m0_candle(_make_utc_dt(11, 0), _make_utc_dt(12, 0))
+    candles = [c1, c2]
+
+    catalog, record, ctx = commit_and_build_context(tmp_path, candles, file_sha256="e" * 64)
+    assert ctx.snapshot_id == record.snapshot_id
+    assert ctx.content_fingerprint == record.content_fingerprint_sha256
+    assert ctx.file_sha256 == "e" * 64
+    assert ctx.content_fingerprint != ctx.file_sha256
+    assert ctx.dataset_identity == record.dataset_identity
+
+    # Direct construction without CatalogDatasetRecord is rejected
     market = MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT")
-    report = DataQualityReport(
-        requested_since_ms=0,
-        requested_until_ms=7200000,
-        timeframe=SupportedTimeframe.H1,
-        expected_records=2,
-        record_count=2,
-        missing_intervals=0,
-        gap_count=0,
-        gaps=(),
-        quality_status="GAP_FREE",
-    )
-    fp = "sha256:" + "a" * 64
-
-    ctx = EvaluationContext(
-        market=market,
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=0,
-        requested_until_ms=7200000,
-        content_fingerprint=fp,
-        quality_report=report,
-    )
-    assert ctx.dataset_identity == "binance:spot:BTC/USDT:1h:0:7200000"
-
-    # Reject non-spot market
-    with pytest.raises(ValueError, match="Only spot markets are supported"):
-        m_non_spot = MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT")
-        object.__setattr__(m_non_spot, "market_type", "swap")
-        EvaluationContext(
-            market=m_non_spot,
-            timeframe=SupportedTimeframe.H1,
-            requested_since_ms=0,
-            requested_until_ms=7200000,
-            content_fingerprint=fp,
-            quality_report=report,
-        )
-
-    # Reject boolean / float timestamp bounds
-    with pytest.raises(TypeError, match="requested_since_ms must be exact int"):
+    report = ctx.quality_report
+    with pytest.raises(SnapshotConsistencyError, match="from_catalog_record"):
         EvaluationContext(
             market=market,
             timeframe=SupportedTimeframe.H1,
-            requested_since_ms=True,  # type: ignore
-            requested_until_ms=7200000,
-            content_fingerprint=fp,
+            requested_since_ms=ctx.requested_since_ms,
+            requested_until_ms=ctx.requested_until_ms,
+            content_fingerprint=ctx.content_fingerprint,
             quality_report=report,
-        )
-    with pytest.raises(TypeError, match="requested_until_ms must be exact int"):
-        EvaluationContext(
-            market=market,
-            timeframe=SupportedTimeframe.H1,
-            requested_since_ms=0,
-            requested_until_ms=7200000.0,  # type: ignore
-            content_fingerprint=fp,
-            quality_report=report,
+            snapshot_id=record.snapshot_id,
         )
 
-    # Reject off-grid timestamp bounds
-    with pytest.raises(ValueError, match="not grid-aligned"):
-        EvaluationContext(
-            market=market,
-            timeframe=SupportedTimeframe.H1,
-            requested_since_ms=1000,  # not multiple of 3600000
-            requested_until_ms=7200000,
-            content_fingerprint=fp,
-            quality_report=report,
+    # Uncommitted catalog snapshot is rejected
+    with pytest.raises(SnapshotConsistencyError, match="is not committed"):
+        commit_and_build_context(
+            tmp_path / "uncommitted",
+            candles,
+            ingestion_status="PENDING",
         )
 
-    # Reject invalid content_fingerprint format
-    with pytest.raises(ValueError, match="Invalid content_fingerprint format"):
-        EvaluationContext(
-            market=market,
-            timeframe=SupportedTimeframe.H1,
-            requested_since_ms=0,
-            requested_until_ms=7200000,
-            content_fingerprint="not-a-valid-sha256",
-            quality_report=report,
-        )
+    # Missing catalog snapshot cannot establish authoritative provenance
+    assert catalog.find_latest_committed("binance:spot:ETH/USDT:1h:0:7200000") is None
 
-    # Reject inconsistent quality report
-    bad_report = DataQualityReport(
-        requested_since_ms=0,
-        requested_until_ms=7200000,
+    # Mismatched quality report record_count vs catalog record is rejected
+    mismatched_report = DataQualityReport(
+        requested_since_ms=ctx.requested_since_ms,
+        requested_until_ms=ctx.requested_until_ms,
         timeframe=SupportedTimeframe.H1,
         expected_records=2,
         record_count=1,
-        missing_intervals=0,  # expected != record_count + missing_intervals (2 != 1 + 0)
+        missing_intervals=1,
         gap_count=0,
         gaps=(),
         quality_status="GAP_CONTAINING",
     )
-    with pytest.raises(ValueError, match="expected_records != record_count \\+ missing_intervals"):
-        EvaluationContext(
-            market=market,
-            timeframe=SupportedTimeframe.H1,
-            requested_since_ms=0,
-            requested_until_ms=7200000,
-            content_fingerprint=fp,
-            quality_report=bad_report,
-        )
+    with pytest.raises(SnapshotConsistencyError, match="does not match catalog record"):
+        EvaluationContext.from_catalog_record(record, mismatched_report)
+
+    # Off-grid catalog requested_since is rejected
+    bad_since_record = CatalogDatasetRecord(
+        snapshot_id="snap_bad_grid",
+        dataset_identity=record.dataset_identity,
+        exchange_id=record.exchange_id,
+        market_type=record.market_type,
+        symbol=record.symbol,
+        timeframe=record.timeframe,
+        requested_since=datetime(2025, 1, 1, 10, 15, 0, tzinfo=timezone.utc),
+        requested_until=_make_utc_dt(12, 0),
+        actual_first_open=record.actual_first_open,
+        actual_last_close=record.actual_last_close,
+        expected_records=2,
+        record_count=2,
+        gap_count=0,
+        missing_intervals=0,
+        content_fingerprint_sha256=record.content_fingerprint_sha256,
+        file_sha256=record.file_sha256,
+        file_path=record.file_path,
+        file_size_bytes=record.file_size_bytes,
+        ccxt_version=record.ccxt_version,
+        ingestion_uuid=record.ingestion_uuid,
+        ingested_at=record.ingested_at,
+        ingestion_status="COMMITTED",
+        quality_status=record.quality_status,
+    )
+    with pytest.raises(ValueError, match="not grid-aligned"):
+        EvaluationContext.from_catalog_record(bad_since_record, report)
+
+    # Invalid content_fingerprint format in catalog record is rejected
+    bad_fp_record = CatalogDatasetRecord(
+        snapshot_id="snap_bad_fp",
+        dataset_identity=record.dataset_identity,
+        exchange_id=record.exchange_id,
+        market_type=record.market_type,
+        symbol=record.symbol,
+        timeframe=record.timeframe,
+        requested_since=_make_utc_dt(10, 0),
+        requested_until=_make_utc_dt(12, 0),
+        actual_first_open=record.actual_first_open,
+        actual_last_close=record.actual_last_close,
+        expected_records=2,
+        record_count=2,
+        gap_count=0,
+        missing_intervals=0,
+        content_fingerprint_sha256="not-a-valid-sha256",
+        file_sha256=record.file_sha256,
+        file_path=record.file_path,
+        file_size_bytes=record.file_size_bytes,
+        ccxt_version=record.ccxt_version,
+        ingestion_uuid=record.ingestion_uuid,
+        ingested_at=record.ingested_at,
+        ingestion_status="COMMITTED",
+        quality_status=record.quality_status,
+    )
+    with pytest.raises(ValueError, match="Invalid content_fingerprint format"):
+        EvaluationContext.from_catalog_record(bad_fp_record, report)
+
+    # Direct VerifiedSnapshot forgery is rejected
+    with pytest.raises(SnapshotConsistencyError, match="cannot be constructed directly"):
+        VerifiedSnapshot(context=ctx, candle_count=2)
 
 
 # -----------------------------------------------------------------------------

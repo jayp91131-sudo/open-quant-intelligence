@@ -1,16 +1,21 @@
 """Tests for ResearchSignal, ReasonCode, StrategyOutput, and StrategyDecision."""
 
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
+from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
+from open_quant_intelligence.strategy.contracts import SnapshotConsistencyError
+from open_quant_intelligence.strategy.evaluator import StrategyEvaluator
 from open_quant_intelligence.strategy.signals import (
     ReasonCode,
     ResearchSignal,
     StrategyDecision,
     StrategyOutput,
 )
+from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
 
 def _make_utc_dt(hour: int = 10, minute: int = 0) -> datetime:
@@ -125,19 +130,33 @@ def test_strategy_output_immutability() -> None:
         out.metadata["fast_ma"] = 99999.0  # type: ignore
 
 
-def test_strategy_decision_assemble_and_delegation() -> None:
+def test_strategy_decision_assemble_and_delegation(tmp_path: Path) -> None:
     out = _make_valid_output()
-    fp = "sha256:" + "b" * 64
-    dataset_id = "binance:spot:BTC/USDT:1h:0:3600000"
+    c = Candle(
+        exchange_id="binance",
+        market_type="spot",
+        symbol="BTC/USDT",
+        timeframe="1h",
+        open_time=_make_utc_dt(10, 0),
+        close_time=_make_utc_dt(11, 0),
+        open=50000.0,
+        high=50500.0,
+        low=49500.0,
+        close=50200.0,
+        base_volume=10.0,
+        is_closed=True,
+    )
+    _, record, ctx = commit_and_build_context(tmp_path, [c])
+    verified_snapshot = StrategyEvaluator.verify_snapshot([c], ctx)
 
     decision = StrategyDecision.assemble(
         output=out,
-        dataset_identity=dataset_id,
-        dataset_content_fingerprint=fp,
+        verified_snapshot=verified_snapshot,
     )
 
-    assert decision.dataset_identity == dataset_id
-    assert decision.dataset_content_fingerprint == fp
+    assert decision.dataset_identity == record.dataset_identity
+    assert decision.dataset_content_fingerprint == record.content_fingerprint_sha256
+    assert decision.snapshot_id == record.snapshot_id
     assert decision.output == out
 
     # Delegating properties
@@ -158,10 +177,15 @@ def test_strategy_decision_rejections() -> None:
     out = _make_valid_output()
     fp = "sha256:" + "b" * 64
 
-    # Empty dataset_identity
-    with pytest.raises(ValueError, match="dataset_identity cannot be empty"):
-        StrategyDecision.assemble(output=out, dataset_identity="  ", dataset_content_fingerprint=fp)
+    # Direct instantiation without VerifiedSnapshot is rejected
+    with pytest.raises(SnapshotConsistencyError, match="cannot be constructed directly"):
+        StrategyDecision(
+            dataset_identity="binance:spot:BTC/USDT:1h:0:3600000",
+            dataset_content_fingerprint=fp,
+            snapshot_id="snap_fake",
+            output=out,
+        )
 
-    # Invalid content fingerprint format
-    with pytest.raises(ValueError, match="Invalid dataset_content_fingerprint format"):
-        StrategyDecision.assemble(output=out, dataset_identity="valid:id", dataset_content_fingerprint="invalid_hash")
+    # StrategyDecision.assemble() rejects unverified / non-VerifiedSnapshot objects
+    with pytest.raises(SnapshotConsistencyError, match="requires a VerifiedSnapshot"):
+        StrategyDecision.assemble(output=out, verified_snapshot="not-verified")  # type: ignore

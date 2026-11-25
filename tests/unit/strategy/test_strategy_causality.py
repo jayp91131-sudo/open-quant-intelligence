@@ -2,15 +2,11 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
-from open_quant_intelligence.data.quality import analyze_dataset_quality
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.market import MarketIdentity
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.storage.fingerprint import compute_content_fingerprint
 from open_quant_intelligence.strategy.contracts import (
-    EvaluationContext,
     GapPolicy,
     StrategyCandle,
     StrategyConfig,
@@ -22,6 +18,7 @@ from open_quant_intelligence.strategy.signals import (
     ResearchSignal,
     StrategyOutput,
 )
+from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
 
 def _make_utc_dt(hour: int = 10, minute: int = 0) -> datetime:
@@ -99,31 +96,7 @@ def _make_candle(hour: int, open_p: float, close_p: float) -> Candle:
     )
 
 
-def _make_context(candles: list[Candle]) -> EvaluationContext:
-    market = MarketIdentity("binance", "spot", "BTC/USDT")
-    since_ms = int(candles[0].open_time.timestamp() * 1000)
-    until_ms = int(candles[-1].close_time.timestamp() * 1000)
-    report = analyze_dataset_quality(candles, since_ms=since_ms, until_ms=until_ms, timeframe=SupportedTimeframe.H1)
-    fp = compute_content_fingerprint(
-        candles=candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-    )
-    return EvaluationContext(
-        market=market,
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-        content_fingerprint=fp,
-        quality_report=report,
-    )
-
-
-def test_causality_future_candle_modification_invariance() -> None:
+def test_causality_future_candle_modification_invariance(tmp_path: Path) -> None:
     """Assert prefix-invariance: modifying future candles strictly after T does not alter decision at T."""
     c0 = _make_candle(10, 50000.0, 50200.0)
     c1 = _make_candle(11, 50200.0, 50600.0)  # Target candle T (index 1)
@@ -131,12 +104,12 @@ def test_causality_future_candle_modification_invariance() -> None:
     # Dataset 1: Future candle c2 has normal price
     c2_v1 = _make_candle(12, 50600.0, 50800.0)
     dataset1 = [c0, c1, c2_v1]
-    ctx1 = _make_context(dataset1)
+    _, _, ctx1 = commit_and_build_context(tmp_path / "d1", dataset1)
 
     # Dataset 2: Future candle c2 has completely wild/modified price and volume
     c2_v2 = _make_candle(12, 10000.0, 95000.0)
     dataset2 = [c0, c1, c2_v2]
-    ctx2 = _make_context(dataset2)
+    _, _, ctx2 = commit_and_build_context(tmp_path / "d2", dataset2)
 
     strategy = MovingAverageMockStrategy()
 
@@ -158,13 +131,13 @@ def test_causality_future_candle_modification_invariance() -> None:
     assert dec1.metadata == dec2.metadata
 
 
-def test_deterministic_repeat_evaluations() -> None:
+def test_deterministic_repeat_evaluations(tmp_path: Path) -> None:
     """Assert evaluation is completely deterministic across repeated executions."""
     c0 = _make_candle(10, 50000.0, 50200.0)
     c1 = _make_candle(11, 50200.0, 50600.0)
     c2 = _make_candle(12, 50600.0, 50800.0)
     candles = [c0, c1, c2]
-    ctx = _make_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
     strategy = MovingAverageMockStrategy()
 
     runs = [StrategyEvaluator.evaluate_series(candles, context=ctx, strategy=strategy) for _ in range(3)]

@@ -1,22 +1,27 @@
 """Tests for StrategyEvaluator Stage A: Authoritative M1 snapshot verification."""
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Sequence
 
 import pytest
 
-from open_quant_intelligence.data.quality import analyze_dataset_quality
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.market import MarketIdentity
-from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.storage.fingerprint import compute_content_fingerprint
 from open_quant_intelligence.strategy.contracts import (
     EmptyDatasetError,
-    EvaluationContext,
+    GapPolicy,
     HeterogeneousSeriesError,
     SnapshotConsistencyError,
+    StrategyCandle,
+    StrategyConfig,
+    StrategyContext,
     StrategyEvaluationError,
+    VerifiedSnapshot,
 )
 from open_quant_intelligence.strategy.evaluator import StrategyEvaluator
+from open_quant_intelligence.strategy.signals import ReasonCode, ResearchSignal, StrategyOutput
+from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
 
 def _make_utc_dt(hour: int = 10, minute: int = 0) -> datetime:
@@ -49,41 +54,17 @@ def _make_series(count: int = 3) -> list[Candle]:
     return candles
 
 
-def _make_valid_context(candles: list[Candle]) -> EvaluationContext:
-    market = MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT")
-    since_ms = int(candles[0].open_time.timestamp() * 1000)
-    until_ms = int(candles[-1].close_time.timestamp() * 1000)
-    report = analyze_dataset_quality(candles, since_ms=since_ms, until_ms=until_ms, timeframe=SupportedTimeframe.H1)
-    fp = compute_content_fingerprint(
-        candles=candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-    )
-    return EvaluationContext(
-        market=market,
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-        content_fingerprint=fp,
-        quality_report=report,
-    )
-
-
-def test_stage_a_empty_input_rejection() -> None:
+def test_stage_a_empty_input_rejection(tmp_path: Path) -> None:
     candles = _make_series(2)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
     with pytest.raises(EmptyDatasetError, match="Supplied candle sequence is empty"):
         StrategyEvaluator.verify_snapshot([], ctx)
 
 
-def test_stage_a_fingerprint_mismatch_rejection() -> None:
+def test_stage_a_fingerprint_mismatch_rejection(tmp_path: Path) -> None:
     candles = _make_series(3)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
     # Subtly alter price in candles without changing timestamps or record count
     tampered_candles = list(candles)
@@ -94,7 +75,7 @@ def test_stage_a_fingerprint_mismatch_rejection() -> None:
         timeframe=candles[1].timeframe,
         open_time=candles[1].open_time,
         close_time=candles[1].close_time,
-        open=candles[1].open + 1.0,  # Price altered
+        open=candles[1].open + 1.0,
         high=candles[1].high + 1.0,
         low=candles[1].low,
         close=candles[1].close,
@@ -106,37 +87,34 @@ def test_stage_a_fingerprint_mismatch_rejection() -> None:
         StrategyEvaluator.verify_snapshot(tampered_candles, ctx)
 
 
-def test_stage_a_m0_validation_failure_rejection() -> None:
+def test_stage_a_m0_validation_failure_rejection(tmp_path: Path) -> None:
     candles = _make_series(2)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
-    # Supply duplicate candles to trigger M0 DUPLICATE_TIMESTAMP failure
     duplicate_series = [candles[0], candles[0]]
 
     with pytest.raises(StrategyEvaluationError, match="M0 candle validation failed"):
         StrategyEvaluator.verify_snapshot(duplicate_series, ctx)
 
 
-def test_stage_a_record_count_mismatch_rejection() -> None:
+def test_stage_a_record_count_mismatch_rejection(tmp_path: Path) -> None:
     candles = _make_series(3)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
-    # Supply only 2 candles instead of 3
     with pytest.raises(SnapshotConsistencyError, match="Supplied candle count .* does not match"):
         StrategyEvaluator.verify_snapshot(candles[:2], ctx)
 
 
-def test_stage_a_window_bounds_mismatch_rejection() -> None:
+def test_stage_a_window_bounds_mismatch_rejection(tmp_path: Path) -> None:
     candles = _make_series(3)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
-    # First candle starts earlier than requested_since
     early_candle = Candle(
         exchange_id="binance",
         market_type="spot",
         symbol="BTC/USDT",
         timeframe="1h",
-        open_time=_make_utc_dt(9, 0),  # 1 hour earlier
+        open_time=_make_utc_dt(9, 0),
         close_time=_make_utc_dt(10, 0),
         open=50000.0,
         high=50500.0,
@@ -149,13 +127,12 @@ def test_stage_a_window_bounds_mismatch_rejection() -> None:
         StrategyEvaluator.verify_snapshot([early_candle, candles[1], candles[2]], ctx)
 
 
-def test_stage_a_identity_mismatch_rejection() -> None:
+def test_stage_a_identity_mismatch_rejection(tmp_path: Path) -> None:
     candles = _make_series(2)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
-    # Exchange mismatch
     c_mismatched = Candle(
-        exchange_id="kraken",  # mismatch
+        exchange_id="kraken",
         market_type="spot",
         symbol="BTC/USDT",
         timeframe="1h",
@@ -172,17 +149,17 @@ def test_stage_a_identity_mismatch_rejection() -> None:
         StrategyEvaluator.verify_snapshot([candles[0], c_mismatched], ctx)
 
 
-def test_stage_a_timeframe_mismatch_rejection() -> None:
+def test_stage_a_timeframe_mismatch_rejection(tmp_path: Path) -> None:
     candles = _make_series(2)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
     c_mismatched_tf = Candle(
         exchange_id="binance",
         market_type="spot",
         symbol="BTC/USDT",
-        timeframe="4h",  # mismatch
+        timeframe="4h",
         open_time=candles[1].open_time,
-        close_time=_make_utc_dt(15, 0),  # 11:00 + 4h = 15:00
+        close_time=_make_utc_dt(15, 0),
         open=candles[1].open,
         high=candles[1].high,
         low=candles[1].low,
@@ -194,9 +171,90 @@ def test_stage_a_timeframe_mismatch_rejection() -> None:
         StrategyEvaluator.verify_snapshot([candles[0], c_mismatched_tf], ctx)
 
 
-def test_stage_a_successful_verification() -> None:
+def test_stage_a_successful_verification(tmp_path: Path) -> None:
     candles = _make_series(3)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
-    # Does not raise
-    StrategyEvaluator.verify_snapshot(candles, ctx)
+    verified = StrategyEvaluator.verify_snapshot(candles, ctx)
+    assert isinstance(verified, VerifiedSnapshot)
+    assert verified.candle_count == 3
+    assert verified.context == ctx
+
+
+def test_stage_b_cannot_bypass_stage_a_regression(tmp_path: Path) -> None:
+    """Regression test: evaluate_at() MUST run Stage A verification and reject tampered candles."""
+    candles = _make_series(3)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
+
+    @dataclass(frozen=True)
+    class _Cfg(StrategyConfig):
+        pass
+
+    class _SpyStrategy:
+        def __init__(self) -> None:
+            self.called = False
+            self._cfg = _Cfg()
+
+        @property
+        def strategy_id(self) -> str:
+            return "spy"
+
+        @property
+        def version(self) -> str:
+            return "1.0.0"
+
+        @property
+        def config(self) -> StrategyConfig:
+            return self._cfg
+
+        @property
+        def minimum_history_candles(self) -> int:
+            return 2
+
+        @property
+        def gap_policy(self) -> GapPolicy:
+            return GapPolicy.STRICT_GAP_FREE
+
+        def evaluate(self, history: Sequence[StrategyCandle], context: StrategyContext) -> StrategyOutput:
+            self.called = True
+            target = history[-1]
+            return StrategyOutput(
+                strategy_id=self.strategy_id,
+                strategy_version=self.version,
+                config_fingerprint=self.config.compute_fingerprint(),
+                symbol=context.symbol,
+                timeframe=context.timeframe,
+                source_candle_open_time=target.open_time,
+                source_candle_close_time=target.close_time,
+                decision_time=target.close_time,
+                signal=ResearchSignal.HOLD,
+                reason_code=ReasonCode.NO_CONDITION_MET,
+                metadata={},
+            )
+
+    spy = _SpyStrategy()
+    tampered = list(candles)
+    tampered[0] = Candle(
+        exchange_id=candles[0].exchange_id,
+        market_type=candles[0].market_type,
+        symbol=candles[0].symbol,
+        timeframe=candles[0].timeframe,
+        open_time=candles[0].open_time,
+        close_time=candles[0].close_time,
+        open=candles[0].open + 5.0,
+        high=candles[0].high + 5.0,
+        low=candles[0].low,
+        close=candles[0].close,
+        base_volume=candles[0].base_volume,
+        is_closed=True,
+    )
+
+    with pytest.raises(SnapshotConsistencyError, match="Recomputed content fingerprint"):
+        StrategyEvaluator.evaluate_at(tampered, target_index=2, context=ctx, strategy=spy)
+
+    # Strategy.evaluate() must never be invoked when Stage A fails
+    assert spy.called is False
+
+    # Direct _evaluate_at_verified with unverified object also fails
+    with pytest.raises(SnapshotConsistencyError, match="requires a VerifiedSnapshot"):
+        StrategyEvaluator._evaluate_at_verified(candles, target_index=2, verified_snapshot=ctx, strategy=spy)  # type: ignore

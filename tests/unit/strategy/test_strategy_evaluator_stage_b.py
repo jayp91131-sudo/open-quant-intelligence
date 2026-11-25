@@ -2,17 +2,14 @@
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
 
 import pytest
 
-from open_quant_intelligence.data.quality import analyze_dataset_quality
 from open_quant_intelligence.domain.candle import Candle
-from open_quant_intelligence.domain.market import MarketIdentity
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.storage.fingerprint import compute_content_fingerprint
 from open_quant_intelligence.strategy.contracts import (
-    EvaluationContext,
     GapPolicy,
     IncompleteCandleError,
     InsufficientHistoryError,
@@ -27,6 +24,7 @@ from open_quant_intelligence.strategy.signals import (
     ResearchSignal,
     StrategyOutput,
 )
+from tests.unit.strategy._catalog_helpers import commit_and_build_context
 
 
 def _make_utc_dt(hour: int = 10, minute: int = 0) -> datetime:
@@ -121,33 +119,9 @@ def _make_series(count: int = 4) -> list[Candle]:
     return candles
 
 
-def _make_valid_context(candles: list[Candle]) -> EvaluationContext:
-    market = MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT")
-    since_ms = int(candles[0].open_time.timestamp() * 1000)
-    until_ms = int(candles[-1].close_time.timestamp() * 1000)
-    report = analyze_dataset_quality(candles, since_ms=since_ms, until_ms=until_ms, timeframe=SupportedTimeframe.H1)
-    fp = compute_content_fingerprint(
-        candles=candles,
-        exchange_id="binance",
-        market_type="spot",
-        symbol="BTC/USDT",
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-    )
-    return EvaluationContext(
-        market=market,
-        timeframe=SupportedTimeframe.H1,
-        requested_since_ms=since_ms,
-        requested_until_ms=until_ms,
-        content_fingerprint=fp,
-        quality_report=report,
-    )
-
-
-def test_stage_b_lookback_requirement_rejection() -> None:
+def test_stage_b_lookback_requirement_rejection(tmp_path: Path) -> None:
     candles = _make_series(4)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
     strat = DummyStrategy(minimum_history_candles=3)
 
     # Evaluating at target_index = 1 means len(prefix) == 2, which is < minimum_history_candles (3)
@@ -159,9 +133,8 @@ def test_stage_b_lookback_requirement_rejection() -> None:
     assert decision.signal == ResearchSignal.LONG
 
 
-def test_stage_b_unclosed_prefix_candle_rejection() -> None:
+def test_stage_b_unclosed_prefix_candle_rejection(tmp_path: Path) -> None:
     candles = _make_series(4)
-    ctx = _make_valid_context(candles)
     strat = DummyStrategy(minimum_history_candles=2)
 
     # Make candle at index 1 unclosed
@@ -180,15 +153,15 @@ def test_stage_b_unclosed_prefix_candle_rejection() -> None:
         is_closed=False,  # Unclosed
     )
     series_with_unclosed = [candles[0], bad_candle, candles[2], candles[3]]
+    _, _, ctx = commit_and_build_context(tmp_path, series_with_unclosed)
 
     # Evaluating at index 1 or 2 contains the unclosed candle
     with pytest.raises(IncompleteCandleError, match="is incomplete \\(is_closed=False\\)"):
         StrategyEvaluator.evaluate_at(series_with_unclosed, target_index=2, context=ctx, strategy=strat)
 
 
-def test_stage_b_unclosed_future_candle_isolation() -> None:
+def test_stage_b_unclosed_future_candle_isolation(tmp_path: Path) -> None:
     candles = _make_series(4)
-    ctx = _make_valid_context(candles)
     strat = DummyStrategy(minimum_history_candles=2)
 
     # Make candle at index 3 (future candle relative to T=1) unclosed
@@ -207,15 +180,16 @@ def test_stage_b_unclosed_future_candle_isolation() -> None:
         is_closed=False,
     )
     series = [candles[0], candles[1], candles[2], unclosed_future]
+    _, _, ctx = commit_and_build_context(tmp_path, series)
 
     # Evaluating at T=1 must succeed because candle 3 is in the future
     decision = StrategyEvaluator.evaluate_at(series, target_index=1, context=ctx, strategy=strat)
     assert decision.source_candle_close_time == candles[1].close_time
 
 
-def test_stage_b_strategy_output_mismatch_rejections() -> None:
+def test_stage_b_strategy_output_mismatch_rejections(tmp_path: Path) -> None:
     candles = _make_series(3)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
 
     # Strategy that returns mismatched strategy_id
     class BadIdStrategy(DummyStrategy):
@@ -248,9 +222,9 @@ def test_stage_b_strategy_output_mismatch_rejections() -> None:
         StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=BadTfStrategy())
 
 
-def test_stage_b_ingestion_metadata_isolation() -> None:
+def test_stage_b_ingestion_metadata_isolation(tmp_path: Path) -> None:
     candles = _make_series(3)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
     strat = DummyStrategy(minimum_history_candles=2)
 
     StrategyEvaluator.evaluate_at(candles, target_index=2, context=ctx, strategy=strat)
@@ -263,7 +237,7 @@ def test_stage_b_ingestion_metadata_isolation() -> None:
         assert not hasattr(sc, "market_type")
 
 
-def test_stage_b_canonical_market_data_equivalence() -> None:
+def test_stage_b_canonical_market_data_equivalence(tmp_path: Path) -> None:
     candles1 = _make_series(3)
     # Build identical market data candles but with different source and fetched_at
     candles2 = [
@@ -286,8 +260,8 @@ def test_stage_b_canonical_market_data_equivalence() -> None:
         for c in candles1
     ]
 
-    ctx1 = _make_valid_context(candles1)
-    ctx2 = _make_valid_context(candles2)
+    _, _, ctx1 = commit_and_build_context(tmp_path / "c1", candles1)
+    _, _, ctx2 = commit_and_build_context(tmp_path / "c2", candles2)
 
     strat1 = DummyStrategy(minimum_history_candles=2)
     strat2 = DummyStrategy(minimum_history_candles=2)
@@ -302,9 +276,9 @@ def test_stage_b_canonical_market_data_equivalence() -> None:
     assert dec1.metadata == dec2.metadata
 
 
-def test_stage_b_evaluate_series_execution() -> None:
+def test_stage_b_evaluate_series_execution(tmp_path: Path) -> None:
     candles = _make_series(4)
-    ctx = _make_valid_context(candles)
+    _, _, ctx = commit_and_build_context(tmp_path, candles)
     strat = DummyStrategy(minimum_history_candles=2)
 
     decisions = StrategyEvaluator.evaluate_series(candles, context=ctx, strategy=strat)

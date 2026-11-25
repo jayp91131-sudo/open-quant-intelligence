@@ -20,6 +20,7 @@ from open_quant_intelligence.strategy.contracts import (
     StrategyDataGapError,
     StrategyEvaluationError,
     StrategyOutputMismatchError,
+    VerifiedSnapshot,
 )
 from open_quant_intelligence.strategy.evaluator import StrategyEvaluator
 from open_quant_intelligence.strategy.signals import (
@@ -36,6 +37,7 @@ __all__ = [
     "StrategyCandle",
     "StrategyContext",
     "EvaluationContext",
+    "VerifiedSnapshot",
     "GapPolicy",
     # Signals and Outputs
     "ResearchSignal",

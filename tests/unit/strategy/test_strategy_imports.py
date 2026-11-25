@@ -13,6 +13,7 @@ def test_public_exports() -> None:
         "StrategyCandle",
         "StrategyContext",
         "EvaluationContext",
+        "VerifiedSnapshot",
         "GapPolicy",
         "ResearchSignal",
         "ReasonCode",

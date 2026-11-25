@@ -11,7 +11,7 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Protocol, Sequence, runtime_checkable
@@ -21,11 +21,16 @@ from open_quant_intelligence.domain.candle import Candle
 from open_quant_intelligence.domain.market import MarketIdentity
 from open_quant_intelligence.domain.timeframe import (
     SupportedTimeframe,
+    parse_timeframe,
     timeframe_to_timedelta,
 )
 
 if TYPE_CHECKING:
+    from open_quant_intelligence.storage.catalog import CatalogDatasetRecord
     from open_quant_intelligence.strategy.signals import StrategyOutput
+
+_CATALOG_PROVENANCE_TOKEN = object()
+_VERIFIED_SNAPSHOT_TOKEN = object()
 
 
 # -----------------------------------------------------------------------------
@@ -267,9 +272,21 @@ class EvaluationContext:
     requested_until_ms: int
     content_fingerprint: str
     quality_report: DataQualityReport
+    snapshot_id: str = ""
+    file_sha256: str | None = None
     dataset_identity: str = ""
+    _provenance_token: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        # 0. Catalog provenance enforcement
+        if self._provenance_token is not _CATALOG_PROVENANCE_TOKEN:
+            raise SnapshotConsistencyError(
+                "EvaluationContext must be constructed from an authoritative committed "
+                "CatalogDatasetRecord via EvaluationContext.from_catalog_record()."
+            )
+        if not isinstance(self.snapshot_id, str) or not self.snapshot_id.strip():
+            raise SnapshotConsistencyError("snapshot_id cannot be empty.")
+
         # 1. MarketIdentity validation
         if not isinstance(self.market, MarketIdentity):
             raise TypeError(f"market must be an instance of MarketIdentity, got {type(self.market).__name__}")
@@ -369,6 +386,121 @@ class EvaluationContext:
                 f"Quality report missing_intervals ({self.quality_report.missing_intervals}) does not "
                 f"match sum of gap missing_counts ({total_gap_missing})."
             )
+
+    @classmethod
+    def from_catalog_record(
+        cls,
+        record: CatalogDatasetRecord,
+        quality_report: DataQualityReport,
+    ) -> EvaluationContext:
+        """Construct an authoritative EvaluationContext from a committed M1 CatalogDatasetRecord."""
+        from open_quant_intelligence.storage.catalog import CatalogDatasetRecord as _CatalogRecord
+
+        if not isinstance(record, _CatalogRecord):
+            raise TypeError(f"record must be an instance of CatalogDatasetRecord, got {type(record).__name__}")
+        if record.ingestion_status != "COMMITTED":
+            raise SnapshotConsistencyError(
+                f"Catalog snapshot '{record.snapshot_id}' is not committed "
+                f"(ingestion_status='{record.ingestion_status}')."
+            )
+        if not isinstance(record.snapshot_id, str) or not record.snapshot_id.strip():
+            raise SnapshotConsistencyError("CatalogDatasetRecord.snapshot_id cannot be empty.")
+
+        _validate_utc_datetime(
+            req_since := (
+                record.requested_since.astimezone(timezone.utc)
+                if isinstance(record.requested_since, datetime) and record.requested_since.tzinfo is None
+                else record.requested_since
+            ),
+            "record.requested_since",
+        )
+        _validate_utc_datetime(
+            req_until := (
+                record.requested_until.astimezone(timezone.utc)
+                if isinstance(record.requested_until, datetime) and record.requested_until.tzinfo is None
+                else record.requested_until
+            ),
+            "record.requested_until",
+        )
+
+        market = MarketIdentity(
+            exchange_id=record.exchange_id,
+            market_type=record.market_type,
+            symbol=record.symbol,
+        )
+        timeframe = parse_timeframe(record.timeframe)
+        requested_since_ms = int(req_since.timestamp() * 1000)
+        requested_until_ms = int(req_until.timestamp() * 1000)
+
+        if not isinstance(quality_report, DataQualityReport):
+            raise TypeError(f"quality_report must be DataQualityReport, got {type(quality_report).__name__}")
+        if quality_report.expected_records != record.expected_records:
+            raise SnapshotConsistencyError(
+                f"Quality report expected_records ({quality_report.expected_records}) does not match "
+                f"catalog record ({record.expected_records})."
+            )
+        if quality_report.record_count != record.record_count:
+            raise SnapshotConsistencyError(
+                f"Quality report record_count ({quality_report.record_count}) does not match "
+                f"catalog record ({record.record_count})."
+            )
+        if quality_report.gap_count != record.gap_count:
+            raise SnapshotConsistencyError(
+                f"Quality report gap_count ({quality_report.gap_count}) does not match "
+                f"catalog record ({record.gap_count})."
+            )
+        if quality_report.missing_intervals != record.missing_intervals:
+            raise SnapshotConsistencyError(
+                f"Quality report missing_intervals ({quality_report.missing_intervals}) does not match "
+                f"catalog record ({record.missing_intervals})."
+            )
+        if quality_report.quality_status != record.quality_status:
+            raise SnapshotConsistencyError(
+                f"Quality report quality_status ('{quality_report.quality_status}') does not match "
+                f"catalog record ('{record.quality_status}')."
+            )
+
+        return cls(
+            market=market,
+            timeframe=timeframe,
+            requested_since_ms=requested_since_ms,
+            requested_until_ms=requested_until_ms,
+            content_fingerprint=record.content_fingerprint_sha256,
+            quality_report=quality_report,
+            snapshot_id=record.snapshot_id,
+            file_sha256=record.file_sha256,
+            dataset_identity=record.dataset_identity,
+            _provenance_token=_CATALOG_PROVENANCE_TOKEN,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedSnapshot:
+    """Immutable verification proof issued exclusively by StrategyEvaluator.verify_snapshot()."""
+
+    context: EvaluationContext
+    candle_count: int
+    _token: object = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if self._token is not _VERIFIED_SNAPSHOT_TOKEN:
+            raise SnapshotConsistencyError(
+                "VerifiedSnapshot cannot be constructed directly; "
+                "it must be obtained from StrategyEvaluator.verify_snapshot()."
+            )
+        if not isinstance(self.context, EvaluationContext):
+            raise TypeError(f"context must be EvaluationContext, got {type(self.context).__name__}")
+        if type(self.candle_count) is not int or self.candle_count <= 0:
+            raise ValueError(f"candle_count must be positive int, got {self.candle_count}")
+
+
+def _issue_verified_snapshot(context: EvaluationContext, candle_count: int) -> VerifiedSnapshot:
+    """Internal factory for StrategyEvaluator to issue a VerifiedSnapshot."""
+    return VerifiedSnapshot(
+        context=context,
+        candle_count=candle_count,
+        _token=_VERIFIED_SNAPSHOT_TOKEN,
+    )
 
 
 # -----------------------------------------------------------------------------

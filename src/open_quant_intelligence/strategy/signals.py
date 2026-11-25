@@ -10,13 +10,20 @@ from __future__ import annotations
 import math
 import re
 import types
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Mapping
 
 from open_quant_intelligence.domain.timeframe import SupportedTimeframe
-from open_quant_intelligence.strategy.contracts import _validate_utc_datetime
+from open_quant_intelligence.strategy.contracts import (
+    _VERIFIED_SNAPSHOT_TOKEN,
+    SnapshotConsistencyError,
+    VerifiedSnapshot,
+    _validate_utc_datetime,
+)
+
+_VERIFIED_DECISION_TOKEN = object()
 
 # -----------------------------------------------------------------------------
 # Research Signal & Reason Codes
@@ -139,15 +146,24 @@ class StrategyDecision:
     # Evaluator-Attached Snapshot Provenance
     dataset_identity: str
     dataset_content_fingerprint: str
+    snapshot_id: str
 
     # Embedded Verified Strategy Output
     output: StrategyOutput
+    _decision_token: object = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if self._decision_token is not _VERIFIED_DECISION_TOKEN:
+            raise SnapshotConsistencyError(
+                "StrategyDecision cannot be constructed directly; "
+                "it must be assembled with a VerifiedSnapshot via StrategyDecision.assemble()."
+            )
         if not isinstance(self.output, StrategyOutput):
             raise TypeError(f"output must be an instance of StrategyOutput, got {type(self.output).__name__}")
         if not self.dataset_identity.strip():
             raise ValueError("dataset_identity cannot be empty.")
+        if not self.snapshot_id.strip():
+            raise ValueError("snapshot_id cannot be empty.")
         if not re.fullmatch(r"^sha256:[0-9a-f]{64}$", self.dataset_content_fingerprint):
             raise ValueError(f"Invalid dataset_content_fingerprint format: '{self.dataset_content_fingerprint}'.")
 
@@ -155,14 +171,22 @@ class StrategyDecision:
     def assemble(
         cls,
         output: StrategyOutput,
-        dataset_identity: str,
-        dataset_content_fingerprint: str,
+        verified_snapshot: VerifiedSnapshot,
     ) -> StrategyDecision:
-        """Assemble an auditable decision record from verified output and snapshot provenance."""
+        """Assemble an auditable decision record from verified output and Stage A verified snapshot."""
+        if (
+            not isinstance(verified_snapshot, VerifiedSnapshot)
+            or verified_snapshot._token is not _VERIFIED_SNAPSHOT_TOKEN
+        ):
+            raise SnapshotConsistencyError(
+                "StrategyDecision.assemble() requires a VerifiedSnapshot issued by StrategyEvaluator.verify_snapshot()."
+            )
         return cls(
-            dataset_identity=dataset_identity,
-            dataset_content_fingerprint=dataset_content_fingerprint,
+            dataset_identity=verified_snapshot.context.dataset_identity,
+            dataset_content_fingerprint=verified_snapshot.context.content_fingerprint,
+            snapshot_id=verified_snapshot.context.snapshot_id,
             output=output,
+            _decision_token=_VERIFIED_DECISION_TOKEN,
         )
 
     # Delegating properties for clean consumer ergonomics
