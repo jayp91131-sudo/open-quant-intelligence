@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Empty
 from typing import Any
 from unittest.mock import patch
 
@@ -1322,14 +1323,24 @@ def test_cross_process_pipeline_and_recovery_safety(
 
     try:
         assert ready_event.wait(timeout=5.0), "Worker did not signal staging ready in time"
-        worker_events = []
-        while not out_queue.empty():
-            worker_events.append(out_queue.get())
-        errors = [e for e in worker_events if e[0] == "error"]
-        assert len(errors) == 0, f"Worker process error: {errors}"
-        worker_pid = worker_events[0][1]
-        staging_path = Path(worker_events[0][2])
-        initial_lock_token = worker_events[0][3]
+        try:
+            worker_event = out_queue.get(timeout=5.0)
+        except Empty as exc:
+            raise AssertionError("Worker signaled readiness, but no queue message arrived within 5.0s.") from exc
+
+        assert isinstance(worker_event, tuple) and len(worker_event) >= 1, (
+            f"Expected non-empty tuple event from worker, got: {worker_event!r}"
+        )
+        event_type = worker_event[0]
+        assert event_type in ("staged", "error"), f"Unexpected worker event type {event_type!r}: {worker_event!r}"
+        if event_type == "error":
+            raise AssertionError(f"Worker process error: {worker_event!r}")
+
+        assert len(worker_event) == 4, (
+            f"Expected 4 fields in 'staged' worker event, got {len(worker_event)}: {worker_event!r}"
+        )
+        _, worker_pid, staging_path_str, initial_lock_token = worker_event
+        staging_path = Path(staging_path_str)
 
         assert staging_path.exists()
         initial_bytes = staging_path.read_bytes()
