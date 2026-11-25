@@ -318,10 +318,15 @@ def test_evaluation_context_validation(tmp_path: Path) -> None:
     assert ctx.content_fingerprint != ctx.file_sha256
     assert ctx.dataset_identity == record.dataset_identity
 
-    # Direct construction without CatalogDatasetRecord is rejected
+    # Public raw-record factory is removed; fabricated in-memory CatalogDatasetRecord cannot establish provenance
+    assert not hasattr(EvaluationContext, "from_catalog_record")
+    with pytest.raises(TypeError, match="must be an instance of DuckDBCatalog"):
+        EvaluationContext.from_catalog(record, record.snapshot_id, ctx.quality_report)  # type: ignore
+
+    # Direct construction without DuckDBCatalog lookup is rejected
     market = MarketIdentity(exchange_id="binance", market_type="spot", symbol="BTC/USDT")
     report = ctx.quality_report
-    with pytest.raises(SnapshotConsistencyError, match="from_catalog_record"):
+    with pytest.raises(SnapshotConsistencyError, match="from_catalog"):
         EvaluationContext(
             market=market,
             timeframe=SupportedTimeframe.H1,
@@ -332,7 +337,15 @@ def test_evaluation_context_validation(tmp_path: Path) -> None:
             snapshot_id=record.snapshot_id,
         )
 
-    # Uncommitted catalog snapshot is rejected
+    # Unknown snapshot ID is rejected
+    with pytest.raises(SnapshotConsistencyError, match="was not found in DuckDBCatalog"):
+        EvaluationContext.from_catalog(catalog, "snap_does_not_exist", report)
+
+    # Mismatched returned snapshot_id (e.g. querying by dataset_identity or fingerprint) is rejected
+    with pytest.raises(SnapshotConsistencyError, match="returned mismatched snapshot_id"):
+        EvaluationContext.from_catalog(catalog, record.dataset_identity, report)
+
+    # Uncommitted (PENDING) catalog snapshot is rejected
     with pytest.raises(SnapshotConsistencyError, match="is not committed"):
         commit_and_build_context(
             tmp_path / "uncommitted",
@@ -356,9 +369,12 @@ def test_evaluation_context_validation(tmp_path: Path) -> None:
         quality_status="GAP_CONTAINING",
     )
     with pytest.raises(SnapshotConsistencyError, match="does not match catalog record"):
-        EvaluationContext.from_catalog_record(record, mismatched_report)
+        EvaluationContext.from_catalog(catalog, record.snapshot_id, mismatched_report)
 
     # Off-grid catalog requested_since is rejected
+    from open_quant_intelligence.storage.catalog import DuckDBCatalog
+
+    bad_catalog = DuckDBCatalog(tmp_path / "bad_grid.duckdb")
     bad_since_record = CatalogDatasetRecord(
         snapshot_id="snap_bad_grid",
         dataset_identity=record.dataset_identity,
@@ -384,10 +400,12 @@ def test_evaluation_context_validation(tmp_path: Path) -> None:
         ingestion_status="COMMITTED",
         quality_status=record.quality_status,
     )
+    bad_catalog.commit_dataset_snapshot(bad_since_record)
     with pytest.raises(ValueError, match="not grid-aligned"):
-        EvaluationContext.from_catalog_record(bad_since_record, report)
+        EvaluationContext.from_catalog(bad_catalog, "snap_bad_grid", report)
 
     # Invalid content_fingerprint format in catalog record is rejected
+    bad_fp_catalog = DuckDBCatalog(tmp_path / "bad_fp.duckdb")
     bad_fp_record = CatalogDatasetRecord(
         snapshot_id="snap_bad_fp",
         dataset_identity=record.dataset_identity,
@@ -413,8 +431,9 @@ def test_evaluation_context_validation(tmp_path: Path) -> None:
         ingestion_status="COMMITTED",
         quality_status=record.quality_status,
     )
+    bad_fp_catalog.commit_dataset_snapshot(bad_fp_record)
     with pytest.raises(ValueError, match="Invalid content_fingerprint format"):
-        EvaluationContext.from_catalog_record(bad_fp_record, report)
+        EvaluationContext.from_catalog(bad_fp_catalog, "snap_bad_fp", report)
 
     # Direct VerifiedSnapshot construction is rejected
     with pytest.raises(SnapshotConsistencyError, match="cannot be constructed directly"):

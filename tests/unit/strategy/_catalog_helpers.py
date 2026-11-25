@@ -95,5 +95,5 @@ def commit_and_build_context(
         retrieved = catalog.find_by_id_or_fingerprint(snap_id)
         assert retrieved is not None
 
-    ctx = EvaluationContext.from_catalog_record(retrieved, quality_report)
+    ctx = EvaluationContext.from_catalog(catalog, retrieved.snapshot_id, quality_report)
     return catalog, retrieved, ctx

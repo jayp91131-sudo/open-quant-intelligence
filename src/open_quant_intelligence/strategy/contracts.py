@@ -26,7 +26,7 @@ from open_quant_intelligence.domain.timeframe import (
 )
 
 if TYPE_CHECKING:
-    from open_quant_intelligence.storage.catalog import CatalogDatasetRecord
+    from open_quant_intelligence.storage.catalog import CatalogDatasetRecord, DuckDBCatalog
     from open_quant_intelligence.strategy.signals import StrategyOutput
 
 _CATALOG_PROVENANCE_TOKEN = object()
@@ -282,7 +282,7 @@ class EvaluationContext:
         if self._provenance_token is not _CATALOG_PROVENANCE_TOKEN:
             raise SnapshotConsistencyError(
                 "EvaluationContext must be constructed from an authoritative committed "
-                "CatalogDatasetRecord via EvaluationContext.from_catalog_record()."
+                "snapshot in DuckDBCatalog via EvaluationContext.from_catalog()."
             )
         if not isinstance(self.snapshot_id, str) or not self.snapshot_id.strip():
             raise SnapshotConsistencyError("snapshot_id cannot be empty.")
@@ -388,12 +388,45 @@ class EvaluationContext:
             )
 
     @classmethod
-    def from_catalog_record(
+    def from_catalog(
+        cls,
+        catalog: DuckDBCatalog,
+        snapshot_id: str,
+        quality_report: DataQualityReport,
+    ) -> EvaluationContext:
+        """Retrieve a committed snapshot from DuckDBCatalog and build an EvaluationContext.
+
+        Verifies:
+        - `catalog` is a real DuckDBCatalog instance.
+        - `snapshot_id` resolves to an existing record in the catalog.
+        - Retrieved `record.snapshot_id` exactly matches the requested `snapshot_id`.
+        - Retrieved `record.ingestion_status == "COMMITTED"`.
+        - `quality_report` metadata matches the retrieved catalog record.
+        """
+        from open_quant_intelligence.storage.catalog import DuckDBCatalog as _DuckDBCatalog
+
+        if not isinstance(catalog, _DuckDBCatalog):
+            raise TypeError(f"catalog must be an instance of DuckDBCatalog, got {type(catalog).__name__}")
+        if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+            raise SnapshotConsistencyError("snapshot_id must be a non-empty string.")
+
+        record = catalog.find_by_id_or_fingerprint(snapshot_id)
+        if record is None:
+            raise SnapshotConsistencyError(f"Snapshot '{snapshot_id}' was not found in DuckDBCatalog.")
+        if record.snapshot_id != snapshot_id:
+            raise SnapshotConsistencyError(
+                f"Catalog lookup for '{snapshot_id}' returned mismatched snapshot_id '{record.snapshot_id}'."
+            )
+
+        return cls._from_catalog_record(record=record, quality_report=quality_report)
+
+    @classmethod
+    def _from_catalog_record(
         cls,
         record: CatalogDatasetRecord,
         quality_report: DataQualityReport,
     ) -> EvaluationContext:
-        """Construct an authoritative EvaluationContext from a committed M1 CatalogDatasetRecord."""
+        """Internal conversion helper invoked only after verified DuckDBCatalog lookup."""
         from open_quant_intelligence.storage.catalog import CatalogDatasetRecord as _CatalogRecord
 
         if not isinstance(record, _CatalogRecord):
